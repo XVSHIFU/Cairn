@@ -89,22 +89,21 @@ jobs:
           TAG="v${V}-zh"
           DELTA="${{ steps.delta.outputs.file }}"
           FULL="${{ steps.full.outputs.file }}"
+          sed "s/{{VERSION}}/${V}/g" packaging/zh-CN/release-notes.md > /tmp/release-notes.md
 
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "[*] release ${TAG} 已存在，覆盖上传资产"
+            echo "[*] release ${TAG} 已存在，覆盖上传资产并更新说明"
             gh release upload "${TAG}" "${DELTA}" "${FULL}" \
               --clobber --repo "${GITHUB_REPOSITORY}"
+            gh release edit "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --notes-file /tmp/release-notes.md
           else
             echo "[*] 创建 release ${TAG}"
             gh release create "${TAG}" "${DELTA}" "${FULL}" \
               --repo "${GITHUB_REPOSITORY}" \
               --title "Cairn 中文版 ${V} (zh)" \
-              --notes "由 release workflow 自动构建的 Cairn 中文版发行包。
-
-- \`${DELTA}\` 中文独立增量包：下载原版 Cairn 后解压到项目根，运行 \`./install.sh\` 即可切换中文。
-- \`${FULL}\` 完整中文版整包：原版 + 中文本地化，开箱即用。
-
-切换方法：\`dispatch.yaml\` 中 \`runtime.prompt_group: \"zh-CN\"\`；Web 界面右上角 \`中文\` 按钮。" \
+              --notes-file /tmp/release-notes.md \
               --latest
           fi
 
