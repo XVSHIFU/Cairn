@@ -274,7 +274,14 @@
       <button @click="showLocalPrefs = true" class="h-7 max-w-40 px-2.5 rounded-lg border border-slate-200 text-xs text-slate-500 hover:bg-slate-50 hover:text-slate-700 transition inline-flex items-center shrink-0">
         <span class="truncate block" x-text="actorName()"></span>
       </button>
-      
+
+      <div class="flex items-center rounded-lg border border-slate-200 overflow-hidden shrink-0" :title="t('ctfModeToggle')">
+        <button type="button" @click="setCtfMode('manual')" class="h-7 px-2 text-[11px] font-medium transition"
+          :class="ctfMode === 'manual' ? 'bg-slate-800 text-white' : 'text-slate-500 hover:bg-slate-50'"><span x-text="t('modeManual')"></span></button>
+        <button type="button" @click="setCtfMode('ctf')" class="h-7 px-2 text-[11px] font-medium transition"
+          :class="ctfMode === 'ctf' ? 'bg-brand-500 text-white' : 'text-slate-500 hover:bg-slate-50'"><span x-text="t('modeCtf')"></span></button>
+      </div>
+
       <div class="flex items-center rounded-lg border border-slate-200 overflow-hidden shrink-0" :title="t('language')">
         <button type="button" @click="setLang('en')" class="h-7 px-2 text-[11px] font-medium transition"
           :class="lang === 'en' ? 'bg-slate-800 text-white' : 'text-slate-500 hover:bg-slate-50'">EN</button>
@@ -282,7 +289,7 @@
           :class="lang === 'zh' ? 'bg-slate-800 text-white' : 'text-slate-500 hover:bg-slate-50'">中文</button>
       </div>
 
-      <button @click="loadSettings(); showSettings = true" class="h-7 w-7 rounded-lg border border-slate-200 text-slate-400 hover:bg-slate-50 hover:text-slate-600 transition inline-flex items-center justify-center shrink-0">
+      <button @click="loadSettings(); loadCtfConfig(); showSettings = true" class="h-7 w-7 rounded-lg border border-slate-200 text-slate-400 hover:bg-slate-50 hover:text-slate-600 transition inline-flex items-center justify-center shrink-0">
         <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7 7 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a7 7 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a7 7 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.991a7 7 0 0 1 0-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.28Z"/><path d="M15 12a3 3 0 1 1-6 0-3 3 0 0 1 6 0Z"/></svg>
       </button>
     </div>
@@ -401,6 +408,210 @@
   </div>
 </div>
 
+<!-- ═══════════ CTF BOARD VIEW ═══════════ -->
+<div x-show="view === 'ctf'" x-cloak class="flex-1 flex flex-col overflow-hidden">
+  <header class="bg-white/80 backdrop-blur border-b border-slate-200/60 px-4 py-2.5 flex items-center gap-3 shrink-0">
+    <div class="flex items-center gap-2.5 min-w-0">
+      <div class="h-8 w-8 rounded-lg border border-slate-200 bg-white shadow-sm shadow-slate-200/40 flex items-center justify-center shrink-0 overflow-hidden">
+        <img src="/static/favicon.svg" alt="" class="w-5 h-5 block">
+      </div>
+      <span class="font-semibold text-slate-700 tracking-tight" x-text="t('ctfBoard')"></span>
+    </div>
+    <div class="flex-1"></div>
+    <div class="flex items-center gap-3 text-[11px] text-slate-400">
+      <span class="inline-flex items-center gap-1.5 shrink-0" :title="t('ctfTotalPoints')">
+        <span class="font-medium uppercase tracking-[0.12em] text-slate-400" x-text="t('ctfPoints')"></span>
+        <span class="font-semibold text-slate-600 tabular-nums" x-text="ctfDisplayScore()"></span>
+      </span>
+      <span class="inline-flex items-center gap-1.5 shrink-0" :title="t('ctfSolved')">
+        <span class="h-1.5 w-1.5 rounded-full bg-emerald-500"></span>
+        <span class="font-semibold text-emerald-700 tabular-nums" x-text="ctfCount('solved')"></span>
+      </span>
+      <span class="inline-flex items-center gap-1.5 shrink-0" :title="t('ctfSolving')">
+        <span class="h-1.5 w-1.5 rounded-full bg-amber-500"></span>
+        <span class="font-semibold text-amber-700 tabular-nums" x-text="ctfCount('solving')"></span>
+      </span>
+      <span class="inline-flex items-center gap-1.5 shrink-0" :title="t('ctfQueued')">
+        <span class="h-1.5 w-1.5 rounded-full bg-slate-400"></span>
+        <span class="font-semibold text-slate-600 tabular-nums" x-text="ctfCount('queued')"></span>
+      </span>
+      <span class="inline-flex items-center gap-1.5 shrink-0" :title="t('ctfRemaining')">
+        <span class="font-semibold text-slate-600 tabular-nums" x-text="ctfRemaining()"></span>
+      </span>
+      <span class="inline-flex items-center gap-1.5 shrink-0" x-show="ctfStatus && !ctfStatus.bridge_running && ctfConfigured()">
+        <span class="h-1.5 w-1.5 rounded-full bg-rose-500 animate-pulse"></span>
+        <span class="font-semibold text-rose-600" x-text="t('ctfBridgeOffline')"></span>
+      </span>
+      <span class="inline-flex items-center gap-1.5 shrink-0" x-show="ctfStatus && ctfStatus.last_model_error" :title="ctfStatus.last_model_error">
+        <span class="h-1.5 w-1.5 rounded-full bg-rose-500 animate-pulse"></span>
+        <span class="font-semibold text-rose-600" x-text="t('ctfModelError')"></span>
+      </span>
+    </div>
+    <div class="flex items-center gap-1.5">
+      <button @click="refreshCtfChallenges()" :disabled="ctfLoading"
+        class="h-7 px-2.5 rounded-lg border border-brand-200 text-xs text-brand-600 hover:bg-brand-50 transition inline-flex items-center gap-1.5 disabled:cursor-not-allowed disabled:opacity-40">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="1.9" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+        <span x-text="ctfLoading ? t('ctfSyncing') : t('ctfRefresh')"></span>
+      </button>
+    </div>
+    <div class="flex items-center gap-1.5 ml-1">
+      <div class="flex items-center rounded-lg border border-slate-200 overflow-hidden shrink-0" :title="t('ctfModeToggle')">
+        <button type="button" @click="setCtfMode('manual')" class="h-7 px-2 text-[11px] font-medium transition"
+          :class="ctfMode === 'manual' ? 'bg-slate-800 text-white' : 'text-slate-500 hover:bg-slate-50'"><span x-text="t('modeManual')"></span></button>
+        <button type="button" @click="setCtfMode('ctf')" class="h-7 px-2 text-[11px] font-medium transition"
+          :class="ctfMode === 'ctf' ? 'bg-brand-500 text-white' : 'text-slate-500 hover:bg-slate-50'"><span x-text="t('modeCtf')"></span></button>
+      </div>
+      <div class="flex items-center rounded-lg border border-slate-200 overflow-hidden shrink-0" :title="t('language')">
+        <button type="button" @click="setLang('en')" class="h-7 px-2 text-[11px] font-medium transition"
+          :class="lang === 'en' ? 'bg-slate-800 text-white' : 'text-slate-500 hover:bg-slate-50'">EN</button>
+        <button type="button" @click="setLang('zh')" class="h-7 px-2 text-[11px] font-medium transition"
+          :class="lang === 'zh' ? 'bg-slate-800 text-white' : 'text-slate-500 hover:bg-slate-50'">中文</button>
+      </div>
+      <button @click="loadSettings(); loadCtfConfig(); showSettings = true" class="h-7 w-7 rounded-lg border border-slate-200 text-slate-400 hover:bg-slate-50 hover:text-slate-600 transition inline-flex items-center justify-center shrink-0">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7 7 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a7 7 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a7 7 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.991a7 7 0 0 1 0-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.28Z"/><path d="M15 12a3 3 0 1 1-6 0-3 3 0 0 1 6 0Z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="flex-1 overflow-y-auto p-4">
+    <template x-if="!ctfConfigured()">
+      <div class="flex flex-col items-center justify-center h-full text-slate-400">
+        <svg class="w-16 h-16 mb-4 opacity-30" fill="none" stroke="currentColor" stroke-width="1.2" viewBox="0 0 24 24"><path d="M12 3l9 5v8l-9 5-9-5V8l9-5Z"/><path d="M12 12l9-5"/><path d="M12 12v9"/></svg>
+        <p class="text-lg font-medium text-slate-500" x-text="t('ctfNotConfigured')"></p>
+        <p class="text-sm mt-1" x-text="t('ctfConfigureHint')"></p>
+        <button @click="loadCtfConfig(); showSettings = true" class="mt-4 h-8 px-3 rounded-lg border border-brand-200 text-xs text-brand-600 hover:bg-brand-50 transition inline-flex items-center">
+          <span x-text="t('ctfOpenSettings')"></span>
+        </button>
+      </div>
+    </template>
+
+    <template x-if="ctfConfigured() && ctfChallenges.length === 0">
+      <div class="flex flex-col items-center justify-center h-full text-slate-400">
+        <img src="/static/favicon.svg" alt="" class="w-20 h-20 mb-5 opacity-30">
+        <p class="text-lg font-medium text-slate-500" x-text="t('ctfNoChallenges')"></p>
+        <button @click="refreshCtfChallenges()" class="mt-4 h-8 px-3 rounded-lg border border-brand-200 text-xs text-brand-600 hover:bg-brand-50 transition inline-flex items-center">
+          <span x-text="t('ctfRefresh')"></span>
+        </button>
+      </div>
+    </template>
+
+    <div x-show="ctfConfigured() && (ctfSolvingCount() > 0 || ctfQueuedCount() > 0)" class="max-w-3xl mx-auto mb-3">
+      <div class="bg-white rounded-2xl border border-slate-200/60 px-4 py-3">
+        <div class="flex items-center gap-3">
+          <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-400 shrink-0" x-text="t('ctfQueue')"></span>
+          <div class="flex-1 h-1.5 rounded-full bg-slate-100 overflow-hidden">
+            <div class="h-full bg-amber-400 transition-all duration-500" :style="'width:' + (ctfMaxConcurrent() ? (ctfSolvingCount() / ctfMaxConcurrent() * 100) : 0) + '%'"></div>
+          </div>
+          <span class="text-[11px] text-slate-500 tabular-nums shrink-0" x-text="ctfSolvingCount() + '/' + ctfMaxConcurrent() + ' ' + t('ctfSlots')"></span>
+          <span class="text-[11px] shrink-0" :class="ctfFreeSlots() > 0 ? 'text-emerald-600' : 'text-amber-600'"
+            x-text="ctfFreeSlots() > 0 ? ctfFreeSlots() + ' ' + t('ctfFreeSlot') : t('ctfNoFreeSlot')"></span>
+        </div>
+        <div x-show="ctfQueuedCount() > 0" class="mt-2.5 space-y-1.5 border-t border-slate-100 pt-2.5">
+          <template x-for="(q, idx) in ctfQueueList()" :key="q.id">
+            <div class="flex items-center gap-2 text-xs">
+              <span class="inline-flex items-center justify-center h-4 w-4 rounded-full bg-slate-100 text-[10px] font-semibold text-slate-500 shrink-0" x-text="idx + 1"></span>
+              <span class="text-slate-600 truncate" x-text="q.title"></span>
+              <span class="shrink-0" :class="ctfFreeSlots() > 0 ? 'text-amber-500' : 'text-slate-400'"
+                x-text="ctfFreeSlots() > 0 ? t('ctfWaitingOpen') : t('ctfWaitingSlot')"></span>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+    <div x-show="ctfConfigured() && ctfChallenges.length > 0" class="max-w-3xl mx-auto space-y-2.5">
+      <template x-for="ch in ctfChallenges" :key="ch.id">
+        <div class="bg-white rounded-2xl border border-slate-200/60 transition-all duration-200 hover:border-slate-300">
+          <div class="flex items-center gap-3 px-4 py-3">
+            <span class="h-2 w-2 rounded-full shrink-0" :class="ctfStatusDot(ch.status)" :title="ctfStatusLabel(ch.status)"></span>
+            <div class="min-w-0 flex-1 cursor-pointer" @click="toggleCtfChallenge(ch.id)">
+              <p class="font-medium text-slate-700 truncate text-sm"><span x-text="ch.title"></span></p>
+              <p class="text-[11px] text-slate-400 truncate">
+                <span x-text="ch.category || '—'"></span>
+                <span> · </span>
+                <span x-text="ch.points + 'pt'"></span>
+                <template x-if="ch.target">
+                  <span> · <span class="font-mono" x-text="ch.target"></span></span>
+                </template>
+              </p>
+            </div>
+            <div class="flex items-center gap-1.5 shrink-0 flex-wrap justify-end">
+              <span class="px-2 py-0.5 rounded-full text-[11px] font-medium" :class="ctfStatusBadge(ch.status)"><span x-text="ch.status === 'queued' && ctfQueuedCount() > 1 ? ctfStatusLabel('queued') + ' #' + ctfQueuePosition(ch) : ctfStatusLabel(ch.status)"></span></span>
+              <template x-if="ch.status === 'solved' && ch.last_flag">
+                <span class="text-xs font-mono text-emerald-600 max-w-40 truncate" :title="ch.last_flag" x-text="ch.last_flag"></span>
+              </template>
+              <template x-if="ch.project_id">
+                <button @click="openProject(ch.project_id)" class="h-7 px-2 rounded-lg border border-slate-200 text-[11px] text-slate-500 hover:bg-slate-50 hover:text-slate-700 transition inline-flex items-center gap-1">
+                  <span x-text="t('ctfViewProject')"></span>
+                </button>
+              </template>
+              <template x-if="ch.status === 'queued'">
+                <button @click="startCtfChallenge(ch)" class="h-7 px-2 rounded-lg border border-brand-200 text-[11px] text-brand-600 hover:bg-brand-50 transition inline-flex items-center gap-1">
+                  <span x-text="t('ctfStartSolve')"></span>
+                </button>
+              </template>
+              <template x-if="ctfCanPause(ch.status)">
+                <button @click="pauseCtfChallenge(ch)" class="h-7 px-2 rounded-lg border border-slate-200 text-[11px] text-slate-500 hover:bg-slate-50 hover:text-slate-700 transition">
+                  <span x-text="t('ctfPause')"></span>
+                </button>
+              </template>
+              <template x-if="ctfCanResume(ch.status)">
+                <button @click="resumeCtfChallenge(ch)" class="h-7 px-2 rounded-lg border border-slate-200 text-[11px] text-slate-600 hover:bg-slate-50 transition">
+                  <span x-text="t('ctfResume')"></span>
+                </button>
+              </template>
+              <template x-if="ctfCanRetry(ch.status)">
+                <button @click="retryCtfChallenge(ch)" class="h-7 px-2 rounded-lg border border-brand-200 text-[11px] text-brand-600 hover:bg-brand-50 transition">
+                  <span x-text="t('ctfRetry')"></span>
+                </button>
+              </template>
+              <template x-if="ctfCanStop(ch.status)">
+                <button @click="stopCtfChallenge(ch)" class="h-7 px-2 rounded-lg border border-rose-200 text-[11px] text-rose-500 hover:bg-rose-50 transition">
+                  <span x-text="t('ctfStop')"></span>
+                </button>
+              </template>
+              <button @click="toggleCtfChallenge(ch.id)" class="h-7 w-7 rounded-lg border border-slate-200 text-slate-400 hover:bg-slate-50 hover:text-slate-600 transition inline-flex items-center justify-center">
+                <svg class="w-3.5 h-3.5 transition-transform" :class="ctfExpandedId === ch.id ? 'rotate-180' : ''" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
+              </button>
+            </div>
+          </div>
+          <template x-if="ctfExpandedId === ch.id">
+            <div class="border-t border-slate-100 px-4 py-3 text-sm space-y-2.5">
+              <div>
+                <p class="text-[11px] text-slate-400 font-medium uppercase tracking-wider mb-1" x-text="t('ctfDescription')"></p>
+                <p class="text-slate-600 whitespace-pre-wrap text-xs" x-text="ch.description || '—'"></p>
+              </div>
+              <template x-if="ch.attachments && ch.attachments.length">
+                <div>
+                  <p class="text-[11px] text-slate-400 font-medium uppercase tracking-wider mb-1" x-text="t('ctfAttachments')"></p>
+                  <div class="space-y-1">
+                    <template x-for="url in ch.attachments" :key="url">
+                      <a :href="url" target="_blank" rel="noopener" class="block text-xs text-brand-600 hover:underline truncate" x-text="url"></a>
+                    </template>
+                  </div>
+                </div>
+              </template>
+              <template x-if="ch.hints && ch.hints.length">
+                <div>
+                  <p class="text-[11px] text-slate-400 font-medium uppercase tracking-wider mb-1" x-text="t('ctfHints')"></p>
+                  <ul class="space-y-1">
+                    <template x-for="h in ch.hints" :key="h">
+                      <li class="text-xs text-slate-500" x-text="h"></li>
+                    </template>
+                  </ul>
+                </div>
+              </template>
+              <div class="flex items-center gap-4 text-[11px] text-slate-400">
+                <span><span x-text="t('ctfAttempts')"></span>: <span x-text="ch.attempt_count"></span></span>
+                <span><span x-text="t('ctfLastFlag')"></span>: <span class="font-mono" x-text="ch.last_flag || t('ctfNoFlag')"></span></span>
+              </div>
+            </div>
+          </template>
+        </div>
+      </template>
+    </div>
+  </div>
+</div>
+
 <!-- ═══════════ GRAPH VIEW ═══════════ -->
 <template x-if="view === 'graph'">
 <div class="flex-1 flex flex-col overflow-hidden">
@@ -484,7 +695,14 @@
       <button @click="showLocalPrefs = true" class="h-7 max-w-40 px-2.5 rounded-lg border border-slate-200 text-xs text-slate-500 hover:bg-slate-50 hover:text-slate-700 transition inline-flex items-center shrink-0">
         <span class="truncate block" x-text="actorName()"></span>
       </button>
-      
+
+      <div class="flex items-center rounded-lg border border-slate-200 overflow-hidden shrink-0" :title="t('ctfModeToggle')">
+        <button type="button" @click="setCtfMode('manual')" class="h-7 px-2 text-[11px] font-medium transition"
+          :class="ctfMode === 'manual' ? 'bg-slate-800 text-white' : 'text-slate-500 hover:bg-slate-50'"><span x-text="t('modeManual')"></span></button>
+        <button type="button" @click="setCtfMode('ctf')" class="h-7 px-2 text-[11px] font-medium transition"
+          :class="ctfMode === 'ctf' ? 'bg-brand-500 text-white' : 'text-slate-500 hover:bg-slate-50'"><span x-text="t('modeCtf')"></span></button>
+      </div>
+
       <div class="flex items-center rounded-lg border border-slate-200 overflow-hidden shrink-0" :title="t('language')">
         <button type="button" @click="setLang('en')" class="h-7 px-2 text-[11px] font-medium transition"
           :class="lang === 'en' ? 'bg-slate-800 text-white' : 'text-slate-500 hover:bg-slate-50'">EN</button>
@@ -492,7 +710,7 @@
           :class="lang === 'zh' ? 'bg-slate-800 text-white' : 'text-slate-500 hover:bg-slate-50'">中文</button>
       </div>
 
-      <button @click="loadSettings(); showSettings = true" class="h-7 w-7 rounded-lg border border-slate-200 text-slate-400 hover:bg-slate-50 hover:text-slate-600 transition inline-flex items-center justify-center shrink-0">
+      <button @click="loadSettings(); loadCtfConfig(); showSettings = true" class="h-7 w-7 rounded-lg border border-slate-200 text-slate-400 hover:bg-slate-50 hover:text-slate-600 transition inline-flex items-center justify-center shrink-0">
         <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7 7 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a7 7 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a7 7 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.991a7 7 0 0 1 0-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.28Z"/><path d="M15 12a3 3 0 1 1-6 0-3 3 0 0 1 6 0Z"/></svg>
       </button>
     </div>
@@ -1003,7 +1221,7 @@
 
 <!-- Settings -->
 <div x-show="showSettings" x-cloak class="fixed inset-0 z-50 flex items-center justify-center overlay" @click.self="showSettings = false">
-  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 border border-slate-200/60" @click.stop>
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto p-6 border border-slate-200/60" @click.stop>
     <h3 class="text-base font-semibold text-slate-700 mb-4"><span x-text="t('serverSettings')"></span></h3>
     <div>
       <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('intentTimeout')"></span></label>
@@ -1014,7 +1232,159 @@
       <input type="number" x-model.number="settingsForm.reason_timeout" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition">
       <p class="text-[11px] text-slate-400 mt-2"><span x-text="t('sharedBackend')"></span></p>
     </div>
-    <div class="flex justify-end gap-2 mt-5">
+
+    <div class="mt-6 border-t border-slate-200 pt-5">
+      <h4 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2">
+        <span x-text="t('ctfPlatform')"></span>
+        <span class="text-[10px] font-normal text-slate-400" x-text="t('ctfPlatformHint')"></span>
+      </h4>
+      <div class="flex items-center gap-1 mb-4 bg-slate-50 rounded-xl p-1">
+        <button type="button" @click="ctfSettingsTab='general'" class="h-7 px-2.5 rounded-lg text-[11px] font-medium transition"
+          :class="ctfSettingsTab==='general' ? 'bg-white text-slate-700 shadow-sm' : 'text-slate-400 hover:text-slate-600'"><span x-text="t('ctfTabGeneral')"></span></button>
+        <button type="button" @click="ctfSettingsTab='budget'" class="h-7 px-2.5 rounded-lg text-[11px] font-medium transition"
+          :class="ctfSettingsTab==='budget' ? 'bg-white text-slate-700 shadow-sm' : 'text-slate-400 hover:text-slate-600'"><span x-text="t('ctfTabBudget')"></span></button>
+        <button type="button" @click="ctfSettingsTab='adapter'" class="h-7 px-2.5 rounded-lg text-[11px] font-medium transition"
+          :class="ctfSettingsTab==='adapter' ? 'bg-white text-slate-700 shadow-sm' : 'text-slate-400 hover:text-slate-600'"><span x-text="t('ctfTabAdapter')"></span></button>
+        <button type="button" @click="ctfSettingsTab='model'" class="h-7 px-2.5 rounded-lg text-[11px] font-medium transition"
+          :class="ctfSettingsTab==='model' ? 'bg-white text-slate-700 shadow-sm' : 'text-slate-400 hover:text-slate-600'"><span x-text="t('ctfTabModel')"></span></button>
+      </div>
+      <div x-show="ctfSettingsTab==='general'" class="space-y-3">
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('ctfAdapter')"></span></label>
+            <select x-model="ctfForm.adapter" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition bg-white">
+              <option value="ctfd">CTFd</option>
+              <option value="dasctf">DasCTF</option>
+              <option value="mock">Mock (local test)</option>
+            </select>
+          </div>
+          <div>
+            <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('ctfPollInterval')"></span></label>
+            <input type="number" x-model.number="ctfForm.poll_interval" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition">
+          </div>
+        </div>
+        <div>
+          <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('ctfBaseUrl')"></span></label>
+          <input type="text" x-model="ctfForm.base_url" :placeholder="t('ctfBaseUrlPlaceholder')" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition">
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('ctfToken')"></span></label>
+            <div class="flex gap-1.5">
+              <input :type="ctfShowToken ? 'text' : 'password'" x-model="ctfForm.token" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition">
+              <button @click="ctfShowToken = !ctfShowToken" class="h-9 w-9 shrink-0 rounded-xl border border-slate-200 text-slate-400 hover:bg-slate-50 hover:text-slate-600 transition inline-flex items-center justify-center" :title="t('ctfToggleToken')">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.7" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+              </button>
+            </div>
+          </div>
+          <div>
+            <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('ctfTeamName')"></span></label>
+            <input type="text" x-model="ctfForm.team_name" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition">
+          </div>
+        </div>
+        <div>
+          <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('ctfFlagRegex')"></span></label>
+          <input type="text" x-model="ctfForm.flag_regex" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm font-mono focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition">
+        </div>
+        <div class="grid grid-cols-2 gap-3 items-end">
+          <div>
+            <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('ctfMaxConcurrent')"></span></label>
+            <input type="number" x-model.number="ctfForm.max_concurrent" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition">
+          </div>
+          <label class="flex items-center gap-2 text-sm text-slate-600 pb-2 cursor-pointer select-none">
+            <input type="checkbox" x-model="ctfForm.auto_submit" class="rounded border-slate-300 text-brand-500 focus:ring-brand-100 focus:ring-2">
+            <span x-text="t('ctfAutoSubmit')"></span>
+          </label>
+        </div>
+        <div class="flex items-center gap-3">
+          <button @click="testCtfConnection()" :disabled="ctfTesting"
+            class="h-8 px-3 rounded-xl border border-slate-200 text-xs text-slate-600 hover:bg-slate-50 transition inline-flex items-center gap-1.5 disabled:cursor-not-allowed disabled:opacity-40">
+            <span x-text="ctfTesting ? t('ctfTesting') : t('ctfTestConnection')"></span>
+          </button>
+          <span x-show="ctfTestResult" class="text-xs" :class="ctfTestResult.ok ? 'text-emerald-600' : 'text-rose-600'" x-text="ctfTestResult.ok ? t('ctfTestOk') : t('ctfTestFail') + ' · ' + ctfTestResult.detail"></span>
+        </div>
+
+      </div>
+
+      <div x-show="ctfSettingsTab==='budget'" class="space-y-3">
+        <p class="text-[11px] text-slate-400 leading-relaxed" x-text="t('ctfBudgetHint')"></p>
+        <div class="grid grid-cols-3 gap-3">
+          <div>
+            <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('ctfBudgetEasy')"></span></label>
+            <input type="number" x-model.number="ctfForm.budget_easy" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition">
+          </div>
+          <div>
+            <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('ctfBudgetMedium')"></span></label>
+            <input type="number" x-model.number="ctfForm.budget_medium" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition">
+          </div>
+          <div>
+            <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('ctfBudgetHard')"></span></label>
+            <input type="number" x-model.number="ctfForm.budget_hard" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition">
+          </div>
+        </div>
+      </div>
+
+      <div x-show="ctfSettingsTab==='adapter'" class="space-y-3">
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('ctfEnvPollInterval')"></span></label>
+            <input type="number" x-model.number="ctfForm.env_poll_interval" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition">
+          </div>
+          <div>
+            <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('ctfEnvTimeout')"></span></label>
+            <input type="number" x-model.number="ctfForm.env_timeout" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition">
+          </div>
+          <div>
+            <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('ctfMaxRetries')"></span></label>
+            <input type="number" x-model.number="ctfForm.submission_max_retries" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition">
+          </div>
+          <div>
+            <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('ctfRateBackoff')"></span></label>
+            <input type="number" x-model.number="ctfForm.rate_limit_backoff" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition">
+          </div>
+        </div>
+      </div>
+
+      <div x-show="ctfSettingsTab==='model'" class="space-y-3">
+        <div>
+          <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('ctfModelBaseUrl')"></span></label>
+          <input type="text" x-model="ctfForm.model_base_url" :placeholder="t('ctfModelBaseUrlPlaceholder')" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition">
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('ctfModelName')"></span></label>
+            <input type="text" x-model="ctfForm.model_name" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition">
+          </div>
+          <div>
+            <label class="text-[11px] text-slate-400 mb-1 block font-medium"><span x-text="t('ctfModelApiKey')"></span></label>
+            <div class="flex gap-1.5">
+              <input :type="ctfShowModelKey ? 'text' : 'password'" x-model="ctfForm.model_api_key" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition">
+              <button @click="ctfShowModelKey = !ctfShowModelKey" class="h-9 w-9 shrink-0 rounded-xl border border-slate-200 text-slate-400 hover:bg-slate-50 hover:text-slate-600 transition inline-flex items-center justify-center" :title="t('ctfToggleToken')">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.7" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+        <div class="flex items-center gap-3">
+          <button @click="testCtfModel()" :disabled="ctfModelTesting"
+            class="h-8 px-3 rounded-xl border border-slate-200 text-xs text-slate-600 hover:bg-slate-50 transition inline-flex items-center gap-1.5 disabled:cursor-not-allowed disabled:opacity-40">
+            <span x-text="ctfModelTesting ? t('ctfTesting') : t('ctfTestModel')"></span>
+          </button>
+          <span x-show="ctfModelTestResult" class="text-xs" :class="ctfModelTestResult.ok ? 'text-emerald-600' : 'text-rose-600'" x-text="ctfModelTestResult.ok ? t('ctfTestOk') : t('ctfTestFail') + ' · ' + ctfModelTestResult.detail"></span>
+          <template x-if="ctfStatus && (ctfStatus.model_name || ctfStatus.last_model_error)">
+            <span class="text-[11px] text-slate-400">
+              <span x-text="t('ctfModelHealth')"></span>:
+              <span x-text="ctfStatus.model_name || '—'"></span>
+              <template x-if="ctfStatus.last_model_error">
+                <span class="text-rose-500" x-text="' · ' + t('ctfModelError')"></span>
+              </template>
+            </span>
+          </template>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex justify-end gap-2 mt-6">
       <button @click="showSettings = false" class="px-4 py-2 text-sm text-slate-500 hover:bg-slate-50 rounded-xl transition"><span x-text="t('close')"></span></button>
       <button @click="saveServerSettings()" class="px-4 py-2 text-sm bg-brand-500 text-white rounded-xl font-medium hover:bg-brand-600 transition shadow-sm shadow-brand-200"><span x-text="t('saveServer')"></span></button>
     </div>
@@ -1129,7 +1499,37 @@ const CAIRN_I18N = {
     toastIntentDeclaredClaimed:"Intent declared and claimed", toastIntentDeclared:"Intent declared",
     toastIntentClaimed:"Intent claimed", toastHeartbeat:"Heartbeat sent", toastIntentReleased:"Intent released",
     toastIntentConcluded:"Intent concluded", toastProjectCompleted:"Project completed", toastHintAdded:"Hint added",
-    toastLocalSaved:"Local preferences saved", toastServerSaved:"Server settings saved"
+    toastLocalSaved:"Local preferences saved", toastServerSaved:"Server settings saved",
+    ctfModeToggle:"Mode: manual / CTF platform", modeManual:"Manual", modeCtf:"CTF Platform",
+    ctfBoard:"CTF Platform", ctfPoints:"Score", ctfTotalPoints:"Total points solved",
+    ctfSolved:"Solved", ctfSolving:"Solving", ctfQueued:"Queued", ctfRemaining:"Remaining",
+    ctfRefresh:"Refresh", ctfSyncing:"Syncing...", ctfBridgeOffline:"Bridge offline",
+    ctfNotConfigured:"CTF platform not configured", ctfConfigureHint:"Set the platform URL and token in Settings.",
+    ctfOpenSettings:"Open Settings", ctfNoChallenges:"No challenges synced yet",
+    ctfViewProject:"View project", ctfStartSolve:"Start", ctfDescription:"Description",
+    ctfQueue:"Solve queue", ctfSlots:"slots", ctfFreeSlot:"free", ctfNoFreeSlot:"no free slot", ctfWaitingSlot:"waiting for a slot", ctfWaitingOpen:"waiting for platform to open",
+    ctfAttachments:"Attachments", ctfHints:"Hints", ctfAttempts:"Attempts", ctfLastFlag:"Last flag",
+    ctfNoFlag:"—", ctfPlatform:"CTF Platform", ctfPlatformHint:"(used by the bridge)",
+    ctfAdapter:"Adapter", ctfBaseUrl:"Base URL", ctfBaseUrlPlaceholder:"https://ctf.example.com",
+    ctfToken:"Token", ctfTeamName:"Team name", ctfFlagRegex:"Flag regex",
+    ctfMaxConcurrent:"Max concurrent", ctfPollInterval:"Poll interval (s)",
+    ctfAutoSubmit:"Auto submit", ctfToggleToken:"Show / hide token",
+    ctfTestConnection:"Test connection", ctfTesting:"Testing...", ctfTestOk:"Connection OK",
+    ctfTestFail:"Connection failed", statusQueued:"queued", statusSolving:"solving",
+    statusSubmitted:"submitted", statusSolved:"solved", statusWrongFlag:"wrong flag",
+    statusRateLimited:"rate limited", statusPaused:"paused", statusFailed:"failed",
+    toastCtfQueued:"Challenge queued for solving", toastCtfRetried:"Challenge requeued",
+    toastCtfPaused:"Challenge paused", toastCtfResumed:"Challenge resumed", toastCtfStopped:"Challenge stopped",
+    ctfPause:"Pause", ctfResume:"Resume", ctfRetry:"Retry", ctfStop:"Stop",
+    ctfAdapterSection:"Platform adapter", ctfEnvPollInterval:"Env poll (s)", ctfEnvTimeout:"Env timeout (s)",
+    ctfMaxRetries:"Max submit retries", ctfRateBackoff:"Rate-limit backoff (s)",
+    ctfModelSection:"Model (LLM)", ctfModelBaseUrl:"Model base URL", ctfModelBaseUrlPlaceholder:"https://dashscope.aliyuncs.com/apps/anthropic",
+    ctfModelName:"Model", ctfModelApiKey:"API key", ctfTestModel:"Test model", ctfModelHealth:"Model health", ctfModelError:"model unavailable",
+    ctfTabGeneral:"General", ctfTabBudget:"Budget", ctfTabAdapter:"Adapter", ctfTabModel:"Model",
+    ctfBudgetHint:"Per-challenge agent-task budget (concluded intents). A challenge that exceeds its tier is stopped to protect your model quota.",
+    ctfBudgetEasy:"Easy (≤100pt)", ctfBudgetMedium:"Medium (100-300pt)", ctfBudgetHard:"Hard (>300pt)",
+    ctfModeGuardFail:"Cannot enable CTF mode:", ctfGuardNoAdapter:"Select a platform adapter first",
+    ctfGuardNoBaseUrl:"Set the platform Base URL first", ctfGuardNoToken:"Set the platform access key first"
   },
   zh: {
     all:"全部", allProjects:"全部项目", activeProjects:"进行中", stoppedProjects:"已停止",
@@ -1173,7 +1573,37 @@ const CAIRN_I18N = {
     toastIntentDeclaredClaimed:"意图已声明并认领", toastIntentDeclared:"意图已声明",
     toastIntentClaimed:"意图已认领", toastHeartbeat:"心跳已发送", toastIntentReleased:"意图已释放",
     toastIntentConcluded:"意图已结案", toastProjectCompleted:"项目已完成", toastHintAdded:"提示已添加",
-    toastLocalSaved:"本地偏好已保存", toastServerSaved:"服务器设置已保存"
+    toastLocalSaved:"本地偏好已保存", toastServerSaved:"服务器设置已保存",
+    ctfModeToggle:"模式：人工 / CTF 平台", modeManual:"人工", modeCtf:"CTF 平台",
+    ctfBoard:"CTF 平台", ctfPoints:"得分", ctfTotalPoints:"已得总分",
+    ctfSolved:"已解出", ctfSolving:"解题中", ctfQueued:"待开始", ctfRemaining:"剩余题目",
+    ctfRefresh:"刷新题目", ctfSyncing:"同步中...", ctfBridgeOffline:"桥接离线",
+    ctfNotConfigured:"尚未配置 CTF 平台", ctfConfigureHint:"请在设置中填写平台地址与 Token。",
+    ctfOpenSettings:"打开设置", ctfNoChallenges:"还没有同步任何题目",
+    ctfViewProject:"查看项目", ctfStartSolve:"开始解", ctfDescription:"题目描述",
+    ctfQueue:"求解队列", ctfSlots:"槽位", ctfFreeSlot:"空闲", ctfNoFreeSlot:"无空闲槽位", ctfWaitingSlot:"等待空闲槽位", ctfWaitingOpen:"等待平台放题",
+    ctfAttachments:"附件", ctfHints:"提示", ctfAttempts:"尝试次数", ctfLastFlag:"上次 Flag",
+    ctfNoFlag:"—", ctfPlatform:"CTF 平台", ctfPlatformHint:"（由桥接进程使用）",
+    ctfAdapter:"适配器", ctfBaseUrl:"平台地址", ctfBaseUrlPlaceholder:"https://ctf.example.com",
+    ctfToken:"Token", ctfTeamName:"队伍名", ctfFlagRegex:"Flag 正则",
+    ctfMaxConcurrent:"最大并发", ctfPollInterval:"轮询间隔（秒）",
+    ctfAutoSubmit:"自动提交", ctfToggleToken:"显示 / 隐藏 Token",
+    ctfTestConnection:"测试连接", ctfTesting:"测试中...", ctfTestOk:"连接成功",
+    ctfTestFail:"连接失败", statusQueued:"待开始", statusSolving:"解题中",
+    statusSubmitted:"已提取待提交", statusSolved:"已解出", statusWrongFlag:"Flag 错误",
+    statusRateLimited:"限流中", statusPaused:"已暂停", statusFailed:"失败",
+    toastCtfQueued:"题目已加入求解队列", toastCtfRetried:"题目已重新排队",
+    toastCtfPaused:"题目已暂停", toastCtfResumed:"题目已恢复", toastCtfStopped:"题目已停止",
+    ctfPause:"暂停", ctfResume:"恢复", ctfRetry:"重试", ctfStop:"停止",
+    ctfAdapterSection:"平台适配器", ctfEnvPollInterval:"环境轮询（秒）", ctfEnvTimeout:"环境超时（秒）",
+    ctfMaxRetries:"最大提交重试", ctfRateBackoff:"限流退避（秒）",
+    ctfModelSection:"模型（大模型）", ctfModelBaseUrl:"模型 Base URL", ctfModelBaseUrlPlaceholder:"https://dashscope.aliyuncs.com/apps/anthropic",
+    ctfModelName:"模型", ctfModelApiKey:"API Key", ctfTestModel:"测试模型", ctfModelHealth:"模型健康", ctfModelError:"模型不可用",
+    ctfTabGeneral:"通用", ctfTabBudget:"预算", ctfTabAdapter:"适配器", ctfTabModel:"模型",
+    ctfBudgetHint:"每道题的 agent 任务预算（完成的 intent 数）。超过对应档位会自动停止该题，保护模型额度。",
+    ctfBudgetEasy:"简单（≤100分）", ctfBudgetMedium:"中等（100-300分）", ctfBudgetHard:"困难（>300分）",
+    ctfModeGuardFail:"无法启用 CTF 模式：", ctfGuardNoAdapter:"请先选择平台适配器",
+    ctfGuardNoBaseUrl:"请先填写平台 Base URL", ctfGuardNoToken:"请先填写平台访问凭证"
   }
 };
 </script>
@@ -1247,6 +1677,20 @@ function cairnApp() {
     renameForm: { projectId: '', originalTitle: '', title: '' },
     localPrefs: { actor_name: 'Human', layout_mode: 'dagre_tb' },
     settingsForm: { intent_timeout: 5, reason_timeout: 5 },
+    ctfMode: 'manual',
+    ctfForm: { adapter: 'ctfd', base_url: '', token: '', team_name: '', flag_regex: '(?:DASCTF|flag)\\{[^}]+\\}', auto_submit: true, max_concurrent: 2, poll_interval: 10, env_poll_interval: 5, env_timeout: 180, submission_max_retries: 5, rate_limit_backoff: 30, model_base_url: '', model_name: '', model_api_key: '', budget_easy: 12, budget_medium: 25, budget_hard: 40 },
+    ctfSettingsTab: 'general',
+    ctfChallenges: [],
+    ctfStatus: null,
+    ctfExpandedId: null,
+    ctfLoading: false,
+    ctfTesting: false,
+    ctfTestResult: null,
+    ctfModelTesting: false,
+    ctfModelTestResult: null,
+    ctfShowToken: false,
+    ctfShowModelKey: false,
+    ctfPollTimer: null,
     deleteConfirm: { id: '', title: '' },
     isDeletingProject: false,
     yamlPreviewTitle: '',
@@ -1279,7 +1723,9 @@ function cairnApp() {
       this.loadLocalPrefs();
       await this.loadProjects();
       await this.loadSettings();
+      await this.loadCtfConfig();
       this.startPolling();
+      this.startCtfPolling();
       window.addEventListener('hashchange', () => this.handleRoute());
       this.handleRoute();
     },
@@ -1293,7 +1739,7 @@ function cairnApp() {
           this.openProject(id);
         }
       } else {
-        if (this.view !== 'list') this.backToList(true);
+        if (this.view !== 'list' && this.view !== 'ctf') this.backToList(true);
       }
     },
 
@@ -2250,7 +2696,7 @@ function cairnApp() {
         this._timelineEventsCache = [];
         this.polling = true;
       }
-      this.view = 'list';
+      this.view = this.ctfMode === 'ctf' ? 'ctf' : 'list';
       this.shouldRestoreProjectListScroll = true;
       this.project = null;
       this.selectedProjectId = '';
@@ -2260,6 +2706,10 @@ function cairnApp() {
       this.teardownAutoFit();
       if (this.cy) { this.cy.destroy(); this.cy = null; }
       if (!fromRoute) location.hash = '/';
+      if (this.ctfMode === 'ctf') {
+        this.loadCtfChallenges();
+        this.loadCtfStatus();
+      }
       this.loadProjects().then(() => this.restoreProjectListScroll());
     },
 
@@ -3533,9 +3983,271 @@ function cairnApp() {
     async saveServerSettings() {
       try {
         await this.api('PUT', '/settings', this.settingsForm);
+        const cfg = { ...this.ctfForm };
+        await this.api('PUT', '/ctf/config', cfg);
+        this.ctfTestResult = null;
         this.showSettings = false;
         this.showToast(this.t('toastServerSaved'));
+        if (this.ctfMode === 'ctf') {
+          await this.loadCtfChallenges();
+          await this.loadCtfStatus();
+        }
       } catch(e) { this.showToast(e.message, 'error'); }
+    },
+
+    // ------------------------------------------------------------- CTF mode
+
+    ctfConfigured() {
+      return !!(this.ctfForm.base_url && this.ctfMode === 'ctf');
+    },
+
+    async loadCtfConfig() {
+      try {
+        const cfg = await this.api('GET', '/ctf/config');
+        this.ctfMode = cfg.mode || 'manual';
+        this.ctfForm.adapter = cfg.adapter || 'ctfd';
+        this.ctfForm.base_url = cfg.base_url || '';
+        this.ctfForm.token = cfg.token || '';
+        this.ctfForm.team_name = cfg.team_name || '';
+        this.ctfForm.flag_regex = cfg.flag_regex || 'flag\\{[^}]+\\}';
+        this.ctfForm.auto_submit = !!cfg.auto_submit;
+        this.ctfForm.max_concurrent = cfg.max_concurrent ?? 2;
+        this.ctfForm.poll_interval = cfg.poll_interval ?? 10;
+        this.ctfForm.env_poll_interval = cfg.env_poll_interval ?? 5;
+        this.ctfForm.env_timeout = cfg.env_timeout ?? 180;
+        this.ctfForm.submission_max_retries = cfg.submission_max_retries ?? 5;
+        this.ctfForm.rate_limit_backoff = cfg.rate_limit_backoff ?? 30;
+        this.ctfForm.budget_easy = cfg.budget_easy ?? 12;
+        this.ctfForm.budget_medium = cfg.budget_medium ?? 25;
+        this.ctfForm.budget_hard = cfg.budget_hard ?? 40;
+        this.ctfForm.model_base_url = cfg.model_base_url || '';
+        this.ctfForm.model_name = cfg.model_name || '';
+        this.ctfForm.model_api_key = cfg.model_api_key || '';
+        // Switch the home view to match the stored mode, but never yank the
+        // user out of a project graph they may be viewing.
+        if (this.view !== 'graph') {
+          this.view = this.ctfMode === 'ctf' ? 'ctf' : 'list';
+        }
+        if (this.view === 'ctf') {
+          this.loadCtfChallenges();
+          this.loadCtfStatus();
+        }
+      } catch(e) { console.error(e); }
+    },
+
+    async setCtfMode(mode) {
+      if (mode === this.ctfMode) return;
+      // Guard (P0-3): entering CTF mode requires a complete, reachable config.
+      if (mode === 'ctf') {
+        const blocker = this.ctfGuardBlocker();
+        if (blocker) { this.showToast(blocker, 'error'); return; }
+        this.ctfTesting = true;
+        try {
+          await this.api('PUT', '/ctf/config', { ...this.ctfForm });
+          const probe = await this.api('POST', '/ctf/test');
+          if (!probe.ok) {
+            this.showToast(this.t('ctfModeGuardFail') + ' · ' + probe.detail, 'error');
+            return;
+          }
+        } catch(e) {
+          this.showToast(this.t('ctfModeGuardFail') + ' · ' + e.message, 'error');
+          return;
+        } finally {
+          this.ctfTesting = false;
+        }
+      }
+      try {
+        await this.api('PUT', '/ctf/mode', { mode });
+        this.ctfMode = mode;
+        this.view = mode === 'ctf' ? 'ctf' : 'list';
+        if (mode === 'ctf') {
+          this.loadCtfChallenges();
+          this.loadCtfStatus();
+        }
+        if (!location.hash || location.hash === '#/') location.hash = '/';
+      } catch(e) { this.showToast(e.message, 'error'); }
+    },
+
+    ctfGuardBlocker() {
+      if (!this.ctfForm.adapter) return this.t('ctfGuardNoAdapter');
+      if (!this.ctfForm.base_url) return this.t('ctfGuardNoBaseUrl');
+      if (!this.ctfForm.token) return this.t('ctfGuardNoToken');
+      return null;
+    },
+
+    async loadCtfChallenges() {
+      try {
+        this.ctfChallenges = await this.api('GET', '/ctf/challenges');
+      } catch(e) { this.showToast(e.message, 'error'); }
+    },
+
+    async loadCtfStatus() {
+      try {
+        this.ctfStatus = await this.api('GET', '/ctf/status');
+      } catch(e) { console.error(e); }
+    },
+
+    async refreshCtfChallenges() {
+      if (this.ctfLoading) return;
+      this.ctfLoading = true;
+      try {
+        await this.api('POST', '/ctf/sync', {});
+        await this.loadCtfChallenges();
+        await this.loadCtfStatus();
+      } catch(e) { this.showToast(e.message, 'error'); }
+      finally { this.ctfLoading = false; }
+    },
+
+    async startCtfChallenge(ch) {
+      try {
+        await this.api('POST', '/ctf/sync', {});
+        this.showToast(this.t('toastCtfQueued'));
+        this.loadCtfChallenges();
+      } catch(e) { this.showToast(e.message, 'error'); }
+    },
+
+    async testCtfConnection() {
+      this.ctfTesting = true;
+      this.ctfTestResult = null;
+      try {
+        await this.api('PUT', '/ctf/config', { ...this.ctfForm });
+        this.ctfTestResult = await this.api('POST', '/ctf/test');
+      } catch(e) { this.ctfTestResult = { ok: false, detail: e.message }; }
+      finally { this.ctfTesting = false; }
+    },
+
+    async testCtfModel() {
+      this.ctfModelTesting = true;
+      this.ctfModelTestResult = null;
+      try {
+        await this.api('PUT', '/ctf/config', { ...this.ctfForm });
+        this.ctfModelTestResult = await this.api('POST', '/ctf/test-model');
+      } catch(e) { this.ctfModelTestResult = { ok: false, detail: e.message }; }
+      finally { this.ctfModelTesting = false; }
+    },
+
+    // --------------------------------------------------- challenge lifecycle
+
+    async retryCtfChallenge(ch) {
+      try {
+        await this.api('POST', `/ctf/challenges/${ch.id}/retry`, {});
+        this.showToast(this.t('toastCtfRetried'));
+        this.loadCtfChallenges(); this.loadCtfStatus();
+      } catch(e) { this.showToast(e.message, 'error'); }
+    },
+
+    async pauseCtfChallenge(ch) {
+      try {
+        await this.api('POST', `/ctf/challenges/${ch.id}/pause`, {});
+        this.showToast(this.t('toastCtfPaused'));
+        this.loadCtfChallenges(); this.loadCtfStatus();
+        if (this.view === 'list') this.loadProjects();
+      } catch(e) { this.showToast(e.message, 'error'); }
+    },
+
+    async resumeCtfChallenge(ch) {
+      try {
+        await this.api('POST', `/ctf/challenges/${ch.id}/resume`, {});
+        this.showToast(this.t('toastCtfResumed'));
+        this.loadCtfChallenges(); this.loadCtfStatus();
+      } catch(e) { this.showToast(e.message, 'error'); }
+    },
+
+    async stopCtfChallenge(ch) {
+      try {
+        await this.api('POST', `/ctf/challenges/${ch.id}/stop`, {});
+        this.showToast(this.t('toastCtfStopped'));
+        this.loadCtfChallenges(); this.loadCtfStatus();
+        if (this.view === 'list') this.loadProjects();
+      } catch(e) { this.showToast(e.message, 'error'); }
+    },
+
+    ctfCanPause(status) {
+      return ['queued', 'solving', 'submitted', 'rate_limited', 'wrong_flag'].includes(status);
+    },
+    ctfCanResume(status) { return status === 'paused'; },
+    ctfCanRetry(status) { return ['failed', 'paused', 'wrong_flag', 'rate_limited', 'submitted'].includes(status); },
+    ctfCanStop(status) { return ['queued', 'solving', 'submitted', 'rate_limited', 'wrong_flag'].includes(status); },
+
+    toggleCtfChallenge(id) {
+      this.ctfExpandedId = this.ctfExpandedId === id ? null : id;
+    },
+
+    ctfCount(status) {
+      return this.ctfChallenges.filter(ch => ch.status === status).length;
+    },
+
+    ctfTotalPoints() {
+      return this.ctfChallenges.filter(ch => ch.status === 'solved').reduce((sum, ch) => sum + (ch.points || 0), 0);
+    },
+
+    ctfDisplayScore() {
+      // Prefer the platform's official score (from /ctf/status overview); fall
+      // back to the locally-derived sum when the platform exposes none.
+      if (this.ctfStatus && typeof this.ctfStatus.platform_score === 'number') {
+        return this.ctfStatus.platform_score;
+      }
+      return this.ctfTotalPoints();
+    },
+
+    ctfRemaining() {
+      return this.ctfChallenges.filter(ch => !['solved', 'failed'].includes(ch.status)).length;
+    },
+
+    ctfMaxConcurrent() { return this.ctfForm.max_concurrent || 2; },
+    ctfSolvingCount() { return this.ctfCount('solving'); },
+    ctfQueuedCount() { return this.ctfCount('queued'); },
+    ctfFreeSlots() { return Math.max(0, this.ctfMaxConcurrent() - this.ctfSolvingCount()); },
+    ctfQueueList() {
+      // Matches bridge order: oldest-created queued challenge gets the next slot.
+      return this.ctfChallenges.filter(ch => ch.status === 'queued')
+        .sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''));
+    },
+    ctfQueuePosition(ch) {
+      return this.ctfQueueList().findIndex(q => q.id === ch.id) + 1;
+    },
+
+    ctfStatusLabel(status) {
+      const labels = {
+        queued: this.t('statusQueued'), solving: this.t('statusSolving'),
+        submitted: this.t('statusSubmitted'), solved: this.t('statusSolved'),
+        wrong_flag: this.t('statusWrongFlag'), rate_limited: this.t('statusRateLimited'),
+        paused: this.t('statusPaused'), failed: this.t('statusFailed'),
+      };
+      return labels[status] || status || '';
+    },
+
+    ctfStatusDot(status) {
+      const dots = {
+        queued: 'bg-slate-400', solving: 'bg-amber-500', submitted: 'bg-sky-500',
+        solved: 'bg-emerald-500', wrong_flag: 'bg-rose-500', rate_limited: 'bg-orange-500',
+        paused: 'bg-violet-500', failed: 'bg-red-500',
+      };
+      return dots[status] || 'bg-slate-400';
+    },
+
+    ctfStatusBadge(status) {
+      const badges = {
+        queued: 'bg-slate-100 text-slate-600', solving: 'bg-amber-50 text-amber-700',
+        submitted: 'bg-sky-50 text-sky-700', solved: 'bg-emerald-50 text-emerald-700',
+        wrong_flag: 'bg-rose-50 text-rose-700', rate_limited: 'bg-orange-50 text-orange-700',
+        paused: 'bg-violet-50 text-violet-700', failed: 'bg-red-50 text-red-700',
+      };
+      return badges[status] || 'bg-slate-100 text-slate-600';
+    },
+
+    startCtfPolling() {
+      this.stopCtfPolling();
+      this.ctfPollTimer = setInterval(() => {
+        if (this.view === 'ctf') {
+          this.loadCtfChallenges();
+          this.loadCtfStatus();
+        }
+      }, 10000);
+    },
+
+    stopCtfPolling() {
+      if (this.ctfPollTimer) { clearInterval(this.ctfPollTimer); this.ctfPollTimer = null; }
     },
   };
 }

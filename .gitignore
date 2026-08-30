@@ -4,3 +4,7 @@ __pycache__/
 .playwright-cli/
 datas/
 dispatch.yaml
+# SQLite databases may hold the CTF platform token — never commit them.
+*.db
+*.db-wal
+*.db-shm

@@ -178,6 +178,19 @@ runtime:
 uv run --project cairn --group dev pytest
 ```
 
+## CTF 平台接入
+
+Cairn 内置了 CTF 比赛平台自动接入：拉取题目 → 建项目 → Agent 解题 → 自动提交 flag。
+
+- **Bridge 进程**：`uv run cairn ctf-bridge --server http://127.0.0.1:8000`（与 server/dispatcher 并列运行）。
+- **适配器**：`cairn/src/cairn/ctfbridge/adapters/` — 目前含 `dasctf`（西湖论剑/DasCTF）与 `ctfd`（CTFd 通用）两个实现，可通过 `ChallengeSource` 基类扩展新平台。
+- **配置**：接入凭证通过设置页或 `PUT /ctf/config` 写入（`base_url` + `token` + `adapter`），模型配置复用 `dispatch.yaml` 的 worker 环境。
+- **Flag 提交**：自动剥离 `DASCTF{...}` / `flag{...}` 外壳，只提交花括号内内容；`auto_submit` 控制是否自动提交。
+- **预算护栏**：设置页 `budget_easy/medium/hard` 按题目难度档位限制单个项目的 intent 消耗，防止失控解题烧 token。
+- **网关代理**：`scripts/llm_proxy.py` 提供一个路径剥离的反向代理，用于必须走平台 LLM 网关（要求精确 URL）的场景。
+
+> 注意：`dispatch.yaml` 与 SQLite 数据文件（`*.db`）含平台凭证，已在 `.gitignore` 中排除，**切勿提交**。
+
 ## 成绩
 
 **腾讯云黑客松 · AI 渗透测试挑战赛 · 第二届**
