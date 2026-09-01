@@ -155,7 +155,11 @@ def test_claude_analysis_response_extracts_bounded_usage_metadata() -> None:
                     "cache_read_input_tokens": 44,
                     "ignored_future_field": "not persisted",
                 },
-                "modelUsage": {"claude-sonnet-test": {"inputTokens": 111}},
+                "modelUsage": {
+                    "claude-sonnet-test": {"inputTokens": 111},
+                    "claude-sonnet-test[1m": {"inputTokens": 111},
+                    "\u001b[32mclaude-sonnet-test": {"inputTokens": 111},
+                },
                 "session_id": "must-not-be-persisted",
             }
         ),

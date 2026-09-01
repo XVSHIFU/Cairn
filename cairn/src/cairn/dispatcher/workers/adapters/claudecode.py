@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any
 
 from cairn.dispatcher.config import WorkerConfig
@@ -10,6 +11,11 @@ from cairn.dispatcher.workers.health import HealthResult, http_ping, proxies_fro
 
 
 ANTHROPIC_VERSION = "2023-06-01"
+ANSI_MODEL_FRAGMENT = re.compile(r"(?:\x1b)?\[[0-9;?]*[ -/]*[@-~]")
+
+
+def _clean_model_name(value: object) -> str:
+    return ANSI_MODEL_FRAGMENT.sub("", str(value)).strip()
 
 
 class ClaudeCodeDriver(SeedSessionDriver):
@@ -124,7 +130,13 @@ class ClaudeCodeDriver(SeedSessionDriver):
 
         model_usage = payload.get("modelUsage")
         model_names = (
-            sorted(str(name) for name in model_usage if str(name).strip())
+            sorted(
+                {
+                    cleaned
+                    for name in model_usage
+                    if (cleaned := _clean_model_name(name))
+                }
+            )
             if isinstance(model_usage, dict)
             else []
         )

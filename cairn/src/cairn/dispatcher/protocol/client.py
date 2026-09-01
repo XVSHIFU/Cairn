@@ -197,12 +197,23 @@ class CairnClient:
         )
 
     def fail_vulnerability_analysis(
-        self, project_id: str, intent_id: str, worker: str, error: str
+        self,
+        project_id: str,
+        intent_id: str,
+        worker: str,
+        error: str,
+        model: str | None = None,
+        execution_metadata: dict[str, Any] | None = None,
     ) -> ApiResult:
         return self._request_json(
             "POST",
             f"/vulnerability/projects/{project_id}/intents/{intent_id}/ai/failure",
-            json={"worker": worker, "error": error[:2000]},
+            json={
+                "worker": worker,
+                "error": error[:2000],
+                "model": model,
+                "execution_metadata": execution_metadata,
+            },
         )
 
     def _request_json(self, method: str, path: str, json: dict[str, Any]) -> ApiResult:
