@@ -350,6 +350,7 @@ class VulnSourceAdapter(ABC):
                 line[:256]
                 for line in lines
                 if "version" in line.casefold()
+                or re.fullmatch(r"v?\d+(?:\.\d+){1,3}", line)
                 or (
                     self.expected_tool_version is not None
                     and self.expected_tool_version in line
@@ -669,7 +670,7 @@ class SubfinderPassiveDnsAdapter(LineDomainDiscoveryAdapter):
     risk_class = "R1"
     source_type = "subfinder_passive"
     dimension = "external"
-    binary = "subfinder"
+    binary = _configured_user_binary("subfinder", "CAIRN_SUBFINDER_BINARY")
     version_args = ("-version",)
     timeout_seconds = 120
 
@@ -692,7 +693,7 @@ class AmassPassiveEnumAdapter(LineDomainDiscoveryAdapter):
     risk_class = "R1"
     source_type = "amass_passive"
     dimension = "external"
-    binary = "amass"
+    binary = _configured_user_binary("amass", "CAIRN_AMASS_BINARY")
     version_args = ("-version",)
     timeout_seconds = 180
 
@@ -800,6 +801,13 @@ class RdapDomainAdapter(DomainAdapter):
                         "--silent",
                         "--show-error",
                         "--fail-with-body",
+                        "--location",
+                        "--max-redirs",
+                        "5",
+                        "--proto",
+                        "=https",
+                        "--proto-redir",
+                        "=https",
                         "--max-time",
                         str(self.timeout_seconds),
                         "--user-agent",
@@ -1060,7 +1068,7 @@ class DnsxResolveAdapter(DomainAdapter):
     risk_class = "R2"
     source_type = "dns"
     dimension = "external"
-    binary = "dnsx"
+    binary = _configured_user_binary("dnsx", "CAIRN_DNSX_BINARY")
     version_args = ("-version",)
     timeout_seconds = 30
     uses_network = True
@@ -1167,7 +1175,7 @@ class HttpxHttpMetadataAdapter(DomainAdapter):
     risk_class = "R2"
     source_type = "http"
     dimension = "web"
-    binary = "httpx-toolkit"
+    binary = _configured_user_binary("httpx-toolkit", "CAIRN_HTTPX_BINARY")
     version_args = ("-version",)
     timeout_seconds = 30
     uses_http = True
@@ -1377,7 +1385,7 @@ class TlsxTlsMetadataAdapter(DomainAdapter):
     risk_class = "R2"
     source_type = "tls"
     dimension = "web"
-    binary = "tlsx"
+    binary = _configured_user_binary("tlsx", "CAIRN_TLSX_BINARY")
     version_args = ("-version",)
     timeout_seconds = 30
     uses_network = True

@@ -359,6 +359,14 @@ def test_r3_adapters_parse_only_bounded_in_scope_records() -> None:
     assert urls == {"urls": [{"domain": "api.example.com", "url": "https://api.example.com/v1"}]}
 
 
+def test_rdap_redirects_remain_https_only_and_bounded() -> None:
+    invocation = RdapDomainAdapter().materialize(_context())[0]
+    assert invocation.argv[invocation.argv.index("--max-redirs") + 1] == "5"
+    assert invocation.argv[invocation.argv.index("--proto") + 1] == "=https"
+    assert invocation.argv[invocation.argv.index("--proto-redir") + 1] == "=https"
+    assert "--location" in invocation.argv
+
+
 def test_tlsx_accepts_complete_json_emitted_before_hard_process_timeout(
     monkeypatch,
 ) -> None:
