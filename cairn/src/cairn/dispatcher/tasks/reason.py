@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import time
 
 from cairn.dispatcher.config import DispatchConfig, WorkerConfig
@@ -26,6 +27,7 @@ from cairn.dispatcher.tasks.common import (
 )
 from cairn.dispatcher.workers.registry import get_driver
 from cairn.server.models import ProjectDetail
+from cairn.vulnerability_ai_protocol import parse_analysis_draft
 
 LOG = logging.getLogger(__name__)
 
@@ -80,6 +82,7 @@ def run_reason_task(
                     health.detail,
                 )
                 return "unhealthy"
+        vulnerability_profile = config.runtime.profile == "vulnerability"
         open_intents = [
             {
                 "id": intent.id,
@@ -100,23 +103,47 @@ def run_reason_task(
             len(project.hints),
             len(open_intents),
         )
+        analysis_context: dict[str, object] = {}
+        if vulnerability_profile:
+            analysis_context = client.get_vulnerability_reason_context(
+                project.project.id,
+                config.tasks.vulnerability_analysis.max_observations,
+            )
+        prompt_name = "vulnerability_reason.md" if vulnerability_profile else "reason.md"
+        graph_context = export_yaml.strip()
+        if vulnerability_profile and config.runtime.prompt_group == "mock":
+            graph_context = json.dumps(graph_context, ensure_ascii=False)
         prompt = render_prompt(
-            load_prompt(config.runtime.prompt_group, "reason.md"),
+            load_prompt(config.runtime.prompt_group, prompt_name),
             {
-                "graph_yaml": write_graph_snapshot_reference(
-                    container_manager,
-                    container_name,
-                    export_yaml.strip(),
-                    phase="reason_execute",
+                "graph_yaml": (
+                    graph_context
+                    if vulnerability_profile
+                    else write_graph_snapshot_reference(
+                        container_manager,
+                        container_name,
+                        graph_context,
+                        phase="reason_execute",
+                    )
                 ),
                 "fact_ids": format_fact_ids(allowed_fact_ids),
                 "open_intents": format_open_intents(open_intents),
                 "max_intents": str(config.tasks.reason.max_intents),
+                "analysis_context_json": json.dumps(
+                    analysis_context, ensure_ascii=False, indent=2
+                ),
+                "max_budget_units": str(
+                    config.tasks.vulnerability_analysis.max_budget_units
+                ),
             },
         )
 
-        session = driver.prepare_session()
-        command = driver.build_execute(worker, prompt, session)
+        session = None if vulnerability_profile else driver.prepare_session()
+        command = (
+            driver.build_analysis(worker, prompt)
+            if vulnerability_profile
+            else driver.build_execute(worker, prompt, session)
+        )
         execute_started = time.perf_counter()
         result = run_worker_process(
             container_manager,
@@ -124,7 +151,11 @@ def run_reason_task(
             worker,
             command.argv,
             phase="reason_execute",
-            timeout_seconds=config.tasks.reason.timeout,
+            timeout_seconds=(
+                config.tasks.vulnerability_analysis.timeout
+                if vulnerability_profile
+                else config.tasks.reason.timeout
+            ),
             lease=lease,
             cancellation=cancellation,
         )
@@ -173,12 +204,34 @@ def run_reason_task(
                 preview(result.stderr),
             )
             return "failed"
+        if (
+            vulnerability_profile
+            and len(result.stdout.encode("utf-8"))
+            > config.tasks.vulnerability_analysis.max_output_bytes
+        ):
+            LOG.warning(
+                "vulnerability reason output exceeded limit project=%s worker=%s bytes=%s",
+                project.project.id,
+                worker.name,
+                len(result.stdout.encode("utf-8")),
+            )
+            return "failed"
         try:
             model_output = driver.extract_response_text(result.stdout, result.stderr)
             payload = parse_json_output(model_output)
             kind, data = validate_reason_payload(
-                payload, open_intents_empty=not open_intents, max_intents=config.tasks.reason.max_intents,
+                payload,
+                open_intents_empty=(
+                    not open_intents
+                    and (
+                        not vulnerability_profile
+                        or bool(analysis_context.get("observations"))
+                    )
+                ),
+                max_intents=config.tasks.reason.max_intents,
             )
+            if vulnerability_profile and kind == "complete":
+                raise ValueError("vulnerability Reason cannot complete a Campaign project")
         except Exception as exc:
             LOG.warning(
                 "reason parse failed project=%s worker=%s error=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -227,7 +280,53 @@ def run_reason_task(
         if kind == "intents":
             created = 0
             for intent_data in data:
-                response = client.create_intent(project.project.id, intent_data["from"], intent_data["description"], worker.name)
+                if vulnerability_profile:
+                    try:
+                        draft = parse_analysis_draft(intent_data["description"])
+                    except ValueError as exc:
+                        LOG.warning(
+                            "vulnerability reason emitted invalid analysis intent project=%s worker=%s error=%s",
+                            project.project.id,
+                            worker.name,
+                            exc,
+                        )
+                        continue
+                    allowed_observations = {
+                        item["id"]
+                        for item in analysis_context.get("observations", [])
+                        if isinstance(item, dict) and isinstance(item.get("id"), str)
+                    }
+                    if not set(draft.observation_ids).issubset(allowed_observations):
+                        LOG.warning(
+                            "vulnerability reason referenced observations outside bounded context project=%s worker=%s",
+                            project.project.id,
+                            worker.name,
+                        )
+                        continue
+                    if draft.budget_units > config.tasks.vulnerability_analysis.max_budget_units:
+                        LOG.warning(
+                            "vulnerability reason exceeded budget project=%s worker=%s requested=%s max=%s",
+                            project.project.id,
+                            worker.name,
+                            draft.budget_units,
+                            config.tasks.vulnerability_analysis.max_budget_units,
+                        )
+                        continue
+                    response = client.create_vulnerability_analysis(
+                        project.project.id,
+                        intent_data["from"],
+                        draft.analysis_type,
+                        draft.observation_ids,
+                        draft.budget_units,
+                        worker.name,
+                    )
+                else:
+                    response = client.create_intent(
+                        project.project.id,
+                        intent_data["from"],
+                        intent_data["description"],
+                        worker.name,
+                    )
                 if response.status_code == 403:
                     LOG.info("project became inactive during reason intent create project=%s worker=%s created=%s", project.project.id, worker.name, created)
                     return "success"

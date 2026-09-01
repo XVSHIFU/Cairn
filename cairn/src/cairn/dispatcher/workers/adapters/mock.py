@@ -28,6 +28,10 @@ if phase=="reason":
     if not prompt.get("fact_ids"):
         weights.pop("complete",None)
         weights.pop("intent",None)
+if phase=="vulnerability_reason":
+    observations=(prompt.get("analysis_context") or {}).get("observations") or []
+    if not observations:
+        weights.pop("intent",None)
 choices=[(name,weight) for name,weight in weights.items() if weight>0]
 if not choices:
     print(f"mock {phase} has no legal outcomes for prompt context", file=sys.stderr)
@@ -92,6 +96,42 @@ if phase=="reason":
         print(json.dumps({"accepted":True,"data":{"complete":{"description":"mock invalid payload"}}}, ensure_ascii=False))
     raise SystemExit(0)
 
+if phase=="vulnerability_reason":
+    observations=(prompt.get("analysis_context") or {}).get("observations") or []
+    observation_ids=[item["id"] for item in observations if isinstance(item,dict) and item.get("id")]
+    if outcome=="intent" and observation_ids:
+        budget=min(10,int(prompt.get("max_budget_units",10)))
+        draft={"analysis_type":"comprehensive","observation_ids":observation_ids[:10],"budget_units":budget}
+        description="CAIRN_VULNERABILITY_ANALYSIS_V1\\n"+json.dumps(draft,separators=(",",":"))
+        from_ids=(prompt.get("fact_ids") or ["origin"])[:1]
+        print(json.dumps({"accepted":True,"data":{"intents":[{"from":from_ids,"description":description}]}},ensure_ascii=False))
+    elif outcome=="noop":
+        print(json.dumps({"accepted":True,"data":{}},ensure_ascii=False))
+    elif outcome=="rejected":
+        print(json.dumps({"accepted":False,"reason":"mock_rejected"},ensure_ascii=False))
+    else:
+        print(json.dumps({"accepted":True,"data":{"intents":[{"from":[],"description":"invalid"}]}},ensure_ascii=False))
+    raise SystemExit(0)
+
+if phase=="vulnerability_analysis":
+    observations=prompt.get("observations") or []
+    first=observations[0] if observations else {}
+    asset_ref=first.get("asset_id")
+    evidence=[first.get("id")] if first.get("id") else []
+    if outcome=="result":
+        hypotheses=[]
+        gaps=[]
+        if asset_ref:
+            hypotheses=[{"asset_ref":asset_ref,"vuln_id":None,"title":"Mock vulnerability hypothesis","description":"Structured offline inference for pipeline verification","confidence":0.6,"evidence_refs":evidence}]
+            gaps=[{"asset_ref":asset_ref,"dimension":"external","reason":"Mock coverage gap"}]
+        data={"summary":"Mock offline vulnerability analysis completed","extracted_entities":[],"inferred_relations":[],"coverage_gaps":gaps,"hypotheses":hypotheses}
+        print(json.dumps({"accepted":True,"data":data},ensure_ascii=False))
+    elif outcome=="rejected":
+        print(json.dumps({"accepted":False,"reason":"mock_rejected"},ensure_ascii=False))
+    elif outcome=="invalid_payload":
+        print(json.dumps({"accepted":True,"data":{}},ensure_ascii=False))
+    raise SystemExit(0)
+
 if phase=="bootstrap":
     if outcome=="complete":
         print(json.dumps({"accepted":True,"data":{"fact":{"description":"mock fact for bootstrap"},"complete":{"description":"mock bootstrap complete from fact"}}}, ensure_ascii=False))
@@ -146,3 +186,6 @@ class MockDriver(SeedSessionDriver):
 
     def build_conclude(self, worker: WorkerConfig, prompt: str, session: str) -> list[str]:
         return self._argv(worker, prompt)
+
+    def build_analysis(self, worker: WorkerConfig, prompt: str) -> DriverResult:
+        return DriverResult(argv=self._argv(worker, prompt), session=None)

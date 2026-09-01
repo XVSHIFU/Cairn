@@ -1,4 +1,6 @@
-from fastapi import APIRouter, HTTPException
+from typing import Literal
+
+from fastapi import APIRouter, HTTPException, Query
 
 from cairn.server.db import get_conn
 from cairn.server.models import (
@@ -42,7 +44,9 @@ router = APIRouter(tags=["projects"])
 
 
 @router.get("/projects", response_model=list[ProjectSummary])
-def list_projects():
+def list_projects(
+    project_kind: Literal["general", "vulnerability"] = Query(default="general"),
+):
     with get_conn() as conn:
         expire_workers(conn)
         expire_reason_leases(conn)
@@ -54,14 +58,25 @@ def list_projects():
                 (SELECT COUNT(*) FROM intents WHERE project_id = p.id AND concluded_at IS NULL AND worker IS NULL) AS unclaimed_intent_count,
                 (SELECT COUNT(*) FROM hints WHERE project_id = p.id) AS hint_count
             FROM projects p
+            LEFT JOIN vuln_campaigns vc ON vc.project_id = p.id
+            WHERE p.project_kind = ?
+              AND (
+                  ? = 'general'
+                  OR (
+                      vc.status = 'running'
+                      AND vc.authorization_confirmed = 1
+                      AND date(vc.authorization_expires_at) >= date('now')
+                  )
+              )
             ORDER BY p.created_at
-        """).fetchall()
+        """, (project_kind, project_kind)).fetchall()
         return [
             ProjectSummary(
                 id=row["id"],
                 title=row["title"],
                 status=row["status"],
                 bootstrap_enabled=bool(row["bootstrap_enabled"]),
+                project_kind=row["project_kind"],
                 created_at=row["created_at"],
                 reason=project_reason_from_row(row),
                 fact_count=row["fact_count"],
@@ -109,6 +124,7 @@ def create_project(body: CreateProjectRequest):
                 title=body.title,
                 status="active",
                 bootstrap_enabled=body.bootstrap_enabled,
+                project_kind="general",
                 created_at=now,
                 reason=None,
             ),

@@ -44,6 +44,11 @@ class WorkerDriver(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
+    def build_analysis(self, worker: WorkerConfig, prompt: str) -> DriverResult:
+        """Build a non-interactive, tool-disabled command for structured offline analysis."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def build_conclude(self, worker: WorkerConfig, prompt: str, session: str) -> list[str]:
         raise NotImplementedError
 

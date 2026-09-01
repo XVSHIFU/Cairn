@@ -60,3 +60,9 @@ class ClaudeCodeDriver(SeedSessionDriver):
             "--",
             prompt,
         ]
+
+    def build_analysis(self, worker: WorkerConfig, prompt: str) -> DriverResult:
+        return DriverResult(
+            argv=["claude", "--tools", "", "-p", "--", prompt],
+            session=None,
+        )

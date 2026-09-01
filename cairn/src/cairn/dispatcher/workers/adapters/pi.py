@@ -93,7 +93,38 @@ class PiDriver(WorkerDriver):
         ]
         return self._wrap_with_models(worker, argv)
 
-    def _local_argv(self, worker: WorkerConfig, prompt: str, session: str | None) -> list[str]:
+    def build_analysis(self, worker: WorkerConfig, prompt: str) -> DriverResult:
+        if self.local:
+            return DriverResult(
+                argv=self._local_argv(worker, prompt, None, enable_tools=False),
+                session=None,
+            )
+        env = worker.env
+        argv = [
+            "--provider",
+            "cairn",
+            "--model",
+            env["PI_MODEL"],
+            "--mode",
+            "json",
+            "--session-dir",
+            self._session_dir(worker),
+            "-p",
+            prompt,
+        ]
+        return DriverResult(
+            argv=self._wrap_with_models(worker, argv, enable_tools=False),
+            session=None,
+        )
+
+    def _local_argv(
+        self,
+        worker: WorkerConfig,
+        prompt: str,
+        session: str | None,
+        *,
+        enable_tools: bool = True,
+    ) -> list[str]:
         # Native pi: no models.json injection and no --provider/--model overrides, so pi uses
         # its own host configuration. A tiny sh wrapper just ensures the session dir exists.
         session_dir = self._session_dir(worker)
@@ -107,9 +138,12 @@ class PiDriver(WorkerDriver):
             "--no-prompt-templates",
             "--no-themes",
             "--no-context-files",
-            "--tools",
-            "read,write,edit,bash,grep,find,ls",
         ]
+        pi_argv.extend(
+            ["--tools", "read,write,edit,bash,grep,find,ls"]
+            if enable_tools
+            else ["--tools", ""]
+        )
         if session:
             pi_argv.extend(["--session", session])
         pi_argv.extend(["-p", prompt])
@@ -177,6 +211,8 @@ class PiDriver(WorkerDriver):
         ]
         if enable_tools:
             argv.extend(["--tools", "read,write,edit,bash,grep,find,ls"])
+        else:
+            argv.extend(["--tools", ""])
         return [
             "/bin/sh",
             "-lc",

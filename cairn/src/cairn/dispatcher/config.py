@@ -10,7 +10,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-TaskType = Literal["reason", "explore", "bootstrap"]
+TaskType = Literal["reason", "explore", "bootstrap", "vulnerability_analysis"]
 WorkerType = Literal["claudecode", "codex", "pi", "mock"]
 CompletedAction = Literal["remove", "stop"]
 WorkerHealthcheckMode = Literal["startup_and_task", "startup_only", "disabled"]
@@ -45,6 +45,22 @@ DEFAULT_PROMPT_REQUIRED_TOKENS: dict[str, tuple[str, ...]] = {
     "bootstrap_conclude.md": ("{origin}", "{goal}", "{hints}"),
 }
 
+VULNERABILITY_PROMPT_REQUIRED_TOKENS: dict[str, tuple[str, ...]] = {
+    "vulnerability_reason.md": (
+        "{graph_yaml}",
+        "{fact_ids}",
+        "{open_intents}",
+        "{analysis_context_json}",
+        "{max_intents}",
+        "{max_budget_units}",
+    ),
+    "vulnerability_analysis.md": (
+        "{intent_context_json}",
+        "{observations_json}",
+        "{max_output_bytes}",
+    ),
+}
+
 PROMPT_REQUIRED_TOKENS_BY_GROUP: dict[str, dict[str, tuple[str, ...]]] = {
     "mock": {
         "reason.md": ("{fact_ids}", "{open_intents}", "{max_intents}"),
@@ -52,6 +68,18 @@ PROMPT_REQUIRED_TOKENS_BY_GROUP: dict[str, dict[str, tuple[str, ...]]] = {
         "explore_conclude.md": ("{intent_id}",),
         "bootstrap.md": ("{origin}", "{goal}", "{hints}"),
         "bootstrap_conclude.md": ("{origin}", "{goal}", "{hints}"),
+        "vulnerability_reason.md": (
+            "{fact_ids}",
+            "{open_intents}",
+            "{analysis_context_json}",
+            "{max_intents}",
+            "{max_budget_units}",
+        ),
+        "vulnerability_analysis.md": (
+            "{intent_context_json}",
+            "{observations_json}",
+            "{max_output_bytes}",
+        ),
     }
 }
 
@@ -62,6 +90,8 @@ MOCK_ALLOWED_OUTCOMES: dict[str, frozenset[str]] = {
     "explore_conclude": frozenset({"fact", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
     "bootstrap": frozenset({"complete", "fact", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
     "bootstrap_conclude": frozenset({"fact", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
+    "vulnerability_reason": frozenset({"intent", "noop", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
+    "vulnerability_analysis": frozenset({"result", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
 }
 
 MOCK_DEFAULT_BEHAVIOR: dict[str, dict[str, Any]] = {
@@ -122,6 +152,27 @@ MOCK_DEFAULT_BEHAVIOR: dict[str, dict[str, Any]] = {
             "command_fail": "0.0",
         },
     },
+    "vulnerability_reason": {
+        "delay": [0.05, 0.3],
+        "outcomes": {
+            "intent": "1.0",
+            "noop": "0.0",
+            "rejected": "0.0",
+            "invalid_json": "0.0",
+            "invalid_payload": "0.0",
+            "command_fail": "0.0",
+        },
+    },
+    "vulnerability_analysis": {
+        "delay": [0.05, 0.3],
+        "outcomes": {
+            "result": "1.0",
+            "rejected": "0.0",
+            "invalid_json": "0.0",
+            "invalid_payload": "0.0",
+            "command_fail": "0.0",
+        },
+    },
 }
 
 MOCK_ALLOWED_ENV_KEYS = frozenset(
@@ -144,10 +195,20 @@ class BootstrapTaskConfig(BaseModel):
     conclude_timeout: int = Field(gt=0)
 
 
+class VulnerabilityAnalysisTaskConfig(BaseModel):
+    timeout: int = Field(default=180, gt=0)
+    max_observations: int = Field(default=50, ge=1, le=100)
+    max_budget_units: int = Field(default=20, ge=1, le=50)
+    max_output_bytes: int = Field(default=262_144, ge=1024, le=2_000_000)
+
+
 class TasksConfig(BaseModel):
     bootstrap: BootstrapTaskConfig
     reason: ReasonTaskConfig
     explore: ExploreTaskConfig
+    vulnerability_analysis: VulnerabilityAnalysisTaskConfig = Field(
+        default_factory=VulnerabilityAnalysisTaskConfig
+    )
 
 
 class ContainerConfig(BaseModel):
@@ -171,6 +232,7 @@ class RuntimeConfig(BaseModel):
     worker_healthcheck: WorkerHealthcheckMode = "startup_only"
     execution: ExecutionMode = "container"
     prompt_group: str = Field(min_length=1)
+    profile: Literal["general", "vulnerability"] = "general"
 
 
 class WorkerConfig(BaseModel):
@@ -275,7 +337,7 @@ class DispatchConfig(BaseModel):
     def load(cls, path: Path) -> "DispatchConfig":
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         config = cls.model_validate(data)
-        validate_prompt_resources(config.runtime.prompt_group)
+        validate_prompt_resources(config.runtime.prompt_group, config.runtime.profile)
         return config
 
 
@@ -291,7 +353,7 @@ def _validate_optional_positive_int_env(worker_name: str, env: dict[str, str], k
         raise ValueError(f"worker {worker_name} env {key} must be greater than 0")
 
 
-def validate_prompt_resources(prompt_group: str) -> None:
+def validate_prompt_resources(prompt_group: str, profile: str = "general") -> None:
     prompts_dir = resources.files("cairn.dispatcher.prompts")
     group_dir = prompts_dir.joinpath(prompt_group)
     if not group_dir.is_dir():
@@ -305,6 +367,23 @@ def validate_prompt_resources(prompt_group: str) -> None:
         missing = [token for token in tokens if token not in content]
         if missing:
             raise ValueError(f"prompt group {prompt_group} resource {name} missing placeholders: {', '.join(missing)}")
+    if profile == "vulnerability":
+        vulnerability_tokens = VULNERABILITY_PROMPT_REQUIRED_TOKENS
+        if prompt_group == "mock":
+            vulnerability_tokens = {
+                name: PROMPT_REQUIRED_TOKENS_BY_GROUP["mock"][name]
+                for name in VULNERABILITY_PROMPT_REQUIRED_TOKENS
+            }
+        for name, tokens in vulnerability_tokens.items():
+            try:
+                content = group_dir.joinpath(name).read_text(encoding="utf-8")
+            except FileNotFoundError as exc:
+                raise ValueError(f"prompt group {prompt_group} missing resource: {name}") from exc
+            missing = [token for token in tokens if token not in content]
+            if missing:
+                raise ValueError(
+                    f"prompt group {prompt_group} resource {name} missing placeholders: {', '.join(missing)}"
+                )
 
 
 def resolve_mock_behavior(worker_name: str, env: dict[str, str]) -> dict[str, dict[str, Any]]:

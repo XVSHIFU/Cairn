@@ -11,6 +11,10 @@ from cairn.dispatcher.contracts import (
 )
 from cairn.dispatcher.runtime.process import ManagedProcess
 from cairn.dispatcher.workers.adapters.pi import PiDriver
+from cairn.dispatcher.workers.adapters.claudecode import ClaudeCodeDriver
+from cairn.dispatcher.workers.adapters.codex import CodexDriver
+
+from conftest import make_config
 
 
 def test_parse_json_output_extracts_object_from_markdown_noise() -> None:
@@ -94,3 +98,38 @@ def test_close_stream_closes_response_even_when_stream_close_fails() -> None:
 
     assert stream._response.closed
 
+
+def test_analysis_driver_commands_disable_dangerous_tool_access() -> None:
+    base_worker = make_config().workers[0]
+    claude_worker = base_worker.model_copy(update={"type": "claudecode"})
+    claude = ClaudeCodeDriver().build_analysis(claude_worker, "analyze").argv
+    assert "--dangerously-skip-permissions" not in claude
+    assert claude[claude.index("--tools") + 1] == ""
+
+    codex_worker = base_worker.model_copy(
+        update={
+            "type": "codex",
+            "env": {
+                "CODEX_MODEL": "mock",
+                "CODEX_BASE_URL": "http://example.invalid",
+                "OPENAI_API_KEY": "test",
+            },
+        }
+    )
+    codex = CodexDriver().build_analysis(codex_worker, "analyze").argv
+    assert "--dangerously-bypass-approvals-and-sandbox" not in codex
+    assert codex[codex.index("--sandbox") + 1] == "read-only"
+
+    pi_worker = base_worker.model_copy(
+        update={
+            "type": "pi",
+            "env": {
+                "PI_MODEL": "mock",
+                "PI_BASE_URL": "http://example.invalid",
+                "PI_API_KEY": "test",
+                "PI_PROVIDER_API": "openai-completions",
+            },
+        }
+    )
+    pi = PiDriver().build_analysis(pi_worker, "analyze").argv
+    assert pi[pi.index("--tools") + 1] == ""

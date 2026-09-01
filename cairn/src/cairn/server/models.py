@@ -49,6 +49,7 @@ class ProjectMeta(BaseModel):
     title: str
     status: Literal["active", "stopped", "completed"]
     bootstrap_enabled: bool
+    project_kind: Literal["general", "vulnerability"] = "general"
     created_at: str
     reason: ProjectReason | None = None
 

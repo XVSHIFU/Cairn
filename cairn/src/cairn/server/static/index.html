@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Cairn</title>
 <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/vulnerability.css?v=20260831-3">
 <script src="/static/vendor/tailwindcss.js"></script>
 <script src="/static/vendor/dagre.min.js"></script>
 <script src="/static/vendor/cytoscape.min.js"></script>
@@ -13,6 +14,9 @@
 <script src="/static/vendor/cytoscape-klay.js"></script>
 <script src="/static/vendor/elk.bundled.js"></script>
 <script src="/static/vendor/cytoscape-elk.js"></script>
+<script src="/static/vendor/echarts.min.js"></script>
+<script defer src="/static/vulnerability.js?v=20260831-3"></script>
+<script defer src="/static/ui-controls.js?v=20260831-2"></script>
 <script defer src="/static/vendor/alpine.min.js"></script>
 <style>
   [x-cloak] { display: none !important; }
@@ -265,6 +269,10 @@
       </button>
     </div>
     <div class="flex items-center gap-1.5">
+      <button @click="openVulnerability('overview')" class="h-7 px-2.5 rounded-lg border border-sky-200 bg-sky-50/70 text-xs text-sky-700 hover:bg-sky-100/70 transition inline-flex items-center gap-1.5">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="M12 3 4.5 6v5.25c0 4.49 3.2 8.7 7.5 9.75 4.3-1.05 7.5-5.26 7.5-9.75V6L12 3Z"/><path d="m9.5 12 1.75 1.75L15 10"/></svg>
+        <span x-text="t('vulnerabilityMining')"></span>
+      </button>
       <button @click="showNewProject = true" class="h-7 px-2.5 rounded-lg border border-brand-200 text-xs text-brand-600 hover:bg-brand-50 transition inline-flex items-center gap-1.5">
         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="1.9" viewBox="0 0 24 24"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
         <span x-text="t('newProject')"></span>
@@ -611,6 +619,474 @@
     </div>
   </div>
 </div>
+<!-- ═══════════ VULNERABILITY MINING WORKSPACE ═══════════ -->
+<template x-if="view === 'vulnerability'">
+<div class="vuln-workspace flex-1 flex flex-col overflow-hidden">
+  <header class="bg-white/90 backdrop-blur border-b border-slate-200/70 px-4 py-2.5 flex items-center gap-3 shrink-0 z-20">
+    <button @click="backToList()" class="p-1.5 rounded-lg hover:bg-slate-100 transition text-slate-400 hover:text-slate-700" :title="t('vulnBackProjects')">
+      <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M15 19l-7-7 7-7"/></svg>
+    </button>
+    <div class="h-8 w-8 rounded-lg bg-slate-900 text-sky-300 flex items-center justify-center shadow-sm">
+      <svg class="w-4.5 h-4.5" fill="none" stroke="currentColor" stroke-width="1.7" viewBox="0 0 24 24"><path d="M12 3 4.5 6v5.25c0 4.49 3.2 8.7 7.5 9.75 4.3-1.05 7.5-5.26 7.5-9.75V6L12 3Z"/><path d="M9 12h6M12 9v6"/></svg>
+    </div>
+    <div class="min-w-0">
+      <div class="flex items-center gap-2">
+        <h1 class="text-sm font-semibold text-slate-800" x-text="t('vulnerabilityMining')"></h1>
+        <span class="px-1.5 py-0.5 rounded-full border text-[9px] font-semibold uppercase tracking-wider" :class="vulnerabilityCampaign.authorized ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-amber-200 bg-amber-50 text-amber-700'" x-text="vulnerabilityCampaign.authorized ? t('vulnAuthorized') : t('vulnAuthorizationRequired')"></span>
+      </div>
+      <select x-show="vulnerabilityCampaigns.length" x-model="vulnerabilitySelectedCampaignId" @change="vulnerabilitySelectCampaign(vulnerabilitySelectedCampaignId)" class="mt-0.5 max-w-64 border-0 bg-transparent p-0 text-[11px] text-slate-500 outline-none">
+        <template x-for="campaignOption in vulnerabilityCampaigns" :key="campaignOption.id"><option :value="campaignOption.id" x-text="campaignOption.title"></option></template>
+      </select>
+      <p x-show="!vulnerabilityCampaigns.length" class="text-[11px] text-slate-400 truncate" x-text="t('vulnNoCampaign')"></p>
+    </div>
+    <div class="flex-1"></div>
+    <div class="hidden md:flex items-center gap-1.5 text-[11px] text-slate-400">
+      <span x-text="t('vulnLastUpdated')"></span>
+      <span class="font-medium text-slate-600 tabular-nums" x-text="vulnerabilityUpdatedAt"></span>
+    </div>
+    <button @click="vulnerabilityRefreshRecon()" :disabled="vulnerabilityRefreshing" class="h-7 px-2.5 rounded-lg border border-slate-200 text-xs text-slate-600 hover:bg-slate-50 transition inline-flex items-center gap-1.5 disabled:opacity-50">
+      <svg class="w-3.5 h-3.5" :class="{ 'vuln-refreshing': vulnerabilityRefreshing }" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.34 5.66"/><path d="M20 4v7h-7"/></svg>
+      <span x-text="vulnerabilityRefreshing ? t('vulnRefreshing') : t('vulnRefresh')"></span>
+    </button>
+    <div class="flex items-center rounded-lg border border-slate-200 overflow-hidden shrink-0" :title="t('language')">
+      <button type="button" @click="setLang('en')" class="h-7 px-2 text-[11px] font-medium transition" :class="lang === 'en' ? 'bg-slate-800 text-white' : 'text-slate-500 hover:bg-slate-50'">EN</button>
+      <button type="button" @click="setLang('zh')" class="h-7 px-2 text-[11px] font-medium transition" :class="lang === 'zh' ? 'bg-slate-800 text-white' : 'text-slate-500 hover:bg-slate-50'">中文</button>
+    </div>
+  </header>
+
+  <div class="vuln-shell-body flex flex-1 min-h-0 overflow-hidden">
+    <aside class="vuln-sidebar w-56 shrink-0 flex flex-col text-slate-200">
+      <div class="vuln-sidebar-summary px-4 pt-5 pb-4 border-b border-white/10">
+        <div class="text-[10px] uppercase tracking-[0.16em] text-slate-500" x-text="t('vulnCurrentCampaign')"></div>
+        <div class="mt-2 text-sm font-semibold text-white leading-snug" x-text="vulnerabilityCampaign.title || t('vulnNoCampaign')"></div>
+        <div class="mt-3 flex items-center gap-2 text-[11px] text-slate-400">
+          <span class="h-2 w-2 rounded-full" :class="vulnerabilityCampaign.status === 'running' ? 'bg-emerald-400 shadow-[0_0_0_4px_rgba(52,211,153,0.12)]' : 'bg-slate-600'"></span>
+          <span x-text="vulnerabilitySelectedCampaignId ? vulnerabilityCampaignStatusLabel(vulnerabilityCampaign.status) : t('vulnWaitingCampaign')"></span>
+        </div>
+      </div>
+      <nav class="vuln-sidebar-nav flex-1 p-3 space-y-1 overflow-y-auto">
+        <template x-for="item in vulnerabilityNavItems()" :key="item.id">
+          <button @click="setVulnerabilitySection(item.id)" class="vuln-nav-item w-full px-3 py-2.5 rounded-lg text-left text-xs font-medium flex items-center gap-2.5" :class="{ 'is-active': vulnerabilitySection === item.id }">
+            <span class="h-1.5 w-1.5 rounded-full" :class="vulnerabilitySection === item.id ? 'bg-sky-400' : 'bg-slate-600'"></span>
+            <span x-text="t(item.labelKey)"></span>
+          </button>
+        </template>
+      </nav>
+      <div class="vuln-sidebar-summary p-4 border-t border-white/10 text-[10px] text-slate-500 leading-relaxed">
+        <div class="flex justify-between gap-2"><span x-text="t('vulnAuthorizationUntil')"></span><span class="text-slate-300" x-text="vulnerabilityCampaign.authorizationExpiresAt"></span></div>
+        <div class="mt-2 flex justify-between gap-2"><span x-text="t('vulnScopeItems')"></span><span class="text-slate-300" x-text="vulnerabilityCampaign.scope.length"></span></div>
+      </div>
+    </aside>
+
+    <main class="flex-1 min-w-0 overflow-y-auto">
+      <div class="max-w-[1500px] mx-auto p-4 md:p-6">
+        <div class="mb-5 flex flex-col sm:flex-row sm:items-end gap-3">
+          <div>
+            <p class="text-[10px] font-semibold uppercase tracking-[0.16em] text-sky-600" x-text="t('vulnWorkspace')"></p>
+            <h2 class="mt-1 text-xl font-semibold text-slate-800" x-text="t(vulnerabilityNavItems().find(item => item.id === vulnerabilitySection)?.labelKey || 'vulnOverview')"></h2>
+            <p class="mt-1 text-xs text-slate-400" x-text="t('vulnMockNotice')"></p>
+          </div>
+          <div class="flex-1"></div>
+          <button @click="vulnerabilityCreateCampaign()" class="h-9 px-3.5 rounded-xl bg-slate-900 text-white text-xs font-medium hover:bg-slate-800 transition inline-flex items-center justify-center gap-2 shadow-sm">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.9" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+            <span x-text="t('vulnNewCampaign')"></span>
+          </button>
+        </div>
+
+        <div x-show="vulnerabilityLoading" class="mb-4 rounded-xl border border-sky-100 bg-sky-50 px-4 py-3 text-xs text-sky-700" x-text="t('vulnLoading')"></div>
+        <div x-show="vulnerabilityError" class="mb-4 flex items-center justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-700"><span x-text="vulnerabilityError"></span><button @click="loadVulnerabilityWorkspace(vulnerabilitySelectedCampaignId)" class="font-semibold" x-text="t('vulnRetry')"></button></div>
+        <div x-show="vulnerabilityReady && !vulnerabilitySelectedCampaignId" class="mb-4 rounded-2xl border border-dashed border-slate-300 bg-white p-8 text-center"><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnNoCampaignTitle')"></h3><p class="mx-auto mt-2 max-w-xl text-xs text-slate-400" x-text="t('vulnNoCampaignHint')"></p><button @click="vulnerabilityCreateCampaign()" class="mt-4 rounded-xl bg-slate-900 px-4 py-2.5 text-xs font-medium text-white" x-text="t('vulnNewCampaign')"></button></div>
+
+        <!-- Overview -->
+        <section x-show="vulnerabilitySection === 'overview'" x-cloak class="space-y-4">
+          <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+            <template x-for="metric in vulnerabilityMetrics" :key="metric.labelKey">
+              <article class="vuln-card rounded-2xl p-4">
+                <div class="flex items-start justify-between gap-3">
+                  <div>
+                    <p class="text-[11px] text-slate-400" x-text="t(metric.labelKey)"></p>
+                    <p class="mt-2 text-2xl font-semibold tracking-tight text-slate-800 tabular-nums" x-text="metric.value"></p>
+                  </div>
+                  <span class="px-2 py-1 rounded-lg border text-[10px] font-medium" :class="vulnerabilityMetricTone(metric.tone)" x-text="t(metric.metaKey, metric.metaVars)"></span>
+                </div>
+              </article>
+            </template>
+          </div>
+
+          <article class="vuln-card overflow-hidden rounded-2xl">
+            <header class="flex flex-col gap-3 border-b border-slate-100 bg-gradient-to-r from-slate-950 via-slate-900 to-indigo-950 px-5 py-4 text-white sm:flex-row sm:items-center">
+              <div class="flex min-w-0 items-center gap-3">
+                <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-sky-300/20 bg-sky-300/10 text-sky-300">
+                  <svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.7" viewBox="0 0 24 24"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="m7 7 4 9m6-9-4 9M7 6h10"/></svg>
+                </div>
+                <div class="min-w-0">
+                  <div class="flex flex-wrap items-center gap-2"><h3 class="text-sm font-semibold" x-text="t('vulnBlackboardTitle')"></h3><span class="rounded-full border border-sky-300/20 bg-sky-300/10 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-sky-200" x-text="t('vulnBlackboardLive')"></span></div>
+                  <p class="mt-1 text-[11px] leading-relaxed text-slate-300" x-text="t('vulnBlackboardHint')"></p>
+                </div>
+              </div>
+              <div class="flex-1"></div>
+              <div x-show="vulnerabilityBlackboard.project" class="flex shrink-0 items-center gap-2 text-[10px] text-slate-300"><code class="rounded-md bg-white/10 px-2 py-1" x-text="vulnerabilityBlackboard.project?.id"></code><span class="rounded-full border border-emerald-300/20 bg-emerald-300/10 px-2 py-1 text-emerald-200" x-text="vulnerabilityBlackboard.project?.status"></span></div>
+            </header>
+
+            <div class="grid grid-cols-1 border-b border-slate-100 bg-slate-50/80 sm:grid-cols-4">
+              <div class="px-4 py-3"><div class="text-[9px] font-semibold uppercase tracking-wider text-sky-600">FACT</div><div class="mt-1 text-[11px] text-slate-600" x-text="t('vulnBlackboardFactStep')"></div></div>
+              <div class="border-slate-200 px-4 py-3 sm:border-l"><div class="text-[9px] font-semibold uppercase tracking-wider text-indigo-600">INTENT</div><div class="mt-1 text-[11px] text-slate-600" x-text="t('vulnBlackboardIntentStep')"></div></div>
+              <div class="border-slate-200 px-4 py-3 sm:border-l"><div class="text-[9px] font-semibold uppercase tracking-wider text-violet-600">WORKER / REASON</div><div class="mt-1 text-[11px] text-slate-600" x-text="t('vulnBlackboardWorkerStep')"></div></div>
+              <div class="border-slate-200 px-4 py-3 sm:border-l"><div class="text-[9px] font-semibold uppercase tracking-wider text-emerald-600">NEW FACT</div><div class="mt-1 text-[11px] text-slate-600" x-text="t('vulnBlackboardResultStep')"></div></div>
+            </div>
+
+            <div x-show="vulnerabilityBlackboard.loading" class="px-5 py-8 text-center text-xs text-slate-400" x-text="t('vulnBlackboardLoading')"></div>
+            <div x-show="vulnerabilityBlackboard.error" class="m-5 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-700" x-text="vulnerabilityBlackboard.error"></div>
+            <div x-show="!vulnerabilityBlackboard.loading && !vulnerabilityBlackboard.error" class="grid grid-cols-1 divide-y divide-slate-100 xl:grid-cols-[0.9fr_1.4fr_0.9fr] xl:divide-x xl:divide-y-0">
+              <section class="min-w-0 p-5">
+                <div class="mb-3 flex items-center justify-between"><div><h4 class="text-xs font-semibold text-slate-700" x-text="t('vulnBlackboardFacts')"></h4><p class="mt-1 text-[10px] text-slate-400" x-text="t('vulnBlackboardFactsHint')"></p></div><span class="rounded-full bg-sky-50 px-2 py-1 text-[10px] font-semibold text-sky-700" x-text="vulnerabilityBlackboard.facts.length"></span></div>
+                <div x-show="!vulnerabilityBlackboard.facts.length" class="rounded-xl border border-dashed border-slate-200 px-3 py-6 text-center text-[11px] text-slate-400" x-text="t('vulnBlackboardNoFacts')"></div>
+                <div class="max-h-80 space-y-2 overflow-y-auto pr-1"><template x-for="fact in vulnerabilityBlackboard.facts" :key="fact.id"><article class="rounded-xl border border-sky-100 bg-sky-50/50 p-3"><div class="flex items-center justify-between gap-2"><code class="text-[10px] font-semibold text-sky-700" x-text="fact.id"></code><span class="text-[9px] uppercase tracking-wider text-slate-400" x-text="vulnerabilityBlackboardFactRole(fact)"></span></div><p class="mt-2 whitespace-pre-wrap break-words text-[11px] leading-relaxed text-slate-700" x-text="fact.description"></p></article></template></div>
+              </section>
+
+              <section class="min-w-0 p-5">
+                <div class="mb-3 flex items-center justify-between"><div><h4 class="text-xs font-semibold text-slate-700" x-text="t('vulnBlackboardIntents')"></h4><p class="mt-1 text-[10px] text-slate-400" x-text="t('vulnBlackboardIntentsHint')"></p></div><span class="rounded-full bg-indigo-50 px-2 py-1 text-[10px] font-semibold text-indigo-700" x-text="vulnerabilityBlackboard.intents.length"></span></div>
+                <div x-show="!vulnerabilityBlackboard.intents.length" class="rounded-xl border border-dashed border-slate-200 px-3 py-6 text-center text-[11px] text-slate-400" x-text="t('vulnBlackboardNoIntents')"></div>
+                <div class="max-h-80 space-y-2 overflow-y-auto pr-1"><template x-for="intent in vulnerabilityBlackboard.intents" :key="intent.id"><article class="rounded-xl border border-indigo-100 bg-indigo-50/40 p-3"><div class="flex flex-wrap items-center gap-2"><code class="text-[10px] font-semibold text-indigo-700" x-text="intent.id"></code><span class="rounded-full border px-2 py-0.5 text-[9px] font-semibold" :class="vulnerabilityBlackboardIntentStateClass(intent)" x-text="vulnerabilityBlackboardIntentStateLabel(intent)"></span><span class="ml-auto text-[9px] text-slate-400" x-text="vulnerabilityFormatTime(intent.created_at)"></span></div><pre class="mt-2 whitespace-pre-wrap break-words font-mono text-[10px] leading-relaxed text-slate-700" x-text="intent.description"></pre><div class="mt-3 flex flex-wrap gap-x-3 gap-y-1 border-t border-indigo-100 pt-2 text-[9px] text-slate-500"><span x-text="`${t('from')}: ${(intent.from || []).join(', ') || '--'}`"></span><span x-text="`${t('to')}: ${intent.to || '--'}`"></span><span x-text="`${t('creator')}: ${intent.creator}`"></span><span x-text="`${t('worker')}: ${intent.worker || '--'}`"></span></div></article></template></div>
+              </section>
+
+              <section class="min-w-0 p-5">
+                <div class="mb-3 flex items-center justify-between"><div><h4 class="text-xs font-semibold text-slate-700" x-text="t('vulnBlackboardHints')"></h4><p class="mt-1 text-[10px] text-slate-400" x-text="t('vulnBlackboardHintsHint')"></p></div><span class="rounded-full bg-violet-50 px-2 py-1 text-[10px] font-semibold text-violet-700" x-text="vulnerabilityBlackboard.hints.length"></span></div>
+                <div x-show="!vulnerabilityBlackboard.hints.length" class="rounded-xl border border-dashed border-slate-200 px-3 py-6 text-center text-[11px] text-slate-400" x-text="t('vulnBlackboardNoHints')"></div>
+                <div class="max-h-80 space-y-2 overflow-y-auto pr-1"><template x-for="hint in vulnerabilityBlackboard.hints" :key="hint.id"><article class="rounded-xl border border-violet-100 bg-violet-50/40 p-3"><div class="flex items-center justify-between gap-2"><code class="text-[10px] font-semibold text-violet-700" x-text="hint.id"></code><span class="text-[9px] text-slate-400" x-text="vulnerabilityFormatTime(hint.created_at)"></span></div><p class="mt-2 whitespace-pre-wrap break-words text-[11px] leading-relaxed text-slate-700" x-text="hint.content"></p><div class="mt-2 text-[9px] text-slate-400" x-text="`${t('creator')}: ${hint.creator}`"></div></article></template></div>
+              </section>
+            </div>
+            <footer class="flex flex-col gap-2 border-t border-slate-100 bg-white px-5 py-3 text-[10px] text-slate-500 sm:flex-row sm:items-center"><span class="font-semibold text-slate-600" x-text="t('vulnBlackboardReason')"></span><span class="h-2 w-2 rounded-full" :class="vulnerabilityBlackboard.project?.reason ? 'bg-sky-500 shadow-[0_0_0_4px_rgba(14,165,233,0.12)]' : 'bg-slate-300'"></span><span x-text="vulnerabilityBlackboard.project?.reason ? `${vulnerabilityBlackboard.project.reason.worker} · ${vulnerabilityBlackboard.project.reason.trigger}` : t('vulnBlackboardReasonIdle')"></span><span class="sm:ml-auto" x-text="t('vulnBlackboardBoundary')"></span></footer>
+          </article>
+
+          <article class="overflow-hidden rounded-2xl border border-sky-100 bg-gradient-to-br from-sky-50 via-white to-indigo-50 shadow-sm">
+            <div class="flex flex-col gap-5 p-5 lg:flex-row lg:items-start">
+              <div class="min-w-0 flex-1">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="rounded-full border px-2.5 py-1 text-[10px] font-semibold" :class="vulnerabilityCampaign.status === 'running' ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 bg-white text-slate-600'" x-text="vulnerabilityCampaignStatusLabel(vulnerabilityCampaign.status)"></span>
+                  <span class="text-[10px] uppercase tracking-[0.16em] text-sky-600" x-text="t('vulnCollectionResult')"></span>
+                </div>
+                <h3 class="mt-3 text-lg font-semibold text-slate-800" x-text="t('vulnCollectionSummary', vulnerabilityResultSummary)"></h3>
+                <p class="mt-2 max-w-3xl text-xs leading-relaxed text-slate-500" x-text="t('vulnCollectionMeaning')"></p>
+                <p x-show="vulnerabilityResultSummary.assets > vulnerabilityResultSummary.verifiedAssets" class="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-800" x-text="t('vulnCollectionLimit', vulnerabilityResultSummary)"></p>
+              </div>
+              <div class="flex shrink-0 flex-wrap gap-2">
+                <button @click="setVulnerabilitySection('assets')" class="rounded-lg bg-slate-900 px-3 py-2 text-xs font-medium text-white" x-text="t('vulnViewAllAssets')"></button>
+                <button @click="setVulnerabilitySection('recon')" class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-600" x-text="t('vulnViewSources')"></button>
+              </div>
+            </div>
+            <div class="grid grid-cols-1 border-t border-sky-100/80 bg-white/70 sm:grid-cols-4">
+              <div class="px-5 py-3"><div class="text-[10px] text-slate-400" x-text="t('vulnProductiveSources')"></div><div class="mt-1 text-sm font-semibold text-slate-700" x-text="`${vulnerabilityResultSummary.productiveSources}/${vulnerabilityResultSummary.totalSources}`"></div></div>
+              <div class="border-sky-100/80 px-5 py-3 sm:border-l"><div class="text-[10px] text-slate-400" x-text="t('vulnVerifiedAssets')"></div><div class="mt-1 text-sm font-semibold text-slate-700" x-text="`${vulnerabilityResultSummary.verifiedAssets}/${vulnerabilityResultSummary.assets}`"></div></div>
+              <div class="border-sky-100/80 px-5 py-3 sm:border-l"><div class="text-[10px] text-slate-400" x-text="t('vulnObservationMetric')"></div><div class="mt-1 text-sm font-semibold text-slate-700" x-text="vulnerabilityResultSummary.observations"></div></div>
+              <div class="border-sky-100/80 px-5 py-3 sm:border-l"><div class="text-[10px] text-slate-400" x-text="t('vulnDataFreshness')"></div><div class="mt-1 text-sm font-semibold" :class="vulnerabilityResultSummary.staleAssets ? 'text-amber-700' : 'text-emerald-700'" x-text="t('vulnFreshnessSummary', vulnerabilityResultSummary)"></div></div>
+            </div>
+          </article>
+
+          <article class="vuln-card overflow-hidden rounded-2xl">
+            <div class="flex items-center justify-between gap-3 border-b border-slate-100 px-5 py-4">
+              <div><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnCollectedAssets')"></h3><p class="mt-1 text-[11px] text-slate-400" x-text="t('vulnCollectedAssetsHint')"></p></div>
+              <button x-show="vulnerabilityAssets.length > 10" @click="setVulnerabilitySection('assets')" class="text-xs font-medium text-sky-600" x-text="t('vulnViewAllAssets')"></button>
+            </div>
+            <div x-show="!vulnerabilityAssets.length" class="p-8 text-center text-xs text-slate-400" x-text="t('vulnNoCollectedAssets')"></div>
+            <div x-show="vulnerabilityAssets.length" class="overflow-x-auto"><table class="w-full text-left text-xs"><thead class="bg-slate-50/80 text-[10px] uppercase tracking-wider text-slate-400"><tr><th class="px-5 py-3" x-text="t('vulnIdentifier')"></th><th class="px-4 py-3" x-text="t('vulnSource')"></th><th class="px-4 py-3" x-text="t('vulnResultState')"></th><th class="px-5 py-3" x-text="t('vulnUse')"></th></tr></thead><tbody class="divide-y divide-slate-100"><template x-for="asset in vulnerabilityRecentAssets()" :key="asset.id"><tr class="hover:bg-slate-50/60"><td class="px-5 py-3"><div class="font-medium text-slate-700" x-text="asset.identifier"></div><div class="mt-1 text-[10px] text-slate-400" x-text="asset.type"></div></td><td class="px-4 py-3 text-slate-500" x-text="vulnerabilityAssetSourceLabel(asset)"></td><td class="px-4 py-3"><span class="rounded-full border px-2 py-1 text-[10px]" :class="asset.verified ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-amber-200 bg-amber-50 text-amber-700'" x-text="vulnerabilityVerificationLabel(asset)"></span></td><td class="px-5 py-3 text-slate-500" x-text="vulnerabilityAssetUseLabel(asset)"></td></tr></template></tbody></table></div>
+          </article>
+
+          <div class="grid grid-cols-1 xl:grid-cols-[1.45fr_1fr] gap-4">
+            <article class="vuln-card rounded-2xl p-5">
+              <div class="flex items-center justify-between gap-3 mb-4">
+                <div><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnCoverageTitle')"></h3><p class="mt-1 text-[11px] text-slate-400" x-text="t('vulnCoverageHint')"></p></div>
+                <span class="text-xl font-semibold text-indigo-600" x-text="vulnerabilityMetrics[1].value"></span>
+              </div>
+              <div class="space-y-3">
+                <template x-for="dimension in vulnerabilityReconDimensions" :key="dimension.id">
+                  <div class="flex items-center justify-between rounded-xl border border-slate-100 bg-slate-50 px-3 py-2.5">
+                    <span class="font-medium text-slate-600" x-text="t(dimension.labelKey)"></span><span class="text-[11px] tabular-nums" :class="dimension.productive ? 'text-emerald-700' : 'text-slate-400'" x-text="t('vulnRecordsCollected', {count:dimension.discovered})"></span>
+                  </div>
+                </template>
+              </div>
+            </article>
+
+            <article class="vuln-card rounded-2xl p-5">
+              <h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnRecentChanges')"></h3>
+              <div class="mt-4 space-y-4">
+                <template x-for="change in vulnerabilityChanges" :key="change.title">
+                  <div class="flex gap-3">
+                    <span class="mt-1 h-2 w-2 rounded-full shrink-0" :class="change.kind === 'asset' ? 'bg-sky-500' : (change.kind === 'service' ? 'bg-amber-500' : 'bg-indigo-500')"></span>
+                    <div class="min-w-0"><p class="text-xs font-medium text-slate-700 break-words" x-text="change.title"></p><p class="mt-1 text-[11px] text-slate-400" x-text="change.detail"></p></div>
+                    <span class="ml-auto text-[10px] text-slate-400 shrink-0" x-text="change.time"></span>
+                  </div>
+                </template>
+              </div>
+            </article>
+          </div>
+
+          <article class="vuln-card rounded-2xl overflow-hidden">
+            <div class="px-5 py-4 border-b border-slate-100"><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnSourceHealth')"></h3></div>
+            <div class="overflow-x-auto"><table class="w-full text-left text-xs"><thead class="bg-slate-50/80 text-[10px] uppercase tracking-wider text-slate-400"><tr><th class="px-5 py-3" x-text="t('vulnSource')"></th><th class="px-4 py-3" x-text="t('vulnType')"></th><th class="px-4 py-3" x-text="t('vulnStatus')"></th><th class="px-4 py-3" x-text="t('vulnRecords')"></th><th class="px-4 py-3" x-text="t('vulnFreshness')"></th><th class="px-5 py-3 text-right" x-text="t('vulnSourceControl')"></th></tr></thead><tbody class="divide-y divide-slate-100"><template x-for="source in vulnerabilitySources" :key="source.name"><tr class="hover:bg-slate-50/60"><td class="px-5 py-3 font-medium text-slate-700" x-text="source.name"></td><td class="px-4 py-3 text-slate-500" x-text="source.kind"></td><td class="px-4 py-3"><span class="inline-flex items-center gap-1.5 text-slate-600"><span class="h-2 w-2 rounded-full" :class="vulnerabilitySourceDot(source.status)"></span><span x-text="vulnerabilitySourceStatusLabel(source.status)"></span></span></td><td class="px-4 py-3 font-semibold tabular-nums" :class="source.records ? 'text-emerald-700' : 'text-slate-400'" x-text="source.records"></td><td class="px-4 py-3"><div class="text-slate-500" x-text="source.freshness"></div><div x-show="source.freshUntil" class="mt-1 text-[10px]" :class="source.freshnessState === 'stale' ? 'text-amber-600' : 'text-slate-400'" x-text="t('vulnFreshUntil', {time:vulnerabilityFormatTime(source.freshUntil)})"></div></td><td class="px-5 py-3 text-right"><button @click="vulnerabilityToggleSource(source)" class="rounded-lg border px-2.5 py-1 text-[10px]" :class="source.enabled ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 bg-slate-50 text-slate-500'" x-text="source.enabled ? t('vulnEnabled') : t('vulnDisabled')"></button></td></tr></template></tbody></table></div>
+          </article>
+        </section>
+
+        <!-- Recon command center -->
+        <section x-show="vulnerabilitySection === 'recon'" x-cloak class="space-y-4">
+          <div class="grid grid-cols-1 gap-4 xl:grid-cols-[1.25fr_1fr]">
+            <article class="vuln-card overflow-hidden rounded-2xl">
+              <header class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 px-5 py-4">
+                <div><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnReconCoverageRings')"></h3><p class="mt-1 text-[11px] text-slate-400" x-text="t('vulnReconCoverageRingsHint')"></p></div>
+                <span class="rounded-full border border-indigo-100 bg-indigo-50 px-2.5 py-1 text-[10px] font-semibold text-indigo-600" x-text="`${vulnerabilityResultSummary.productiveDimensions}/${vulnerabilityResultSummary.totalDimensions}`"></span>
+              </header>
+              <div id="vulnerabilityCoverageChart" class="h-[310px] w-full" role="img" :aria-label="t('vulnReconCoverageRings')"></div>
+            </article>
+
+            <div class="space-y-4">
+              <article class="vuln-card rounded-2xl p-5">
+                <div class="flex items-start justify-between gap-3"><div><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnReconFreshness')"></h3><p class="mt-1 text-[11px] text-slate-400" x-text="t('vulnReconFreshnessHint')"></p></div><span class="rounded-full px-2.5 py-1 text-[10px] font-semibold" :class="vulnerabilityResultSummary.staleAssets ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700'" x-text="vulnerabilityResultSummary.staleAssets ? t('vulnNeedsAttention') : t('vulnAllFresh')"></span></div>
+                <div class="mt-4 grid grid-cols-2 gap-3">
+                  <div class="rounded-xl bg-emerald-50/70 p-3"><div class="text-[10px] text-emerald-600" x-text="t('vulnFreshAssets')"></div><div class="mt-1 text-xl font-semibold text-emerald-800" x-text="vulnerabilityResultSummary.freshAssets"></div></div>
+                  <div class="rounded-xl bg-amber-50/70 p-3"><div class="text-[10px] text-amber-600" x-text="t('vulnStaleAssets')"></div><div class="mt-1 text-xl font-semibold text-amber-800" x-text="vulnerabilityResultSummary.staleAssets"></div></div>
+                </div>
+                <dl class="mt-4 space-y-2 text-[11px]"><div class="flex items-center justify-between gap-3"><dt class="text-slate-400" x-text="t('vulnLastSuccess')"></dt><dd class="font-medium text-slate-600" x-text="vulnerabilityFormatTime(vulnerabilityFreshnessSummary().lastSuccess)"></dd></div><div class="flex items-center justify-between gap-3"><dt class="text-slate-400" x-text="t('vulnNextUpdate')"></dt><dd class="font-medium text-slate-600" x-text="vulnerabilityFormatTime(vulnerabilityFreshnessSummary().nextRun)"></dd></div></dl>
+              </article>
+
+              <article class="vuln-card rounded-2xl p-5">
+                <div class="flex items-center justify-between"><div><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnSourceHealth')"></h3><p class="mt-1 text-[11px] text-slate-400" x-text="t('vulnReconSourceHealthHint')"></p></div><span class="text-[10px] text-slate-400" x-text="`${vulnerabilitySources.filter(source => source.status === 'healthy').length}/${vulnerabilitySources.length}`"></span></div>
+                <div class="mt-4 max-h-48 space-y-2 overflow-y-auto pr-1"><template x-for="source in vulnerabilitySources" :key="source.id"><div class="rounded-xl border border-slate-100 bg-slate-50 px-3 py-2.5"><div class="flex items-center gap-2"><span class="h-2 w-2 rounded-full" :class="vulnerabilitySourceDot(source.status)"></span><span class="min-w-0 flex-1 truncate text-xs font-medium text-slate-700" x-text="source.name"></span><span class="text-[10px] text-slate-400" x-text="source.freshness"></span></div><p x-show="source.error" class="mt-1 truncate text-[10px] text-rose-500" x-text="source.error"></p></div></template></div>
+              </article>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-3 lg:grid-cols-5">
+            <article class="vuln-card rounded-2xl p-4"><div class="text-[10px] text-slate-400" x-text="t('vulnBacklogTasks')"></div><div class="mt-1 text-xl font-semibold text-slate-800" x-text="vulnerabilityQueueSummary().backlog"></div></article>
+            <article class="vuln-card rounded-2xl p-4"><div class="text-[10px] text-slate-400" x-text="t('vulnPendingApprovals')"></div><div class="mt-1 text-xl font-semibold text-amber-700" x-text="vulnerabilityQueueSummary().approval"></div></article>
+            <article class="vuln-card rounded-2xl p-4"><div class="text-[10px] text-slate-400" x-text="t('vulnFailedTasks')"></div><div class="mt-1 text-xl font-semibold text-rose-700" x-text="vulnerabilityQueueSummary().failed"></div></article>
+            <article class="vuln-card rounded-2xl p-4"><div class="text-[10px] text-slate-400" x-text="t('vulnRecentChanges')"></div><div class="mt-1 text-xl font-semibold text-sky-700" x-text="vulnerabilityChanges.length"></div></article>
+            <article class="vuln-card col-span-2 rounded-2xl p-4 lg:col-span-1"><div class="text-[10px] text-slate-400" x-text="t('vulnAIHypotheses')"></div><div class="mt-1 text-xl font-semibold text-indigo-700" x-text="vulnerabilityHypotheses.length"></div></article>
+          </div>
+
+          <article class="vuln-card overflow-hidden rounded-2xl">
+            <header class="flex flex-col gap-3 border-b border-slate-100 px-5 py-4 lg:flex-row lg:items-center">
+              <div><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnReconWorkspace')"></h3><p class="mt-1 text-[11px] text-slate-400" x-text="t('vulnReconWorkspaceHint')"></p></div>
+              <div class="flex-1"></div>
+              <nav class="inline-flex rounded-xl bg-slate-100 p-1" :aria-label="t('vulnReconWorkspace')">
+                <button @click="vulnerabilityReconPanel = 'assets'" class="rounded-lg px-3 py-2 text-xs font-medium transition" :class="vulnerabilityReconPanel === 'assets' ? 'bg-white text-sky-700 shadow-sm' : 'text-slate-500'" x-text="t('vulnReconAssetsTab')"></button>
+                <button @click="vulnerabilityReconPanel = 'tasks'" class="rounded-lg px-3 py-2 text-xs font-medium transition" :class="vulnerabilityReconPanel === 'tasks' ? 'bg-white text-sky-700 shadow-sm' : 'text-slate-500'" x-text="t('vulnReconTasksTab')"></button>
+                <button @click="vulnerabilityReconPanel = 'intel'" class="rounded-lg px-3 py-2 text-xs font-medium transition" :class="vulnerabilityReconPanel === 'intel' ? 'bg-white text-sky-700 shadow-sm' : 'text-slate-500'" x-text="t('vulnReconIntelTab')"></button>
+              </nav>
+            </header>
+
+            <div x-show="vulnerabilityReconPanel === 'assets'">
+              <div class="grid grid-cols-1 gap-2 border-b border-slate-100 bg-slate-50/60 p-4 md:grid-cols-3 xl:grid-cols-6">
+                <input x-model="vulnerabilityAssetFilters.query" @input="vulnerabilityAssetPage = 1" :placeholder="t('vulnSearchAssets')" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs outline-none focus:border-sky-400 xl:col-span-2">
+                <select x-model="vulnerabilityAssetFilters.type" @change="vulnerabilityAssetPage = 1" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600"><option value="" x-text="t('vulnAllTypes')"></option><template x-for="type in vulnerabilityReconAssetTypes()" :key="type"><option :value="type" x-text="type"></option></template></select>
+                <select x-model="vulnerabilityAssetFilters.scope" @change="vulnerabilityAssetPage = 1" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600"><option value="" x-text="t('vulnAllScopes')"></option><option value="in">in</option><option value="out">out</option><option value="pending">pending</option></select>
+                <select x-model="vulnerabilityAssetFilters.source" @change="vulnerabilityAssetPage = 1" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600"><option value="" x-text="t('vulnAllSources')"></option><template x-for="source in vulnerabilityReconAssetSources()" :key="source"><option :value="source" x-text="source"></option></template></select>
+                <div class="flex gap-2"><select x-model="vulnerabilityAssetFilters.risk" @change="vulnerabilityAssetPage = 1" class="min-w-0 flex-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600"><option value="" x-text="t('vulnAllRisks')"></option><option value="critical">critical</option><option value="high">high</option><option value="medium">medium</option><option value="low">low</option><option value="unknown">unknown</option></select><button @click="vulnerabilityResetAssetFilters()" class="rounded-xl border border-slate-200 bg-white px-3 text-[10px] text-slate-500" x-text="t('vulnReset')"></button></div>
+              </div>
+
+              <div class="overflow-x-auto">
+                <table class="w-full min-w-[900px] text-left text-xs">
+                  <thead class="bg-slate-50/80 text-[10px] uppercase tracking-wider text-slate-400"><tr><th class="px-5 py-3" x-text="t('vulnIdentifier')"></th><th class="px-4 py-3" x-text="t('vulnSourceCount')"></th><th class="cursor-pointer px-4 py-3" @click="vulnerabilitySetAssetSort('observations')"><span x-text="t('vulnEvidenceCount')"></span> <span x-text="vulnerabilityAssetSortMark('observations')"></span></th><th class="px-4 py-3" x-text="t('vulnCoverageState')"></th><th class="cursor-pointer px-4 py-3" @click="vulnerabilitySetAssetSort('importance')"><span x-text="t('vulnImportance')"></span> <span x-text="vulnerabilityAssetSortMark('importance')"></span></th><th class="cursor-pointer px-4 py-3" @click="vulnerabilitySetAssetSort('riskScore')"><span x-text="t('vulnRiskScore')"></span> <span x-text="vulnerabilityAssetSortMark('riskScore')"></span></th><th class="cursor-pointer px-5 py-3 text-right" @click="vulnerabilitySetAssetSort('lastSeenAt')"><span x-text="t('vulnUpdated')"></span> <span x-text="vulnerabilityAssetSortMark('lastSeenAt')"></span></th></tr></thead>
+                  <tbody class="divide-y divide-slate-100"><template x-for="asset in vulnerabilityReconPagedAssets()" :key="asset.id"><tr @click="vulnerabilityOpenAssetDetail(asset)" class="cursor-pointer hover:bg-sky-50/50"><td class="px-5 py-3"><div class="flex items-center gap-2"><span class="h-2 w-2 rounded-full" :class="asset.freshnessState === 'stale' ? 'bg-amber-400' : 'bg-emerald-400'"></span><span class="font-medium text-slate-700" x-text="asset.identifier"></span></div><div class="mt-1 text-[10px] text-slate-400" x-text="`${asset.type} · ${asset.scope}`"></div></td><td class="px-4 py-3"><div class="font-semibold text-slate-700" x-text="asset.sources.length"></div><div class="mt-1 max-w-40 truncate text-[10px] text-slate-400" x-text="vulnerabilityAssetSourceLabel(asset)"></div></td><td class="px-4 py-3 font-semibold tabular-nums text-slate-700" x-text="asset.observations"></td><td class="px-4 py-3"><div class="flex items-center gap-2"><span class="rounded-full border px-2 py-1 text-[10px]" :class="vulnerabilityStatusClass(asset.coverage.status)" x-text="asset.coverage.status"></span><span class="text-[10px] text-slate-400" x-text="vulnerabilityCoverageLabel(asset)"></span></div></td><td class="px-4 py-3 text-slate-600" x-text="asset.importance"></td><td class="px-4 py-3"><div class="flex items-center gap-2"><span class="font-semibold tabular-nums text-slate-700" x-text="vulnerabilityAssetRiskScore(asset)"></span><span class="rounded-full border px-2 py-1 text-[10px]" :class="vulnerabilitySeverityClass(asset.risk)" x-text="asset.risk"></span></div></td><td class="px-5 py-3 text-right text-slate-400" x-text="asset.updated"></td></tr></template></tbody>
+                </table>
+              </div>
+              <div x-show="!vulnerabilityReconFilteredAssets().length" class="p-10 text-center text-xs text-slate-400" x-text="t('vulnNoMatchingAssets')"></div>
+              <footer class="flex flex-col gap-3 border-t border-slate-100 px-5 py-4 sm:flex-row sm:items-center"><div class="text-[11px] text-slate-400" x-text="t('vulnAssetPageSummary', vulnerabilityAssetPageSummary())"></div><div class="flex-1"></div><select x-model.number="vulnerabilityAssetPageSize" @change="vulnerabilityAssetPage = 1" class="rounded-lg border border-slate-200 px-2 py-1.5 text-[10px]"><option :value="10">10</option><option :value="25">25</option><option :value="50">50</option></select><div class="flex gap-2"><button @click="vulnerabilitySetAssetPage(vulnerabilityAssetPage - 1)" :disabled="vulnerabilityAssetPage <= 1" class="rounded-lg border border-slate-200 px-3 py-1.5 text-[10px] text-slate-500 disabled:opacity-30" x-text="t('vulnPrevious')"></button><button @click="vulnerabilitySetAssetPage(vulnerabilityAssetPage + 1)" :disabled="vulnerabilityAssetPage >= vulnerabilityAssetTotalPages()" class="rounded-lg border border-slate-200 px-3 py-1.5 text-[10px] text-slate-500 disabled:opacity-30" x-text="t('vulnNext')"></button></div></footer>
+            </div>
+
+            <div x-show="vulnerabilityReconPanel === 'tasks'">
+              <div class="flex flex-col gap-3 border-b border-slate-100 bg-slate-50/60 p-4 sm:flex-row sm:items-center"><div><h4 class="text-xs font-semibold text-slate-700" x-text="t('vulnCollectionTaskCenter')"></h4><p class="mt-1 text-[10px] text-slate-400" x-text="t('vulnCollectionTaskCenterHint')"></p></div><div class="flex-1"></div><select x-model="vulnerabilityTaskStatusFilter" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600"><option value="" x-text="t('vulnAllStatuses')"></option><option value="pending_approval">pending_approval</option><option value="queued">queued</option><option value="running">running</option><option value="succeeded">succeeded</option><option value="failed">failed</option><option value="rejected">rejected</option></select></div>
+              <div x-show="!vulnerabilityFilteredCollectionTasks().length" class="p-10 text-center text-xs text-slate-400" x-text="t('vulnNoCollectionTasks')"></div>
+              <div class="divide-y divide-slate-100"><template x-for="task in vulnerabilityFilteredCollectionTasks()" :key="task.id"><article class="p-5"><div class="flex flex-col gap-4 xl:flex-row xl:items-center"><div class="min-w-0 flex-1"><div class="flex flex-wrap items-center gap-2"><span class="font-mono text-[10px] text-slate-400" x-text="task.id"></span><span class="rounded-full border px-2 py-1 text-[10px]" :class="vulnerabilityStatusClass(task.status)" x-text="task.status"></span><span class="rounded-full bg-slate-100 px-2 py-1 text-[10px] text-slate-600" x-text="task.risk_tier"></span><span x-show="task.approval_kind === 'policy'" class="rounded-full bg-indigo-50 px-2 py-1 text-[10px] text-indigo-600" x-text="t('vulnPolicyApproved')"></span></div><h4 class="mt-2 text-xs font-semibold text-slate-700" x-text="task.adapter"></h4><p class="mt-1 truncate text-[10px] text-slate-400" x-text="task.paramsSummary"></p></div><div class="grid grid-cols-2 gap-3 text-[10px] text-slate-400 sm:grid-cols-3"><div><div x-text="t('vulnAttempts')"></div><div class="mt-1 font-semibold text-slate-600" x-text="`${task.attempt_count}/${task.max_attempts}`"></div></div><div><div x-text="t('vulnApproval')"></div><div class="mt-1 font-semibold text-slate-600" x-text="task.approval_state"></div></div><div><div x-text="t('vulnCreated')"></div><div class="mt-1 font-semibold text-slate-600" x-text="task.createdLabel"></div></div></div><div x-show="task.status === 'pending_approval'" class="flex gap-2"><button @click="vulnerabilityOpenTaskApproval(task, 'reject')" class="rounded-lg border border-rose-200 px-3 py-2 text-[10px] font-medium text-rose-600" x-text="t('vulnReject')"></button><button @click="vulnerabilityOpenTaskApproval(task, 'approve')" class="rounded-lg bg-emerald-600 px-3 py-2 text-[10px] font-medium text-white" x-text="t('vulnApprove')"></button></div><button x-show="vulnerabilityCanRetryTask(task)" @click="vulnerabilityRetryCollectionTask(task)" :disabled="task.retrying" class="rounded-lg border border-amber-200 px-3 py-2 text-[10px] font-medium text-amber-700 disabled:opacity-50" x-text="t('vulnManualRetry')"></button></div><p x-show="task.last_error" class="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-[10px] text-rose-600" x-text="task.last_error"></p></article></template></div>
+            </div>
+
+            <div x-show="vulnerabilityReconPanel === 'intel'" class="grid grid-cols-1 gap-4 p-5 xl:grid-cols-2">
+              <section><div class="flex items-center justify-between"><div><h4 class="text-xs font-semibold text-slate-700" x-text="t('vulnAIHypotheses')"></h4><p class="mt-1 text-[10px] text-slate-400" x-text="t('vulnReconHypothesesHint')"></p></div><span class="rounded-full bg-indigo-50 px-2 py-1 text-[10px] text-indigo-600" x-text="vulnerabilityHypotheses.length"></span></div><div class="mt-4 space-y-3"><template x-for="hypothesis in vulnerabilityHypotheses.slice(0, 10)" :key="hypothesis.id"><button @click="hypothesis.asset_id && vulnerabilityOpenAssetDetail(vulnerabilityAssets.find(asset => asset.id === hypothesis.asset_id))" class="w-full rounded-xl border border-indigo-100 bg-indigo-50/40 p-3 text-left hover:bg-indigo-50"><div class="flex items-center justify-between gap-3"><span class="rounded-full bg-white px-2 py-1 text-[10px] text-indigo-600" x-text="hypothesis.confidenceLabel"></span><span class="text-[10px] text-slate-400" x-text="hypothesis.createdLabel"></span></div><h5 class="mt-2 text-xs font-semibold text-slate-700" x-text="hypothesis.title"></h5><p class="mt-1 line-clamp-2 text-[10px] leading-relaxed text-slate-500" x-text="hypothesis.description"></p><div class="mt-2 font-mono text-[10px] text-slate-400" x-text="`${hypothesis.asset}${hypothesis.vuln_id ? ' · ' + hypothesis.vuln_id : ''}`"></div></button></template><div x-show="!vulnerabilityHypotheses.length" class="py-10 text-center text-xs text-slate-400" x-text="t('vulnAINoHypotheses')"></div></div></section>
+              <section><div class="flex items-center justify-between"><div><h4 class="text-xs font-semibold text-slate-700" x-text="t('vulnRecentVulnIntel')"></h4><p class="mt-1 text-[10px] text-slate-400" x-text="t('vulnRecentVulnIntelHint')"></p></div><span class="rounded-full bg-amber-50 px-2 py-1 text-[10px] text-amber-700" x-text="vulnerabilityRecentIntelligenceFindings().length"></span></div><div class="mt-4 space-y-3"><template x-for="finding in vulnerabilityRecentIntelligenceFindings()" :key="finding.id"><button @click="finding.asset_id && vulnerabilityOpenAssetDetail(vulnerabilityAssets.find(asset => asset.id === finding.asset_id))" class="w-full rounded-xl border border-amber-100 bg-amber-50/40 p-3 text-left hover:bg-amber-50"><div class="flex items-center justify-between gap-3"><span class="rounded-full border px-2 py-1 text-[10px]" :class="vulnerabilitySeverityClass(finding.severity)" x-text="finding.severity"></span><span class="text-[10px] text-slate-400" x-text="finding.updated"></span></div><h5 class="mt-2 text-xs font-semibold text-slate-700" x-text="finding.title"></h5><p class="mt-1 font-mono text-[10px] text-slate-400" x-text="finding.asset"></p></button></template><div x-show="!vulnerabilityRecentIntelligenceFindings().length" class="py-10 text-center text-xs text-slate-400" x-text="t('vulnNoVulnIntel')"></div></div></section>
+            </div>
+          </article>
+        </section>
+
+        <!-- Assets -->
+        <section x-show="vulnerabilitySection === 'assets'" x-cloak class="space-y-4">
+          <article class="vuln-card rounded-2xl overflow-hidden">
+            <div class="p-4 border-b border-slate-100 flex flex-col sm:flex-row sm:items-center gap-3"><div><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnAssetInventory')"></h3><p class="mt-1 text-[11px] text-slate-400" x-text="t('vulnAssetInventoryHint')"></p></div><div class="flex-1"></div><button @click="vulnerabilityOpenImport()" :disabled="!vulnerabilitySelectedCampaignId" class="rounded-lg border border-sky-200 px-3 py-2 text-xs font-medium text-sky-700 hover:bg-sky-50 disabled:opacity-40" x-text="t('vulnImportAssets')"></button><input x-model="vulnerabilityAssetSearch" :placeholder="t('vulnSearchAssets')" class="w-full sm:w-64 px-3 py-2 rounded-xl border border-slate-200 bg-white text-xs focus:outline-none focus:ring-2 focus:ring-sky-100 focus:border-sky-400"></div>
+            <div class="overflow-x-auto"><table class="w-full text-left text-xs"><thead class="bg-slate-50/80 text-[10px] uppercase tracking-wider text-slate-400"><tr><th class="px-5 py-3">ID</th><th class="px-4 py-3" x-text="t('vulnType')"></th><th class="px-4 py-3" x-text="t('vulnIdentifier')"></th><th class="px-4 py-3" x-text="t('vulnSource')"></th><th class="px-4 py-3" x-text="t('vulnResultState')"></th><th class="px-4 py-3" x-text="t('vulnScope')"></th><th class="px-4 py-3" x-text="t('vulnTechnology')"></th><th class="px-4 py-3" x-text="t('vulnRisk')"></th><th class="px-5 py-3 text-right" x-text="t('vulnUpdated')"></th></tr></thead><tbody class="divide-y divide-slate-100"><template x-for="asset in vulnerabilityFilteredAssets()" :key="asset.id"><tr class="hover:bg-slate-50/60"><td class="px-5 py-3 font-mono text-[10px] text-slate-400" x-text="asset.id"></td><td class="px-4 py-3 text-slate-500" x-text="asset.type"></td><td class="px-4 py-3 font-medium text-slate-700" x-text="asset.identifier"></td><td class="px-4 py-3 text-slate-500" x-text="vulnerabilityAssetSourceLabel(asset)"></td><td class="px-4 py-3"><span class="rounded-full border px-2 py-1 text-[10px]" :class="asset.verified ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-amber-200 bg-amber-50 text-amber-700'" x-text="vulnerabilityVerificationLabel(asset)"></span></td><td class="px-4 py-3"><span class="px-2 py-1 rounded-full border text-[10px]" :class="asset.scope === 'in' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : (asset.scope === 'out' ? 'bg-rose-50 text-rose-700 border-rose-200' : 'bg-amber-50 text-amber-700 border-amber-200')" x-text="asset.scope"></span></td><td class="px-4 py-3 text-slate-500" x-text="asset.technology"></td><td class="px-4 py-3"><span class="px-2 py-1 rounded-full border text-[10px] font-medium" :class="vulnerabilitySeverityClass(asset.risk)" x-text="asset.risk"></span></td><td class="px-5 py-3 text-right text-slate-400" x-text="asset.updated"></td></tr></template></tbody></table></div>
+          </article>
+          <article class="vuln-card overflow-hidden rounded-2xl">
+            <div class="flex flex-col gap-3 border-b border-slate-100 px-5 py-4 lg:flex-row lg:items-center"><div><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnAssetGraph')"></h3><p class="mt-1 text-xs text-slate-400" x-text="t('vulnAssetGraphHintReal')"></p></div><div class="flex-1"></div><span class="rounded-full border border-indigo-100 bg-indigo-50 px-2.5 py-1 text-[10px] text-indigo-600" x-text="`${vulnerabilityFilteredGraphAssets().length} ${t('vulnGraphNodes')} · ${vulnerabilityRelations.length} ${t('vulnRelations')}`"></span></div>
+            <div class="grid grid-cols-1 gap-2 border-b border-slate-100 bg-slate-50/60 p-4 sm:grid-cols-4">
+              <select x-model="vulnerabilityAssetGraphFilters.type" @change="$nextTick(() => vulnerabilityRenderAssetGraph())" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600"><option value="" x-text="t('vulnAllTypes')"></option><template x-for="type in vulnerabilityReconAssetTypes()" :key="type"><option :value="type" x-text="type"></option></template></select>
+              <select x-model="vulnerabilityAssetGraphFilters.scope" @change="$nextTick(() => vulnerabilityRenderAssetGraph())" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600"><option value="" x-text="t('vulnAllScopes')"></option><option value="in">in</option><option value="out">out</option><option value="pending">pending</option></select>
+              <select x-model="vulnerabilityAssetGraphFilters.importance" @change="$nextTick(() => vulnerabilityRenderAssetGraph())" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600"><option value="" x-text="t('vulnAllImportance')"></option><option value="critical">critical</option><option value="high">high</option><option value="normal">normal</option><option value="low">low</option></select>
+              <button @click="vulnerabilityResetAssetGraphFilters()" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-500" x-text="t('vulnReset')"></button>
+            </div>
+            <div class="relative"><div id="vulnerabilityAssetGraphCanvas" class="h-[560px] w-full" role="img" :aria-label="t('vulnAssetGraph')"></div><div x-show="!vulnerabilityFilteredGraphAssets().length" class="absolute inset-0 flex items-center justify-center bg-white/80 text-xs text-slate-400" x-text="t('vulnNoGraphAssets')"></div><div class="pointer-events-none absolute bottom-4 left-4 rounded-lg border border-slate-200 bg-white/90 px-3 py-2 text-[10px] text-slate-500 shadow-sm" x-text="t('vulnAssetGraphClickHint')"></div></div>
+          </article>
+        </section>
+
+        <!-- Tasks -->
+        <section x-show="vulnerabilitySection === 'tasks'" x-cloak class="space-y-4">
+          <article class="vuln-card overflow-hidden rounded-2xl">
+            <header class="flex flex-col gap-3 border-b border-slate-100 px-5 py-4 lg:flex-row lg:items-center"><div><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnUnifiedTasks')"></h3><p class="mt-1 text-[11px] text-slate-400" x-text="t('vulnUnifiedTasksHint')"></p></div><div class="flex-1"></div><button @click="vulnerabilityReconPanel = 'tasks'; setVulnerabilitySection('recon')" class="rounded-lg border border-sky-200 px-3 py-2 text-xs font-medium text-sky-700 hover:bg-sky-50" x-text="t('vulnOpenTaskCenter')"></button></header>
+            <div class="grid grid-cols-2 gap-3 border-b border-slate-100 bg-slate-50/60 p-4 lg:grid-cols-4"><div class="rounded-xl bg-white p-3"><div class="text-[10px] text-slate-400" x-text="t('vulnUnifiedTotal')"></div><div class="mt-1 text-xl font-semibold text-slate-800" x-text="vulnerabilityUnifiedTaskSummary().total"></div></div><div class="rounded-xl bg-white p-3"><div class="text-[10px] text-slate-400" x-text="t('vulnJobRecords')"></div><div class="mt-1 text-xl font-semibold text-sky-700" x-text="vulnerabilityUnifiedTaskSummary().jobs"></div></div><div class="rounded-xl bg-white p-3"><div class="text-[10px] text-slate-400" x-text="t('vulnCollectionTaskRecords')"></div><div class="mt-1 text-xl font-semibold text-indigo-700" x-text="vulnerabilityUnifiedTaskSummary().collection"></div></div><div class="rounded-xl bg-white p-3"><div class="text-[10px] text-slate-400" x-text="t('vulnNeedsAttention')"></div><div class="mt-1 text-xl font-semibold text-amber-700" x-text="vulnerabilityUnifiedTaskSummary().attention"></div></div></div>
+            <div class="flex flex-col gap-2 border-b border-slate-100 p-4 sm:flex-row"><select x-model="vulnerabilityUnifiedTaskKind" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600"><option value="" x-text="t('vulnAllTaskKinds')"></option><option value="job" x-text="t('vulnJobRecord')"></option><option value="collection" x-text="t('vulnCollectionTaskRecord')"></option></select><select x-model="vulnerabilityUnifiedTaskStatus" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600"><option value="" x-text="t('vulnAllStatuses')"></option><option value="pending_approval">pending_approval</option><option value="queued">queued</option><option value="running">running</option><option value="completed">completed</option><option value="succeeded">succeeded</option><option value="failed">failed</option><option value="rejected">rejected</option></select></div>
+            <div x-show="!vulnerabilityUnifiedTasks().length" class="p-10 text-center text-xs text-slate-400" x-text="t('vulnNoTasks')"></div>
+            <div class="divide-y divide-slate-100"><template x-for="task in vulnerabilityUnifiedTasks()" :key="task.key"><article class="p-5"><div class="flex flex-col gap-4 xl:flex-row xl:items-center"><div class="min-w-0 flex-1"><div class="flex flex-wrap items-center gap-2"><span class="rounded-full px-2 py-1 text-[10px] font-medium" :class="task.recordKind === 'job' ? 'bg-sky-50 text-sky-700' : 'bg-indigo-50 text-indigo-700'" x-text="task.recordKind === 'job' ? t('vulnJobRecord') : t('vulnCollectionTaskRecord')"></span><span class="font-mono text-[10px] text-slate-400" x-text="task.id"></span><span class="rounded-full border px-2 py-1 text-[10px]" :class="vulnerabilityStatusClass(task.status)" x-text="task.status"></span><span class="rounded-full bg-slate-100 px-2 py-1 text-[10px] text-slate-600" x-text="task.riskTier"></span></div><h3 class="mt-2 text-sm font-semibold text-slate-700" x-text="task.title"></h3><p class="mt-1 truncate text-[10px] text-slate-400" x-text="task.detail"></p><p x-show="task.parentId" class="mt-1 font-mono text-[9px] text-slate-400" x-text="`${t('vulnParentJob')}: ${task.parentId}`"></p></div><div class="grid grid-cols-2 gap-4 text-[10px] sm:grid-cols-3"><div><div class="text-slate-400" x-text="t('vulnApproval')"></div><div class="mt-1 font-semibold text-slate-600" x-text="task.approvalState"></div></div><div><div class="text-slate-400" x-text="t('vulnCreated')"></div><div class="mt-1 font-semibold text-slate-600" x-text="task.createdLabel"></div></div><div><div class="text-slate-400" x-text="t('vulnProgress')"></div><div class="mt-1 font-semibold text-slate-600" x-text="`${task.progress}%`"></div></div></div><div class="w-full xl:w-44"><div class="vuln-progress-track h-2 rounded-full"><div class="vuln-progress-bar h-full rounded-full" :style="`width:${task.progress}%`"></div></div></div><button x-show="task.logs.length" @click="vulnerabilityExpandedTaskId = vulnerabilityExpandedTaskId === task.key ? '' : task.key" class="rounded-lg border border-slate-200 px-2.5 py-1.5 text-[10px] text-slate-500" x-text="t('vulnLogs')"></button></div><p x-show="task.error" class="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-[10px] text-rose-600" x-text="task.error"></p><div x-show="vulnerabilityExpandedTaskId === task.key" class="mt-4 space-y-1 rounded-xl bg-slate-950 p-3 font-mono text-[10px] text-slate-300"><template x-for="(line, lineIndex) in task.logs" :key="lineIndex"><div><span class="text-slate-500" x-text="line.time"></span><span class="ml-2 text-sky-400" x-text="line.level"></span><span class="ml-2" x-text="line.message"></span></div></template></div></article></template></div>
+          </article>
+        </section>
+
+        <!-- Findings -->
+        <section x-show="vulnerabilitySection === 'findings'" x-cloak>
+          <article class="vuln-card rounded-2xl overflow-hidden"><div class="flex flex-col gap-3 px-5 py-4 border-b border-slate-100 sm:flex-row sm:items-center"><div><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnFindingQueue')"></h3><p class="mt-1 text-[11px] text-slate-400" x-text="t('vulnFindingQueueHint')"></p></div><div class="flex-1"></div><div class="flex flex-wrap gap-2"><button @click="vulnerabilityOpenHypothesisFinding()" :disabled="!vulnerabilityConvertibleHypotheses().length || !vulnerabilityAssets.some(item => item.scope === 'in')" class="rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs font-medium text-indigo-700 disabled:opacity-40" x-text="t('vulnFindingFromAsset')"></button><button @click="vulnerabilityOpenFinding()" :disabled="!vulnerabilityAssets.some(item => item.scope === 'in')" class="rounded-lg bg-slate-900 px-3 py-2 text-xs font-medium text-white disabled:opacity-40" x-text="t('vulnAddFinding')"></button></div></div><div x-show="!vulnerabilityFindings.length" class="p-8 text-center text-xs text-slate-400" x-text="t('vulnNoFindings')"></div><div x-show="vulnerabilityFindings.length" class="overflow-x-auto"><table class="w-full text-left text-xs"><thead class="bg-slate-50/80 text-[10px] uppercase tracking-wider text-slate-400"><tr><th class="px-5 py-3">ID</th><th class="px-4 py-3" x-text="t('vulnSeverity')"></th><th class="px-4 py-3" x-text="t('vulnFinding')"></th><th class="px-4 py-3" x-text="t('vulnAsset')"></th><th class="px-4 py-3" x-text="t('vulnStatus')"></th><th class="px-4 py-3" x-text="t('vulnConfidence')"></th><th class="px-5 py-3 text-right" x-text="t('vulnUpdated')"></th></tr></thead><tbody class="divide-y divide-slate-100"><template x-for="finding in vulnerabilityFindings" :key="finding.id"><tr class="hover:bg-slate-50/60"><td class="px-5 py-3 font-mono text-[10px] text-slate-400" x-text="finding.id"></td><td class="px-4 py-3"><span class="px-2 py-1 rounded-full border text-[10px] font-medium" :class="vulnerabilitySeverityClass(finding.severity)" x-text="finding.severity"></span></td><td class="px-4 py-3"><div class="font-medium text-slate-700" x-text="finding.title"></div><div class="mt-1 text-[10px] text-slate-400" x-text="finding.source"></div></td><td class="px-4 py-3 text-slate-500" x-text="finding.asset"></td><td class="px-4 py-3"><select :value="finding.status" @change="vulnerabilityTransitionFinding(finding, $event.target.value)" class="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] text-slate-600"><option :value="finding.status" x-text="finding.status"></option><template x-for="nextStatus in vulnerabilityFindingNextStatuses(finding.status)" :key="nextStatus"><option :value="nextStatus" x-text="nextStatus"></option></template></select></td><td class="px-4 py-3 tabular-nums text-slate-600" x-text="finding.confidenceLabel"></td><td class="px-5 py-3 text-right text-slate-400" x-text="finding.updated"></td></tr></template></tbody></table></div></article>
+        </section>
+
+        <!-- Reports -->
+        <section x-show="vulnerabilitySection === 'reports'" x-cloak class="space-y-3"><div class="vuln-card flex flex-col gap-3 rounded-2xl p-4 sm:flex-row sm:items-center"><label class="flex cursor-pointer items-start gap-3"><input x-model="vulnerabilityReportIncludeRecon" type="checkbox" class="mt-0.5 h-4 w-4 rounded border-slate-300 text-sky-600"><span><span class="block text-xs font-medium text-slate-700" x-text="t('vulnIncludeReconSummary')"></span><span class="mt-1 block text-[10px] text-slate-400" x-text="t('vulnIncludeReconSummaryHint')"></span></span></label><div class="flex-1"></div><button @click="vulnerabilityGenerateReport()" :disabled="!vulnerabilitySelectedCampaignId || vulnerabilitySubmitting" class="rounded-lg bg-slate-900 px-3 py-2 text-xs font-medium text-white disabled:opacity-40" x-text="t('vulnGenerateReport')"></button></div><div x-show="!vulnerabilityReports.length" class="vuln-card rounded-2xl p-8 text-center text-xs text-slate-400" x-text="t('vulnNoReports')"></div><div class="grid grid-cols-1 gap-3 lg:grid-cols-3">
+          <template x-for="report in vulnerabilityReports" :key="report.id"><article class="vuln-card rounded-2xl p-5"><div class="flex items-start justify-between"><span class="font-mono text-[10px] text-slate-400" x-text="report.id"></span><span class="px-2 py-1 rounded-full border border-slate-200 bg-slate-50 text-[10px] text-slate-500" x-text="report.status"></span></div><h3 class="mt-4 text-sm font-semibold text-slate-700" x-text="report.title"></h3><p class="mt-2 text-xs text-slate-400" x-text="report.format"></p><div class="mt-5 pt-4 border-t border-slate-100 flex items-center justify-between"><span class="text-[10px] text-slate-400" x-text="report.updated"></span><button @click="vulnerabilityPreviewReport(report)" class="text-xs font-medium text-sky-600 hover:text-sky-700" x-text="t('vulnPreview')"></button></div></article></template>
+        </div>
+        </section>
+
+        <!-- AI Analysis -->
+        <section x-show="vulnerabilitySection === 'ai'" x-cloak class="space-y-4">
+          <article class="vuln-card rounded-2xl p-5">
+            <div class="flex flex-col gap-4 lg:flex-row lg:items-center">
+              <div class="flex-1"><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnAIAnalysis')"></h3><p class="mt-1 text-[11px] text-slate-400" x-text="t('vulnAIAnalysisHint')"></p></div>
+              <select x-model="vulnerabilityAIAnalysisType" class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600"><option value="comprehensive" x-text="t('vulnAIComprehensive')"></option><option value="entity_extraction" x-text="t('vulnAIEntities')"></option><option value="relationship_inference" x-text="t('vulnAIRelationships')"></option><option value="coverage_gap_analysis" x-text="t('vulnAICoverageGaps')"></option></select>
+              <button @click="vulnerabilityStartAIAnalysis()" :disabled="vulnerabilitySubmitting || vulnerabilityCampaign.status !== 'running' || !vulnerabilityResultSummary.observations" class="rounded-lg bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-40" x-text="vulnerabilitySubmitting ? t('vulnAIQueuing') : t('vulnAIStart')"></button>
+            </div>
+            <p class="mt-4 rounded-xl border border-amber-100 bg-amber-50 px-3 py-2.5 text-[11px] text-amber-700" x-text="t('vulnAISafety')"></p>
+          </article>
+          <div class="grid grid-cols-1 gap-4 xl:grid-cols-2">
+            <article class="vuln-card rounded-2xl p-5"><div class="flex items-center justify-between"><div><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnAIRecent')"></h3><p class="mt-1 text-[11px] text-slate-400" x-text="t('vulnAIRecentHint')"></p></div><span class="rounded-full bg-indigo-50 px-2 py-1 text-[10px] text-indigo-600" x-text="vulnerabilityAIAnalyses.length"></span></div><div class="mt-4 space-y-3"><template x-for="analysis in vulnerabilityAIAnalyses" :key="analysis.id"><div class="rounded-xl border border-slate-100 bg-slate-50 p-3"><div class="flex items-center justify-between gap-3"><div class="flex items-center gap-2"><span class="font-mono text-[10px] text-slate-400" x-text="analysis.id"></span><span class="rounded-full border px-2 py-1 text-[10px]" :class="vulnerabilityStatusClass(analysis.status)" x-text="analysis.status"></span></div><span class="text-[10px] text-slate-400" x-text="analysis.createdLabel"></span></div><div class="mt-2 text-xs font-medium text-slate-600" x-text="analysis.analysis_type"></div><p class="mt-1 text-[11px] leading-relaxed text-slate-500" x-text="analysis.summary"></p><div class="mt-2 text-[10px] text-slate-400" x-text="`${analysis.observation_ids.length} ${t('vulnAIObservations')} · ${analysis.budget_units} ${t('vulnAIBudgetUnits')}`"></div></div></template><div x-show="!vulnerabilityAIAnalyses.length" class="py-8 text-center text-xs text-slate-400" x-text="t('vulnAINoAnalyses')"></div></div></article>
+            <article class="vuln-card rounded-2xl p-5"><div class="flex items-center justify-between"><div><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnAIHypotheses')"></h3><p class="mt-1 text-[11px] text-slate-400" x-text="t('vulnAIHypothesesHint')"></p></div><span class="rounded-full bg-amber-50 px-2 py-1 text-[10px] text-amber-700" x-text="vulnerabilityHypotheses.length"></span></div><div class="mt-4 space-y-3"><template x-for="hypothesis in vulnerabilityHypotheses" :key="hypothesis.id"><div class="rounded-xl border border-amber-100 bg-amber-50/40 p-3"><div class="flex items-center justify-between gap-3"><span class="rounded-full border border-amber-200 bg-white px-2 py-1 text-[10px] text-amber-700" x-text="hypothesis.confidenceLabel"></span><span class="text-[10px] text-slate-400" x-text="hypothesis.createdLabel"></span></div><h4 class="mt-2 text-xs font-semibold text-slate-700" x-text="hypothesis.title"></h4><p class="mt-1 text-[11px] leading-relaxed text-slate-500" x-text="hypothesis.description"></p><div class="mt-2 font-mono text-[10px] text-slate-400" x-text="`${hypothesis.asset}${hypothesis.vuln_id ? ' · ' + hypothesis.vuln_id : ''}`"></div></div></template><div x-show="!vulnerabilityHypotheses.length" class="py-8 text-center text-xs text-slate-400" x-text="t('vulnAINoHypotheses')"></div></div></article>
+          </div>
+        </section>
+
+        <!-- Settings -->
+        <section x-show="vulnerabilitySection === 'settings'" x-cloak class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+          <article class="vuln-card rounded-2xl p-5"><div class="flex items-center justify-between gap-3"><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnAuthorizationScope')"></h3><div class="flex items-center gap-2"><span class="px-2 py-1 rounded-full border text-[10px] font-medium" :class="vulnerabilityCampaign.authorized ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-amber-200 bg-amber-50 text-amber-700'" x-text="vulnerabilityCampaign.authorized ? t('vulnAuthorized') : t('vulnAuthorizationRequired')"></span><button @click="vulnerabilityOpenScopeEditor()" :disabled="!vulnerabilitySelectedCampaignId" class="rounded-lg border border-slate-200 px-2.5 py-1 text-[10px] text-slate-600 disabled:opacity-40" x-text="t('vulnEditScopes')"></button></div></div><div class="mt-4 space-y-2"><template x-for="scopeItem in vulnerabilityCampaign.scope" :key="scopeItem"><div class="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 font-mono text-xs text-slate-600" x-text="scopeItem"></div></template></div><div class="mt-4"><div class="text-[10px] uppercase tracking-wider text-slate-400" x-text="t('vulnExclusions')"></div><div class="mt-2 flex flex-wrap gap-2"><template x-for="item in vulnerabilityCampaign.exclusions" :key="item"><span class="px-2.5 py-1.5 rounded-lg border border-rose-100 bg-rose-50 text-[10px] text-rose-700" x-text="item"></span></template><span x-show="!vulnerabilityCampaign.exclusions.length" class="text-[10px] text-slate-400">--</span></div></div></article>
+          <article class="vuln-card rounded-2xl p-5"><div class="flex items-center justify-between"><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnExecutionPolicy')"></h3><select :value="vulnerabilityCampaign.status" @change="vulnerabilityUpdateCampaign({status:$event.target.value})" :disabled="!vulnerabilitySelectedCampaignId" class="rounded-lg border border-slate-200 px-2 py-1 text-[10px]"><option value="draft">draft</option><option value="running">running</option><option value="paused">paused</option><option value="completed">completed</option><option value="archived">archived</option></select></div><div class="mt-4 space-y-4 text-xs"><div class="flex items-center justify-between"><div><div class="font-medium text-slate-700" x-text="t('vulnActiveTesting')"></div><div class="mt-1 text-[11px] text-slate-400" x-text="t('vulnActiveTestingHint')"></div></div><button @click="vulnerabilityUpdateCampaign({active_testing_enabled:!vulnerabilityCampaign.activeTesting})" :disabled="!vulnerabilitySelectedCampaignId" class="px-2.5 py-1.5 rounded-lg border text-[10px] font-medium disabled:opacity-40" :class="vulnerabilityCampaign.activeTesting ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-emerald-200 bg-emerald-50 text-emerald-700'" x-text="vulnerabilityCampaign.activeTesting ? t('vulnEnabled') : t('vulnDisabled')"></button></div><div class="flex items-center justify-between border-t border-slate-100 pt-4"><span class="text-slate-500" x-text="t('vulnRateLimit')"></span><span class="font-medium text-slate-700" x-text="`${vulnerabilityCampaign.rateLimit || 30} req/s`"></span></div><div class="flex items-center justify-between"><span class="text-slate-500" x-text="t('vulnConcurrency')"></span><span class="font-medium text-slate-700" x-text="`${vulnerabilityCampaign.concurrency || 3} workers`"></span></div><div class="flex items-center justify-between"><span class="text-slate-500" x-text="t('vulnRequestHeader')"></span><code class="rounded bg-slate-100 px-2 py-1 text-[10px] text-slate-600" x-text="vulnerabilityCampaign.requestHeader"></code></div></div></article>
+          <article class="vuln-card rounded-2xl p-5"><div class="flex items-center justify-between"><div><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnAuditTrail')"></h3><p class="mt-1 text-[11px] text-slate-400" x-text="t('vulnAuditTrailHint')"></p></div><span class="rounded-full bg-slate-100 px-2 py-1 text-[10px] text-slate-500" x-text="vulnerabilityAuditEvents.length"></span></div><div class="mt-4 max-h-72 space-y-3 overflow-y-auto"><template x-for="event in vulnerabilityAuditEvents" :key="event.id"><div class="border-l-2 border-sky-200 pl-3"><div class="flex items-center justify-between gap-3"><span class="text-xs font-medium text-slate-700" x-text="event.action"></span><span class="text-[10px] text-slate-400" x-text="event.time"></span></div><p class="mt-1 break-words text-[10px] text-slate-400" x-text="`${event.actor}${event.target ? ' · ' + event.target : ''}${event.detailText ? ' · ' + event.detailText : ''}`"></p></div></template><div x-show="!vulnerabilityAuditEvents.length" class="py-6 text-center text-xs text-slate-400" x-text="t('vulnNoAudit')"></div></div></article>
+          <article class="vuln-card rounded-2xl p-5"><div class="flex items-center justify-between"><div><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnSnapshots')"></h3><p class="mt-1 text-[11px] text-slate-400" x-text="t('vulnSnapshotsHint')"></p></div><span class="rounded-full bg-indigo-50 px-2 py-1 text-[10px] text-indigo-600" x-text="vulnerabilitySnapshots.length"></span></div><div class="mt-4 max-h-72 space-y-2 overflow-y-auto"><template x-for="snapshot in vulnerabilitySnapshots" :key="snapshot.id"><div class="rounded-xl border border-slate-100 bg-slate-50 px-3 py-2.5"><div class="flex items-center justify-between"><span class="font-mono text-[10px] text-slate-500" x-text="snapshot.id"></span><span class="text-[10px] text-slate-400" x-text="snapshot.time"></span></div><p class="mt-1 break-words text-[10px] text-slate-500" x-text="snapshot.summaryText"></p></div></template><div x-show="!vulnerabilitySnapshots.length" class="py-6 text-center text-xs text-slate-400" x-text="t('vulnNoSnapshots')"></div></div></article>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <!-- Recon asset detail drawer -->
+  <div x-show="vulnerabilityShowAssetDetail" x-cloak class="fixed inset-0 z-[60] flex justify-end" @keydown.escape.window="vulnerabilityCloseAssetDetail()">
+    <button type="button" @click="vulnerabilityCloseAssetDetail()" class="absolute inset-0 bg-slate-950/35 backdrop-blur-sm" :aria-label="t('close')"></button>
+    <aside x-transition:enter="transition ease-out duration-200" x-transition:enter-start="translate-x-full" x-transition:enter-end="translate-x-0" x-transition:leave="transition ease-in duration-150" x-transition:leave-start="translate-x-0" x-transition:leave-end="translate-x-full" class="relative flex h-full w-full max-w-4xl flex-col bg-slate-50 shadow-2xl" role="dialog" aria-modal="true" :aria-label="t('vulnAssetDetail')">
+      <header class="flex items-start gap-4 border-b border-slate-200 bg-white px-5 py-4 sm:px-6">
+        <div class="min-w-0 flex-1"><div class="flex flex-wrap items-center gap-2"><span class="rounded-full bg-sky-50 px-2 py-1 text-[10px] font-medium text-sky-700" x-text="vulnerabilitySelectedAsset?.type"></span><span class="rounded-full border px-2 py-1 text-[10px]" :class="vulnerabilitySelectedAsset?.freshnessState === 'stale' ? 'border-amber-200 bg-amber-50 text-amber-700' : 'border-emerald-200 bg-emerald-50 text-emerald-700'" x-text="vulnerabilitySelectedAsset?.freshnessState"></span><span class="font-mono text-[10px] text-slate-400" x-text="vulnerabilitySelectedAsset?.id"></span></div><h2 class="mt-2 truncate text-lg font-semibold text-slate-800" x-text="vulnerabilitySelectedAsset?.identifier"></h2><p class="mt-1 text-xs text-slate-400" x-text="vulnerabilityAssetSourceLabel(vulnerabilitySelectedAsset || {sources:[]})"></p></div>
+        <div class="text-right"><div class="text-[10px] text-slate-400" x-text="t('vulnRiskScore')"></div><div class="mt-1 text-2xl font-semibold text-slate-800" x-text="vulnerabilitySelectedAsset ? vulnerabilityAssetRiskScore(vulnerabilitySelectedAsset) : 0"></div></div>
+        <button @click="vulnerabilityCloseAssetDetail()" class="rounded-lg p-2 text-slate-400 hover:bg-slate-100" :aria-label="t('close')">✕</button>
+      </header>
+      <div x-show="vulnerabilityAssetDetailLoading" class="flex flex-1 items-center justify-center text-xs text-sky-600" x-text="t('vulnAssetDetailLoading')"></div>
+      <div x-show="!vulnerabilityAssetDetailLoading" class="flex-1 space-y-4 overflow-y-auto p-4 sm:p-6">
+        <section class="grid grid-cols-2 gap-3 lg:grid-cols-4"><div class="vuln-card rounded-xl p-3"><div class="text-[10px] text-slate-400" x-text="t('vulnScope')"></div><div class="mt-1 text-xs font-semibold text-slate-700" x-text="vulnerabilitySelectedAsset?.scope"></div></div><div class="vuln-card rounded-xl p-3"><div class="text-[10px] text-slate-400" x-text="t('vulnImportance')"></div><div class="mt-1 text-xs font-semibold text-slate-700" x-text="vulnerabilitySelectedAsset?.importance"></div></div><div class="vuln-card rounded-xl p-3"><div class="text-[10px] text-slate-400" x-text="t('vulnFirstSeen')"></div><div class="mt-1 text-xs font-semibold text-slate-700" x-text="vulnerabilityFormatTime(vulnerabilitySelectedAsset?.firstSeenAt)"></div></div><div class="vuln-card rounded-xl p-3"><div class="text-[10px] text-slate-400" x-text="t('vulnLastSeen')"></div><div class="mt-1 text-xs font-semibold text-slate-700" x-text="vulnerabilityFormatTime(vulnerabilitySelectedAsset?.lastSeenAt)"></div></div></section>
+
+        <section class="vuln-card rounded-2xl p-5"><div class="flex items-center justify-between"><div><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnAssetCoverageMatrix')"></h3><p class="mt-1 text-[11px] text-slate-400" x-text="t('vulnAssetCoverageMatrixHint')"></p></div><span class="text-[10px] text-slate-400" x-text="vulnerabilityCoverageLabel(vulnerabilitySelectedAsset || {})"></span></div><div class="mt-4 grid grid-cols-2 gap-3 lg:grid-cols-3"><template x-for="coverage in vulnerabilityAssetCoverage" :key="coverage.dimension"><div class="rounded-xl border border-slate-100 bg-slate-50 p-3"><div class="flex items-center justify-between gap-2"><span class="text-xs font-medium text-slate-700" x-text="coverage.dimension"></span><span class="rounded-full border px-2 py-1 text-[9px]" :class="vulnerabilityStatusClass(coverage.status)" x-text="coverage.status"></span></div><div class="mt-3 flex items-center justify-between text-[10px] text-slate-400"><span x-text="t('vulnProducedEvidence')"></span><strong class="text-slate-600" x-text="vulnerabilityCoverageEvidenceCount(coverage.dimension)"></strong></div><p x-show="coverage.error" class="mt-2 truncate text-[10px] text-rose-500" x-text="coverage.error"></p></div></template></div></section>
+
+        <div class="grid grid-cols-1 gap-4 xl:grid-cols-2">
+          <section class="vuln-card rounded-2xl p-5"><div class="flex items-center justify-between"><div><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnEvidenceList')"></h3><p class="mt-1 text-[11px] text-slate-400" x-text="t('vulnEvidenceListHint')"></p></div><span class="rounded-full bg-sky-50 px-2 py-1 text-[10px] text-sky-700" x-text="vulnerabilityAssetObservations.length"></span></div><div class="mt-4 max-h-96 space-y-3 overflow-y-auto"><template x-for="observation in vulnerabilityAssetObservations" :key="observation.id"><article class="rounded-xl border border-slate-100 bg-slate-50 p-3"><div class="flex items-center justify-between gap-3"><span class="text-[10px] font-semibold text-sky-700" x-text="vulnerabilitySourceName(observation.source_id)"></span><span class="text-[10px] text-slate-400" x-text="vulnerabilityFormatTime(observation.last_seen_at)"></span></div><p class="mt-2 break-words text-[11px] leading-relaxed text-slate-600" x-text="vulnerabilityObservationSummary(observation)"></p><div class="mt-2 flex items-center justify-between gap-3 font-mono text-[9px] text-slate-400"><span class="truncate" x-text="observation.evidence_hash"></span><span class="shrink-0" x-text="`${Math.round(observation.confidence * 100)}%`"></span></div></article></template><div x-show="!vulnerabilityAssetObservations.length" class="py-8 text-center text-xs text-slate-400" x-text="t('vulnNoEvidence')"></div></div></section>
+          <section class="vuln-card rounded-2xl p-5"><div class="flex items-center justify-between"><div><h3 class="text-sm font-semibold text-slate-700" x-text="t('vulnRelationMiniGraph')"></h3><p class="mt-1 text-[11px] text-slate-400" x-text="t('vulnRelationMiniGraphHint')"></p></div><span class="rounded-full bg-indigo-50 px-2 py-1 text-[10px] text-indigo-600" x-text="vulnerabilityAssetRelations().length"></span></div><div id="vulnerabilityAssetRelationChart" class="mt-3 h-80 w-full"></div><div x-show="!vulnerabilityAssetRelations().length" class="-mt-44 text-center text-xs text-slate-400" x-text="t('vulnNoRelations')"></div></section>
+        </div>
+
+        <section class="grid grid-cols-1 gap-4 xl:grid-cols-3">
+          <article class="vuln-card rounded-2xl p-4"><div class="flex items-center justify-between"><h3 class="text-xs font-semibold text-slate-700" x-text="t('vulnRelatedTasks')"></h3><span class="text-[10px] text-slate-400" x-text="vulnerabilityAssetCollectionTasks.length"></span></div><div class="mt-3 space-y-2"><template x-for="task in vulnerabilityAssetCollectionTasks.slice(0, 8)" :key="task.id"><div class="rounded-xl bg-slate-50 p-3"><div class="flex items-center justify-between gap-2"><span class="truncate font-mono text-[10px] text-slate-500" x-text="task.adapter"></span><span class="rounded-full border px-2 py-1 text-[9px]" :class="vulnerabilityStatusClass(task.status)" x-text="task.status"></span></div></div></template><div x-show="!vulnerabilityAssetCollectionTasks.length" class="py-6 text-center text-[10px] text-slate-400" x-text="t('vulnNoRelatedTasks')"></div></div></article>
+          <article class="vuln-card rounded-2xl p-4"><div class="flex items-center justify-between"><h3 class="text-xs font-semibold text-slate-700" x-text="t('vulnRelatedFindings')"></h3><span class="text-[10px] text-slate-400" x-text="vulnerabilityAssetFindings().length"></span></div><div class="mt-3 space-y-2"><template x-for="finding in vulnerabilityAssetFindings().slice(0, 8)" :key="finding.id"><div class="rounded-xl bg-slate-50 p-3"><div class="flex items-center gap-2"><span class="rounded-full border px-2 py-1 text-[9px]" :class="vulnerabilitySeverityClass(finding.severity)" x-text="finding.severity"></span><span class="truncate text-[10px] font-medium text-slate-600" x-text="finding.title"></span></div></div></template><div x-show="!vulnerabilityAssetFindings().length" class="py-6 text-center text-[10px] text-slate-400" x-text="t('vulnNoRelatedFindings')"></div></div></article>
+          <article class="vuln-card rounded-2xl p-4"><div class="flex items-center justify-between"><h3 class="text-xs font-semibold text-slate-700" x-text="t('vulnRelatedHypotheses')"></h3><span class="text-[10px] text-slate-400" x-text="vulnerabilityAssetHypotheses().length"></span></div><div class="mt-3 space-y-2"><template x-for="hypothesis in vulnerabilityAssetHypotheses().slice(0, 8)" :key="hypothesis.id"><div class="rounded-xl bg-indigo-50/60 p-3"><div class="text-[10px] font-medium text-slate-600" x-text="hypothesis.title"></div><div class="mt-1 text-[9px] text-indigo-500" x-text="hypothesis.confidenceLabel"></div></div></template><div x-show="!vulnerabilityAssetHypotheses().length" class="py-6 text-center text-[10px] text-slate-400" x-text="t('vulnNoRelatedHypotheses')"></div></div></article>
+        </section>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Collection job approval dialog -->
+  <div x-show="vulnerabilityTaskApproval.open" x-cloak class="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-sm" @keydown.escape.window="vulnerabilityCloseTaskApproval()">
+    <section @click.outside="vulnerabilityCloseTaskApproval()" class="w-full max-w-lg rounded-2xl border border-slate-200 bg-white shadow-2xl" role="dialog" aria-modal="true" :aria-label="t('vulnTaskApprovalTitle')">
+      <header class="flex items-start justify-between border-b border-slate-100 px-5 py-4"><div><div class="text-[10px] font-semibold uppercase tracking-wider" :class="vulnerabilityTaskApproval.decision === 'approve' ? 'text-emerald-600' : 'text-rose-600'" x-text="vulnerabilityTaskApproval.decision"></div><h2 class="mt-1 text-base font-semibold text-slate-800" x-text="t('vulnTaskApprovalTitle')"></h2><p class="mt-1 font-mono text-[10px] text-slate-400" x-text="vulnerabilityTaskApproval.task?.adapter"></p></div><button @click="vulnerabilityCloseTaskApproval()" class="text-slate-400">✕</button></header>
+      <div class="space-y-4 px-5 py-5"><div class="rounded-xl border border-amber-100 bg-amber-50 p-3 text-[11px] leading-relaxed text-amber-700" x-text="t('vulnTaskApprovalAuditHint')"></div><label class="block"><span class="text-xs font-medium text-slate-700" x-text="t('vulnApprovalReason')"></span><textarea x-model="vulnerabilityTaskApproval.reason" rows="5" maxlength="2000" :placeholder="t('vulnApprovalReasonPlaceholder')" class="mt-2 w-full resize-none rounded-xl border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-sky-400"></textarea></label></div>
+      <footer class="flex justify-end gap-2 border-t border-slate-100 bg-slate-50 px-5 py-4"><button @click="vulnerabilityCloseTaskApproval()" class="px-3 py-2 text-xs text-slate-500" x-text="t('cancel')"></button><button @click="vulnerabilitySubmitTaskApproval()" :disabled="!vulnerabilityTaskApproval.reason.trim() || vulnerabilityTaskApproval.submitting" class="rounded-lg px-4 py-2 text-xs font-medium text-white disabled:opacity-40" :class="vulnerabilityTaskApproval.decision === 'approve' ? 'bg-emerald-600' : 'bg-rose-600'" x-text="vulnerabilityTaskApproval.submitting ? t('vulnSubmitting') : (vulnerabilityTaskApproval.decision === 'approve' ? t('vulnApprove') : t('vulnReject'))"></button></footer>
+    </section>
+  </div>
+
+  <!-- Campaign creation wizard. Authorization is validated again by the API. -->
+  <div x-show="vulnerabilityShowCreate" x-cloak x-transition.opacity @keydown.escape.window="vulnerabilityCloseCreate()" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-sm">
+    <section @click.outside="vulnerabilityCloseCreate()" class="w-full max-w-2xl overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl" role="dialog" aria-modal="true" :aria-label="t('vulnCreateCampaignTitle')">
+      <header class="border-b border-slate-100 px-6 py-5">
+        <div class="flex items-start justify-between gap-4">
+          <div><p class="text-[10px] font-semibold uppercase tracking-[0.16em] text-sky-600" x-text="t('vulnCreateMockBadge')"></p><h2 class="mt-1 text-lg font-semibold text-slate-800" x-text="t('vulnCreateCampaignTitle')"></h2><p class="mt-1 text-xs text-slate-400" x-text="t('vulnCreateCampaignHint')"></p></div>
+          <button type="button" @click="vulnerabilityCloseCreate()" class="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700" :aria-label="t('close')"><svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+        </div>
+        <div class="mt-5 grid grid-cols-3 gap-2">
+          <template x-for="step in [{id:1,key:'vulnBasicInfo'},{id:2,key:'vulnAuthorization'},{id:3,key:'vulnPolicy'}]" :key="step.id"><div><div class="h-1.5 rounded-full transition-colors" :class="vulnerabilityCreateStep >= step.id ? 'bg-sky-500' : 'bg-slate-100'"></div><div class="mt-2 flex items-center gap-1.5 text-[10px]" :class="vulnerabilityCreateStep >= step.id ? 'text-slate-700' : 'text-slate-400'"><span class="font-semibold" x-text="step.id"></span><span x-text="t(step.key)"></span></div></div></template>
+        </div>
+      </header>
+
+      <div class="min-h-[300px] px-6 py-5">
+        <div x-show="vulnerabilityCreateStep === 1" class="space-y-5">
+          <label class="block"><span class="text-xs font-medium text-slate-700" x-text="t('vulnCampaignTitle')"></span><input x-model="vulnerabilityCreateForm.title" type="text" maxlength="120" :placeholder="t('vulnCampaignTitlePlaceholder')" class="mt-2 w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-sm text-slate-700 outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-100"></label>
+          <label class="block"><span class="text-xs font-medium text-slate-700" x-text="t('vulnObjective')"></span><textarea x-model="vulnerabilityCreateForm.objective" rows="5" maxlength="1000" :placeholder="t('vulnObjectivePlaceholder')" class="mt-2 w-full resize-none rounded-xl border border-slate-200 px-3.5 py-2.5 text-sm text-slate-700 outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-100"></textarea></label>
+        </div>
+
+        <div x-show="vulnerabilityCreateStep === 2" class="space-y-5">
+          <label class="flex cursor-pointer gap-3 rounded-xl border border-amber-200 bg-amber-50/70 p-4"><input x-model="vulnerabilityCreateForm.authorized" type="checkbox" class="mt-0.5 h-4 w-4 rounded border-amber-300 text-sky-600 focus:ring-sky-400"><span><span class="block text-xs font-semibold text-amber-900" x-text="t('vulnAuthorizationConfirm')"></span><span class="mt-1 block text-[11px] leading-relaxed text-amber-700" x-text="t('vulnAuthorizationConfirmHint')"></span></span></label>
+          <div class="grid grid-cols-1 gap-5 md:grid-cols-2">
+            <label class="block"><span class="text-xs font-medium text-slate-700" x-text="t('vulnAuthorizationExpiry')"></span><input x-model="vulnerabilityCreateForm.authorizationExpiresAt" type="date" class="mt-2 w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-sm text-slate-700 outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-100"></label>
+            <label class="block"><span class="text-xs font-medium text-slate-700" x-text="t('vulnScopeLines')"></span><textarea x-model="vulnerabilityCreateForm.scopeText" rows="5" :placeholder="t('vulnScopeLinesPlaceholder')" class="mt-2 w-full resize-none rounded-xl border border-slate-200 px-3.5 py-2.5 font-mono text-xs text-slate-700 outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-100"></textarea></label>
+          </div>
+        </div>
+
+        <div x-show="vulnerabilityCreateStep === 3" class="space-y-5">
+          <label class="flex cursor-pointer gap-3 rounded-xl border border-rose-100 bg-rose-50/60 p-4"><input x-model="vulnerabilityCreateForm.activeTesting" type="checkbox" class="mt-0.5 h-4 w-4 rounded border-rose-300 text-rose-600 focus:ring-rose-400"><span><span class="block text-xs font-semibold text-rose-900" x-text="t('vulnEnableActiveTesting')"></span><span class="mt-1 block text-[11px] leading-relaxed text-rose-700" x-text="t('vulnEnableActiveTestingHint')"></span></span></label>
+          <label class="block max-w-xs"><span class="text-xs font-medium text-slate-700" x-text="t('vulnRequestsPerSecond')"></span><input x-model.number="vulnerabilityCreateForm.rateLimit" type="number" min="1" max="1000" class="mt-2 w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-sm text-slate-700 outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-100"></label>
+          <div class="rounded-xl border border-sky-100 bg-sky-50 p-4 text-[11px] leading-relaxed text-sky-800" x-text="t('vulnMockSafetySummary')"></div>
+        </div>
+      </div>
+
+      <footer class="flex items-center justify-between border-t border-slate-100 bg-slate-50/70 px-6 py-4">
+        <button type="button" @click="vulnerabilityCloseCreate()" class="px-3 py-2 text-xs font-medium text-slate-500 hover:text-slate-800" x-text="t('cancel')"></button>
+        <div class="flex items-center gap-2"><button x-show="vulnerabilityCreateStep > 1" type="button" @click="vulnerabilityPreviousCreateStep()" class="rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-medium text-slate-600 hover:bg-slate-50" x-text="t('vulnPrevious')"></button><button x-show="vulnerabilityCreateStep < 3" type="button" @click="vulnerabilityNextCreateStep()" :disabled="!vulnerabilityCanContinueCreate()" class="rounded-lg bg-slate-900 px-4 py-2 text-xs font-medium text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-35" x-text="t('vulnNext')"></button><button x-show="vulnerabilityCreateStep === 3" type="button" @click="vulnerabilityFinishCreate()" :disabled="!vulnerabilityCanContinueCreate() || vulnerabilitySubmitting" class="rounded-lg bg-sky-600 px-4 py-2 text-xs font-medium text-white hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-35" x-text="vulnerabilitySubmitting ? t('vulnCreating') : t('vulnCreateMock')"></button></div>
+      </footer>
+    </section>
+  </div>
+
+  <!-- Manual asset import -->
+  <div x-show="vulnerabilityShowImport" x-cloak x-transition.opacity @keydown.escape.window="vulnerabilityShowImport = false" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-sm">
+    <section @click.outside="vulnerabilityShowImport = false" class="w-full max-w-xl rounded-2xl border border-slate-200 bg-white shadow-2xl" role="dialog" aria-modal="true" :aria-label="t('vulnImportAssets')"><header class="flex items-start justify-between border-b border-slate-100 px-6 py-5"><div><h2 class="text-lg font-semibold text-slate-800" x-text="t('vulnImportAssets')"></h2><p class="mt-1 text-xs text-slate-400" x-text="t('vulnImportAssetsHint')"></p></div><button @click="vulnerabilityShowImport = false" class="text-slate-400" :aria-label="t('close')">✕</button></header><div class="space-y-4 px-6 py-5"><label class="block"><span class="text-xs font-medium text-slate-700" x-text="t('vulnAssetType')"></span><select x-model="vulnerabilityImportForm.assetType" class="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm"><option value="domain">Domain</option><option value="ip">IP</option><option value="url">URL</option><option value="repository">Repository</option><option value="cloud">Cloud</option></select></label><label class="block"><span class="text-xs font-medium text-slate-700" x-text="t('vulnIdentifiersLines')"></span><textarea x-model="vulnerabilityImportForm.identifiers" rows="8" :placeholder="t('vulnIdentifiersPlaceholder')" class="mt-2 w-full resize-none rounded-xl border border-slate-200 px-3 py-2.5 font-mono text-xs"></textarea></label><p class="rounded-xl bg-amber-50 p-3 text-[11px] text-amber-700" x-text="t('vulnImportScopeHint')"></p></div><footer class="flex justify-end gap-2 border-t border-slate-100 bg-slate-50/70 px-6 py-4"><button @click="vulnerabilityShowImport = false" class="px-3 py-2 text-xs text-slate-500" x-text="t('cancel')"></button><button @click="vulnerabilityImportAssets()" :disabled="!vulnerabilityImportForm.identifiers.trim() || vulnerabilitySubmitting" class="rounded-lg bg-sky-600 px-4 py-2 text-xs font-medium text-white disabled:opacity-35" x-text="t('vulnImport')"></button></footer></section>
+  </div>
+
+  <!-- Candidate finding creation -->
+  <!-- Convert a reviewed AI hypothesis into a candidate finding. -->
+  <div x-show="vulnerabilityShowHypothesisFinding" x-cloak x-transition.opacity @keydown.escape.window="vulnerabilityShowHypothesisFinding = false" class="fixed inset-0 z-[65] flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-sm">
+    <section @click.outside="vulnerabilityShowHypothesisFinding = false" class="w-full max-w-2xl rounded-2xl border border-slate-200 bg-white shadow-2xl" role="dialog" aria-modal="true" :aria-label="t('vulnFindingFromAsset')">
+      <header class="flex items-start justify-between border-b border-slate-100 px-6 py-5"><div><h2 class="text-lg font-semibold text-slate-800" x-text="t('vulnFindingFromAsset')"></h2><p class="mt-1 text-xs text-slate-400" x-text="t('vulnFindingFromAssetHint')"></p></div><button @click="vulnerabilityShowHypothesisFinding = false" class="text-slate-400" :aria-label="t('close')">✕</button></header>
+      <div class="space-y-4 px-6 py-5">
+        <label class="block"><span class="text-xs font-medium text-slate-700" x-text="t('vulnAIHypotheses')"></span><select x-model="vulnerabilityHypothesisFindingForm.hypothesisId" @change="vulnerabilitySyncHypothesisFindingAsset()" class="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm"><template x-for="hypothesis in vulnerabilityConvertibleHypotheses()" :key="hypothesis.id"><option :value="hypothesis.id" x-text="`${hypothesis.title} · ${hypothesis.confidenceLabel}`"></option></template></select></label>
+        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2"><label class="block"><span class="text-xs font-medium text-slate-700" x-text="t('vulnAsset')"></span><select x-model="vulnerabilityHypothesisFindingForm.assetId" :disabled="Boolean(vulnerabilityConvertibleHypotheses().find(item => item.id === vulnerabilityHypothesisFindingForm.hypothesisId)?.asset_id)" class="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm disabled:bg-slate-50"><template x-for="asset in vulnerabilityAssets.filter(item => item.scope === 'in')" :key="asset.id"><option :value="asset.id" x-text="asset.identifier"></option></template></select></label><label class="block"><span class="text-xs font-medium text-slate-700" x-text="t('vulnSeverity')"></span><select x-model="vulnerabilityHypothesisFindingForm.severity" class="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm"><option value="unknown">unknown</option><option value="info">info</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="critical">critical</option></select></label></div>
+        <div class="rounded-xl border border-indigo-100 bg-indigo-50/50 p-4"><template x-if="vulnerabilityConvertibleHypotheses().find(item => item.id === vulnerabilityHypothesisFindingForm.hypothesisId)"><div><h3 class="text-xs font-semibold text-slate-700" x-text="vulnerabilityConvertibleHypotheses().find(item => item.id === vulnerabilityHypothesisFindingForm.hypothesisId).title"></h3><p class="mt-2 text-[11px] leading-relaxed text-slate-500" x-text="vulnerabilityConvertibleHypotheses().find(item => item.id === vulnerabilityHypothesisFindingForm.hypothesisId).description"></p></div></template></div>
+        <p class="rounded-xl border border-amber-100 bg-amber-50 px-3 py-2.5 text-[11px] text-amber-700" x-text="t('vulnHypothesisCandidateSafety')"></p>
+      </div>
+      <footer class="flex justify-end gap-2 border-t border-slate-100 bg-slate-50/70 px-6 py-4"><button @click="vulnerabilityShowHypothesisFinding = false" class="px-3 py-2 text-xs text-slate-500" x-text="t('cancel')"></button><button @click="vulnerabilityCreateFindingFromHypothesis()" :disabled="!vulnerabilityHypothesisFindingForm.assetId || !vulnerabilityHypothesisFindingForm.hypothesisId || vulnerabilitySubmitting" class="rounded-lg bg-indigo-600 px-4 py-2 text-xs font-medium text-white disabled:opacity-35" x-text="vulnerabilitySubmitting ? t('vulnSubmitting') : t('vulnCreateCandidate')"></button></footer>
+    </section>
+  </div>
+
+  <div x-show="vulnerabilityShowFinding" x-cloak x-transition.opacity @keydown.escape.window="vulnerabilityShowFinding = false" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-sm">
+    <section @click.outside="vulnerabilityShowFinding = false" class="w-full max-w-2xl rounded-2xl border border-slate-200 bg-white shadow-2xl" role="dialog" aria-modal="true" :aria-label="t('vulnAddFinding')"><header class="flex items-start justify-between border-b border-slate-100 px-6 py-5"><div><h2 class="text-lg font-semibold text-slate-800" x-text="t('vulnAddFinding')"></h2><p class="mt-1 text-xs text-slate-400" x-text="t('vulnFindingCreateHint')"></p></div><button @click="vulnerabilityShowFinding = false" class="text-slate-400" :aria-label="t('close')">✕</button></header><div class="grid grid-cols-1 gap-4 px-6 py-5 md:grid-cols-2"><label class="block"><span class="text-xs font-medium text-slate-700" x-text="t('vulnAsset')"></span><select x-model="vulnerabilityFindingForm.assetId" class="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm"><template x-for="asset in vulnerabilityAssets.filter(item => item.scope === 'in')" :key="asset.id"><option :value="asset.id" x-text="asset.identifier"></option></template></select></label><label class="block"><span class="text-xs font-medium text-slate-700" x-text="t('vulnFindingType')"></span><input x-model="vulnerabilityFindingForm.findingType" type="text" placeholder="BOLA / XSS / Misconfiguration" class="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm"></label><label class="block md:col-span-2"><span class="text-xs font-medium text-slate-700" x-text="t('vulnFindingTitle')"></span><input x-model="vulnerabilityFindingForm.title" type="text" class="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm"></label><label class="block md:col-span-2"><span class="text-xs font-medium text-slate-700" x-text="t('vulnDescription')"></span><textarea x-model="vulnerabilityFindingForm.description" rows="5" class="mt-2 w-full resize-none rounded-xl border border-slate-200 px-3 py-2.5 text-sm"></textarea></label><label class="block"><span class="text-xs font-medium text-slate-700" x-text="t('vulnSeverity')"></span><select x-model="vulnerabilityFindingForm.severity" class="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm"><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="critical">critical</option></select></label><label class="block"><span class="text-xs font-medium text-slate-700" x-text="t('vulnConfidence')"></span><input x-model.number="vulnerabilityFindingForm.confidence" type="number" min="0" max="100" class="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm"></label></div><footer class="flex justify-end gap-2 border-t border-slate-100 bg-slate-50/70 px-6 py-4"><button @click="vulnerabilityShowFinding = false" class="px-3 py-2 text-xs text-slate-500" x-text="t('cancel')"></button><button @click="vulnerabilityCreateFinding()" :disabled="!vulnerabilityFindingForm.assetId || !vulnerabilityFindingForm.title.trim() || !vulnerabilityFindingForm.description.trim() || !vulnerabilityFindingForm.findingType.trim() || vulnerabilitySubmitting" class="rounded-lg bg-sky-600 px-4 py-2 text-xs font-medium text-white disabled:opacity-35" x-text="t('create')"></button></footer></section>
+  </div>
+
+  <!-- Authorized scope editor -->
+  <div x-show="vulnerabilityShowScope" x-cloak x-transition.opacity @keydown.escape.window="vulnerabilityShowScope = false" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-sm">
+    <section @click.outside="vulnerabilityShowScope = false" class="w-full max-w-2xl rounded-2xl border border-slate-200 bg-white shadow-2xl" role="dialog" aria-modal="true" :aria-label="t('vulnEditScopes')"><header class="flex items-start justify-between border-b border-slate-100 px-6 py-5"><div><h2 class="text-lg font-semibold text-slate-800" x-text="t('vulnEditScopes')"></h2><p class="mt-1 text-xs text-slate-400" x-text="t('vulnEditScopesHint')"></p></div><button @click="vulnerabilityShowScope = false" class="text-slate-400" :aria-label="t('close')">✕</button></header><div class="grid grid-cols-1 gap-5 px-6 py-5 md:grid-cols-2"><label class="block"><span class="text-xs font-medium text-slate-700" x-text="t('vulnIncludedScopes')"></span><textarea x-model="vulnerabilityScopeForm.included" rows="9" class="mt-2 w-full resize-none rounded-xl border border-slate-200 px-3 py-2.5 font-mono text-xs"></textarea></label><label class="block"><span class="text-xs font-medium text-slate-700" x-text="t('vulnExcludedScopes')"></span><textarea x-model="vulnerabilityScopeForm.excluded" rows="9" class="mt-2 w-full resize-none rounded-xl border border-rose-100 bg-rose-50/40 px-3 py-2.5 font-mono text-xs"></textarea></label></div><footer class="flex justify-end gap-2 border-t border-slate-100 bg-slate-50/70 px-6 py-4"><button @click="vulnerabilityShowScope = false" class="px-3 py-2 text-xs text-slate-500" x-text="t('cancel')"></button><button @click="vulnerabilitySaveScopes()" :disabled="!vulnerabilityScopeForm.included.trim() || vulnerabilitySubmitting" class="rounded-lg bg-sky-600 px-4 py-2 text-xs font-medium text-white disabled:opacity-35" x-text="t('save')"></button></footer></section>
+  </div>
+
+  <!-- Report preview -->
+  <div x-show="vulnerabilityShowReport" x-cloak x-transition.opacity @keydown.escape.window="vulnerabilityShowReport = false" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-sm">
+    <section @click.outside="vulnerabilityShowReport = false" class="flex max-h-[88vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl" role="dialog" aria-modal="true" :aria-label="t('vulnReportPreview')"><header class="flex items-start justify-between border-b border-slate-100 px-6 py-5"><div><h2 class="text-lg font-semibold text-slate-800" x-text="vulnerabilitySelectedReport?.title"></h2><p class="mt-1 text-xs text-slate-400" x-text="vulnerabilitySelectedReport?.format"></p></div><button @click="vulnerabilityShowReport = false" class="text-slate-400" :aria-label="t('close')">✕</button></header><pre class="flex-1 overflow-auto whitespace-pre-wrap px-6 py-5 text-xs leading-relaxed text-slate-700" x-text="vulnerabilitySelectedReport?.content"></pre><footer class="flex justify-end gap-2 border-t border-slate-100 bg-slate-50/70 px-6 py-4"><button @click="vulnerabilityShowReport = false" class="px-3 py-2 text-xs text-slate-500" x-text="t('close')"></button><a x-show="vulnerabilitySelectedReport" :href="vulnerabilitySelectedReport ? vulnerabilityReportDownloadUrl(vulnerabilitySelectedReport) : '#'" class="rounded-lg bg-slate-900 px-4 py-2 text-xs font-medium text-white" x-text="t('vulnDownload')"></a></footer></section>
+  </div>
+</div>
+</template>
 
 <!-- ═══════════ GRAPH VIEW ═══════════ -->
 <template x-if="view === 'graph'">
@@ -1485,6 +1961,114 @@ const CAIRN_I18N = {
     statusActive:"active", statusStopped:"stopped", statusCompleted:"completed",
     statusConcluded:"Concluded", statusBootstrapRunning:"Bootstrap Running", statusBootstrapPending:"Bootstrap Pending",
     statusInProgress:"In Progress", statusUnclaimed:"Unclaimed",
+    vulnerabilityMining:"Vulnerability Mining", vulnWorkspace:"Authorized research workspace", vulnAuthorized:"Authorized",
+    vulnBackProjects:"Back to projects", vulnLastUpdated:"Last updated", vulnRefresh:"Refresh", vulnRefreshing:"Refreshing...",
+    vulnCurrentCampaign:"Current campaign", vulnContinuousMonitoring:"Continuous monitoring", vulnAuthorizationUntil:"Authorization until",
+    vulnScopeItems:"Scope items", vulnOverview:"Overview", vulnRecon:"Reconnaissance", vulnAssets:"Asset Graph",
+    vulnTasks:"Mining Tasks", vulnFindings:"Findings", vulnReports:"Reports", vulnAIAnalysis:"AI Analysis", vulnSettings:"Settings",
+    vulnMockNotice:"Live API · Enforced authorization boundary · No active scanning executor configured", vulnNewCampaign:"New campaign",
+    vulnBlackboardTitle:"Cairn Blackboard", vulnBlackboardLive:"Core architecture · live",
+    vulnBlackboardHint:"The real shared reasoning plane for this campaign. Facts hold accepted knowledge, Intents describe bounded work, Hints guide strategy, and Workers return new Facts.",
+    vulnBlackboardFactStep:"Shared accepted knowledge", vulnBlackboardIntentStep:"A bounded question or analysis", vulnBlackboardWorkerStep:"Controlled execution and reasoning", vulnBlackboardResultStep:"Auditable knowledge returned to the board",
+    vulnBlackboardLoading:"Loading the Cairn blackboard...", vulnBlackboardFacts:"Facts", vulnBlackboardFactsHint:"Accepted shared truth", vulnBlackboardNoFacts:"No facts on the board.",
+    vulnBlackboardIntents:"Intents", vulnBlackboardIntentsHint:"Work visible to schedulers and Workers", vulnBlackboardNoIntents:"No intents on the board.",
+    vulnBlackboardHints:"Hints", vulnBlackboardHintsHint:"Shared strategic guidance", vulnBlackboardNoHints:"No hints on the board.",
+    vulnBlackboardOrigin:"origin", vulnBlackboardGoal:"goal", vulnBlackboardDerivedFact:"derived fact", vulnBlackboardConcluded:"concluded", vulnBlackboardRunning:"running", vulnBlackboardQueued:"unclaimed",
+    vulnBlackboardReason:"Reason state", vulnBlackboardReasonIdle:"Idle · no Reason worker currently holds the project lease", vulnBlackboardBoundary:"Assets, observations, and collection tasks remain in the vulnerability data plane; the blackboard is the reasoning control plane.",
+    vulnMetricAssets:"In-scope assets", vulnMetricCoverage:"Collection coverage", vulnMetricTasks:"Running tasks", vulnMetricFindings:"Findings",
+    vulnMetricProductiveDimensions:"Dimensions with data", vulnMetricSourcesRun:"Sources executed",
+    vulnMetricObservationMeta:"{count} evidence", vulnMetricRunMeta:"{percent}% workflows ran", vulnMetricOutputMeta:"{count} produced data", vulnMetricConfirmedMeta:"{count} confirmed",
+    vulnCoverageTitle:"Collection output by dimension", vulnCoverageHint:"Completed means the workflow ran; the record count shows what it actually produced.",
+    vulnCollectionResult:"Collection result", vulnCollectionSummary:"Collected {assets} assets from {productiveSources} productive sources",
+    vulnCollectionMeaning:"Assets are attack-surface leads. They become useful as DNS, HTTP, service, technology, and vulnerability validation adds evidence.",
+    vulnCollectionLimit:"{assets} assets are currently passive leads; only {verifiedAssets} have DNS or HTTP validation.",
+    vulnProductiveSources:"Sources that produced data", vulnVerifiedAssets:"DNS/HTTP verified assets", vulnObservationMetric:"Evidence records", vulnDataFreshness:"Asset freshness", vulnFreshnessSummary:"{freshAssets} fresh · {staleAssets} stale",
+    vulnCollectedAssets:"Collected assets", vulnCollectedAssetsHint:"What was found, where it came from, its current confidence, and how it can be used.",
+    vulnNoCollectedAssets:"No assets have been collected yet.", vulnViewAllAssets:"View all assets", vulnViewSources:"Inspect collection sources",
+    vulnResultState:"Current conclusion", vulnUse:"Use", vulnNeedsValidation:"Passive lead · needs validation", vulnVerified:"DNS/HTTP verified",
+    vulnUseDomain:"Use as a DNS, HTTP, service, and content discovery target", vulnUseDependency:"Match versions against vulnerability intelligence", vulnUseGeneric:"Use as input for the next validation step",
+    vulnUnknownSource:"Unknown source", vulnRecordsCollected:"{count} records", vulnDimensionProduced:"This dimension produced data", vulnDimensionNoOutput:"Workflow completed, but produced no data",
+    vulnRecentChanges:"Recent changes", vulnSourceHealth:"Source health", vulnSource:"Source", vulnType:"Type",
+    vulnStatus:"Status", vulnFreshness:"Freshness", vulnRecords:"Records", vulnReconDomain:"Domains & certificates",
+    vulnCampaignDraft:"Draft · not collecting", vulnCampaignRunning:"Running · continuous collection", vulnCampaignPaused:"Paused", vulnCampaignCompleted:"Completed", vulnCampaignArchived:"Archived",
+    vulnSourceRan:"Executed", vulnSourceRunning:"Running", vulnSourceNotRun:"Not executed", vulnSourceDegraded:"Degraded", vulnSourceFailed:"Failed", vulnSourceStale:"Stale",
+    vulnChangeAssetAdded:"Discovered asset {asset}", vulnChangeAssetSource:"Source: {source}", vulnChangeRefreshCompleted:"Collection workflow completed", vulnChangeRefreshDimensions:"{count} dimensions were processed",
+    vulnChangeAdded:"Added: {asset}", vulnChangeChanged:"Changed: {asset}", vulnChangeRemoved:"Removed: {asset}", vulnChangeStale:"Stale: {asset}", vulnChangeReappeared:"Reappeared: {asset}", vulnChangeUnknown:"Presence unknown: {asset}", vulnChangeSnapshotDetail:"Source {source} · complete coverage: {complete}", vulnFreshUntil:"TTL boundary: {time}", vulnYes:"yes", vulnNo:"no",
+    vulnReconNetwork:"Network & services", vulnReconWeb:"Web & APIs", vulnReconCode:"Code & secrets",
+    vulnReconSupply:"Dependencies & SBOM", vulnReconIntel:"Vulnerability intelligence", vulnReconExternal:"External attack surface",
+    vulnReconHistory:"Historical changes", vulnCoverageDimension:"Required coverage dimension",
+    vulnLastSuccess:"Last successful update", vulnUpdatePolicy:"Continuous update policy", vulnUpdatePolicyHint:"Event, scheduled, and manual refresh share one auditable pipeline.",
+    vulnRunIncremental:"Run incremental refresh", vulnEventDriven:"Event driven", vulnEventDrivenHint:"Repository pushes and webhooks update immediately.",
+    vulnScheduled:"Scheduled", vulnScheduledHint:"Frequency follows source limits and asset priority.", vulnManual:"Manual refresh",
+    vulnManualHint:"Refresh any campaign, asset, or dimension on demand.", vulnAssetInventory:"Asset inventory",
+    vulnAssetInventoryHint:"Normalized assets with scope, provenance, and freshness.", vulnSearchAssets:"Search assets...",
+    vulnIdentifier:"Identifier", vulnScope:"Scope", vulnTechnology:"Technology", vulnRisk:"Risk", vulnUpdated:"Updated",
+    vulnAssetGraph:"Asset relationships", vulnAssetGraphHint:"Domain, IP, service, web, repository, and dependency relationships will be rendered here.",
+    vulnAssetGraphHintReal:"Stored and deduplicated relationships between campaign assets.", vulnRelations:"relations", vulnNoRelations:"No asset relationships have been imported yet.",
+    vulnProgress:"Progress", vulnFindingQueue:"Finding queue", vulnFindingQueueHint:"Candidates remain separate from confirmed vulnerabilities until validated.",
+    vulnSeverity:"Severity", vulnFinding:"Finding", vulnAsset:"Asset", vulnConfidence:"Confidence", vulnPreview:"Preview",
+    vulnAuthorizationScope:"Authorization & scope", vulnExclusions:"Exclusions", vulnExecutionPolicy:"Execution policy",
+    vulnActiveTesting:"Active testing", vulnActiveTestingHint:"Disabled by default and enforced by scope validation.",
+    vulnApprovalRequired:"Approval required", vulnRateLimit:"Rate limit", vulnConcurrency:"Concurrency", vulnRequestHeader:"Research header",
+    vulnEnabled:"Enabled", vulnDisabled:"Disabled", vulnAuthorizationRequired:"Authorization required", vulnNoCampaign:"No campaign",
+    vulnWaitingCampaign:"Waiting for campaign", vulnLoading:"Loading vulnerability workspace...", vulnRetry:"Retry",
+    vulnReconCoverageRings:"Six-dimension coverage", vulnReconCoverageRingsHint:"Live completion across the required collection dimensions.",
+    vulnReconFreshness:"Data freshness", vulnReconFreshnessHint:"Current TTL posture and the scheduler's next update.", vulnNeedsAttention:"Needs attention", vulnAllFresh:"All fresh",
+    vulnFreshAssets:"Fresh assets", vulnStaleAssets:"Stale assets", vulnNextUpdate:"Next update",
+    vulnReconSourceHealthHint:"Last success, next run, and current adapter health.",
+    vulnBacklogTasks:"Queue backlog", vulnPendingApprovals:"Pending approvals", vulnFailedTasks:"Failed tasks",
+    vulnReconWorkspace:"Recon workspace", vulnReconWorkspaceHint:"Inventory, controlled collection, and vulnerability intelligence in one view.",
+    vulnReconAssetsTab:"Asset inventory", vulnReconTasksTab:"Task center", vulnReconIntelTab:"Intelligence board",
+    vulnAllTypes:"All types", vulnAllScopes:"All scopes", vulnAllSources:"All sources", vulnAllRisks:"All risk levels", vulnAllStatuses:"All statuses", vulnReset:"Reset",
+    vulnSourceCount:"Sources", vulnEvidenceCount:"Evidence", vulnCoverageState:"Coverage", vulnImportance:"Importance", vulnRiskScore:"Risk score",
+    vulnNoMatchingAssets:"No assets match these filters.", vulnAssetPageSummary:"{from}–{to} of {total} assets",
+    vulnCollectionTaskCenter:"Collection task center", vulnCollectionTaskCenterHint:"Review queue state and make audited approval decisions.", vulnNoCollectionTasks:"No collection tasks match this status.",
+    vulnPolicyApproved:"Policy approved", vulnAttempts:"Attempts", vulnApproval:"Approval", vulnCreated:"Created", vulnReject:"Reject", vulnApprove:"Approve",
+    vulnReconHypothesesHint:"AI-generated leads remain unconfirmed until evidence validates them.", vulnRecentVulnIntel:"Recent vulnerability intelligence", vulnRecentVulnIntelHint:"Latest dependency and identifier-linked findings.", vulnNoVulnIntel:"No vulnerability intelligence findings yet.",
+    vulnAssetDetail:"Asset details", vulnAssetDetailLoading:"Loading asset evidence and coverage...", vulnFirstSeen:"First seen", vulnLastSeen:"Last seen",
+    vulnAssetCoverageMatrix:"Coverage matrix", vulnAssetCoverageMatrixHint:"Per-dimension execution and evidence state.", vulnProducedEvidence:"Produced evidence",
+    vulnEvidenceList:"Evidence list", vulnEvidenceListHint:"Normalized observations with provenance.", vulnNoEvidence:"No evidence has been recorded for this asset.",
+    vulnRelationMiniGraph:"Relationship graph", vulnRelationMiniGraphHint:"Click a connected asset to inspect it.",
+    vulnRelatedTasks:"Related tasks", vulnNoRelatedTasks:"No related collection tasks.", vulnRelatedFindings:"Related vulnerabilities", vulnNoRelatedFindings:"No related vulnerability findings.",
+    vulnRelatedHypotheses:"Related hypotheses", vulnNoRelatedHypotheses:"No related hypotheses.",
+    vulnTaskApprovalTitle:"Collection task approval", vulnTaskApprovalAuditHint:"This decision is written to the campaign audit trail with the authenticated approver identity.",
+    vulnApprovalReason:"Decision reason", vulnApprovalReasonPlaceholder:"State the authorization or rejection rationale...", vulnSubmitting:"Submitting...", vulnTaskApproved:"Collection job approved.", vulnTaskRejected:"Collection job rejected.",
+    vulnManualRetry:"Retry manually", vulnManualRetryConfirm:"Create a new approved task from this failed task?", vulnManualRetryReason:"Manual retry requested after reviewing the failure", vulnManualRetryCreated:"A new manual retry task was created.",
+    vulnAllImportance:"All importance levels", vulnGraphNodes:"nodes", vulnNoGraphAssets:"No assets match the graph filters.", vulnAssetGraphClickHint:"Click a node to open its evidence and coverage details.",
+    vulnUnifiedTasks:"Unified mining task view", vulnUnifiedTasksHint:"Campaign jobs and their controlled collection tasks, ordered on one timeline.", vulnOpenTaskCenter:"Open collection task center",
+    vulnUnifiedTotal:"Visible records", vulnJobRecords:"Jobs", vulnCollectionTaskRecords:"Collection tasks", vulnAllTaskKinds:"All record kinds", vulnJobRecord:"Job", vulnCollectionTaskRecord:"Collection task", vulnParentJob:"Parent job",
+    vulnFindingFromAsset:"Create from asset + AI hypothesis", vulnFindingFromAssetHint:"Select an in-scope asset and a proposed AI hypothesis to create a traceable candidate finding.",
+    vulnHypothesisCandidateSafety:"This only creates a candidate. It does not scan, validate, confirm, or write a Fact.", vulnCreateCandidate:"Create candidate", vulnHypothesisFindingCreated:"AI hypothesis converted to a candidate finding.",
+    vulnIncludeReconSummary:"Include reconnaissance summary", vulnIncludeReconSummaryHint:"Add current assets, evidence, source health, six-dimension coverage, snapshots, and recent changes to this report.",
+    vulnNoCampaignTitle:"Create the first authorized mining campaign", vulnNoCampaignHint:"Define the objective, written authorization period, and exact scope before collecting any data.",
+    vulnMockOnly:"The API persists campaign data and enforces scope before execution.",
+    vulnMockRefreshDone:"Reconnaissance data refreshed.", vulnCreateCampaignTitle:"Create mining campaign",
+    vulnCreateMockBadge:"Authorized workflow", vulnCreateCampaignHint:"Define the legal authorization boundary before campaign data is created.",
+    vulnBasicInfo:"Basic information", vulnAuthorization:"Authorization & scope", vulnPolicy:"Execution policy",
+    vulnCampaignTitle:"Campaign title", vulnCampaignTitlePlaceholder:"e.g. External attack surface review",
+    vulnObjective:"Success objective", vulnObjectivePlaceholder:"Describe what the campaign should discover, validate, and deliver.",
+    vulnAuthorizationConfirm:"I confirm that I have explicit authorization for this scope",
+    vulnAuthorizationConfirmHint:"Only enter assets covered by a valid written authorization. Scope checks remain mandatory before any future active capability.",
+    vulnAuthorizationExpiry:"Authorization expiry", vulnScopeLines:"In-scope targets (one per line)",
+    vulnScopeLinesPlaceholder:"*.example.com\n203.0.113.0/28\ngithub.com/org/repo",
+    vulnEnableActiveTesting:"Request active testing", vulnEnableActiveTestingHint:"The policy is stored by the API, but no active execution adapter is configured.",
+    vulnRequestsPerSecond:"Maximum requests per second", vulnMockSafetySummary:"The backend validates authorization and scope. Active requests remain unavailable until a separately configured executor passes the same checks.",
+    vulnPrevious:"Previous", vulnNext:"Next", vulnCreateMock:"Create campaign", vulnCreating:"Creating...", vulnCampaignCreated:"Campaign created.",
+    vulnCampaignCreatedMock:"Campaign created.", vulnAllAuthorizedAssets:"All authorized assets", vulnActiveDryRunJob:"Active policy dry-run",
+    vulnPassiveRefreshJob:"Passive refresh", vulnIncrementalRefreshJob:"Incremental refresh", vulnRefreshRecorded:"Refresh dry-run recorded; no external request was sent.",
+    vulnImportAssets:"Import assets", vulnImportAssetsHint:"Add normalized observations manually, one identifier per line.", vulnAssetType:"Asset type",
+    vulnIdentifiersLines:"Identifiers (one per line)", vulnIdentifiersPlaceholder:"api.example.com\n203.0.113.7", vulnImportScopeHint:"Every item is classified by the backend as in-scope or out-of-scope; out-of-scope assets can never be actively tested.",
+    vulnImport:"Import", vulnAssetsImported:"Imported {created} new and updated {updated} existing assets.", vulnNoTasks:"No jobs have been recorded.", vulnLogs:"Logs", vulnNoLogs:"No logs.",
+    vulnAddFinding:"Add candidate finding", vulnNoFindings:"No vulnerability candidates yet.", vulnFindingCreateHint:"New entries start as candidates and require validation before confirmation.",
+    vulnFindingType:"Finding type", vulnFindingTitle:"Finding title", vulnDescription:"Description", vulnFindingCreated:"Candidate finding created.", vulnFindingUpdated:"Finding status updated.",
+    vulnGenerateReport:"Generate campaign report", vulnNoReports:"No reports generated yet.", vulnCampaignReport:"Campaign report", vulnReportGenerated:"Report generated.",
+    vulnReportPreview:"Report preview", vulnDownload:"Download",
+    vulnSourceControl:"Control", vulnSourceUpdated:"Source setting updated.", vulnSettingsSaved:"Campaign settings saved.",
+    vulnEditScopes:"Edit scopes", vulnEditScopesHint:"Exclusions override included scopes and are enforced immediately by the backend.",
+    vulnIncludedScopes:"Included scopes (one per line)", vulnExcludedScopes:"Excluded scopes (one per line)", vulnScopesSaved:"Authorization scopes saved.",
+    vulnAuditTrail:"Audit trail", vulnAuditTrailHint:"Authorization, scope, source, import, finding, and report operations.", vulnNoAudit:"No audit events.",
+    vulnSnapshots:"Reconnaissance snapshots", vulnSnapshotsHint:"Immutable summaries produced by refresh jobs.", vulnNoSnapshots:"No snapshots yet.",
+    vulnAIAnalysisHint:"Run bounded offline entity, relationship, coverage-gap, and hypothesis analysis over existing observations.", vulnAIComprehensive:"Comprehensive", vulnAIEntities:"Entity extraction", vulnAIRelationships:"Relationship inference", vulnAICoverageGaps:"Coverage gaps", vulnAIStart:"Queue AI analysis", vulnAIQueuing:"Queuing...", vulnAIQueued:"AI analysis Intent queued.", vulnAISafety:"The Worker receives bounded JSON only. It has no collection tools; any suggested collection remains pending approval.", vulnAIRecent:"Recent analyses", vulnAIRecentHint:"Dispatcher and Worker execution state with validated summaries.", vulnAIHypotheses:"Generated hypotheses", vulnAIHypothesesHint:"Unconfirmed leads that still require evidence and validation.", vulnAIObservations:"observations", vulnAIBudgetUnits:"budget units", vulnAINoAnalyses:"No AI analyses yet.", vulnAINoHypotheses:"No generated hypotheses yet.", vulnAIAwaiting:"Awaiting an analysis Worker.",
     reasonCompact:"Reason · {worker}", reasoning:"Reasoning · {worker}{trigger}", exploring:"Exploring · {count}",
     replayLabel:"Replay", replayProgress:"Replay {cur} / {total}",
     eventProject:"Project", eventHint:"Hint", eventReason:"Reason", eventIntent:"Intent", eventExecute:"Execute",
@@ -1559,6 +2143,114 @@ const CAIRN_I18N = {
     statusActive:"进行中", statusStopped:"已停止", statusCompleted:"已完成",
     statusConcluded:"已结案", statusBootstrapRunning:"引导执行中", statusBootstrapPending:"引导待执行",
     statusInProgress:"执行中", statusUnclaimed:"未认领",
+    vulnerabilityMining:"漏洞挖掘", vulnWorkspace:"已授权研究工作台", vulnAuthorized:"已授权",
+    vulnBackProjects:"返回项目列表", vulnLastUpdated:"最后更新", vulnRefresh:"刷新", vulnRefreshing:"刷新中...",
+    vulnCurrentCampaign:"当前挖掘项目", vulnContinuousMonitoring:"持续监控中", vulnAuthorizationUntil:"授权有效期",
+    vulnScopeItems:"范围条目", vulnOverview:"项目总览", vulnRecon:"信息搜集", vulnAssets:"资产图谱",
+    vulnTasks:"挖掘任务", vulnFindings:"漏洞中心", vulnReports:"报告中心", vulnAIAnalysis:"AI 分析", vulnSettings:"项目设置",
+    vulnMockNotice:"真实 API · 后端强制授权边界 · 不执行主动扫描（未配置执行器）", vulnNewCampaign:"新建挖掘项目",
+    vulnBlackboardTitle:"Cairn 黑板", vulnBlackboardLive:"核心架构 · 实时",
+    vulnBlackboardHint:"这是本项目真实的共享推理控制面：Fact 保存已接受知识，Intent 描述有边界的工作，Hint 提供策略，Worker 再把新 Fact 写回黑板。",
+    vulnBlackboardFactStep:"共享且已接受的知识", vulnBlackboardIntentStep:"有边界的问题或分析任务", vulnBlackboardWorkerStep:"受控执行与推理", vulnBlackboardResultStep:"可审计地写回新知识",
+    vulnBlackboardLoading:"正在加载 Cairn 黑板...", vulnBlackboardFacts:"事实 Fact", vulnBlackboardFactsHint:"已接受的共享真相", vulnBlackboardNoFacts:"黑板上还没有 Fact。",
+    vulnBlackboardIntents:"意图 Intent", vulnBlackboardIntentsHint:"调度器与 Worker 共同可见的工作", vulnBlackboardNoIntents:"黑板上还没有 Intent。",
+    vulnBlackboardHints:"提示 Hint", vulnBlackboardHintsHint:"所有参与者共享的策略指导", vulnBlackboardNoHints:"黑板上还没有 Hint。",
+    vulnBlackboardOrigin:"起点", vulnBlackboardGoal:"目标", vulnBlackboardDerivedFact:"衍生事实", vulnBlackboardConcluded:"已结案", vulnBlackboardRunning:"执行中", vulnBlackboardQueued:"待认领",
+    vulnBlackboardReason:"Reason 状态", vulnBlackboardReasonIdle:"空闲 · 当前没有 Reason Worker 持有项目租约", vulnBlackboardBoundary:"资产、Observation 与采集任务属于漏洞数据面；黑板承担跨 Worker 的推理控制面。",
+    vulnMetricAssets:"范围内资产", vulnMetricCoverage:"搜集覆盖率", vulnMetricTasks:"运行中任务", vulnMetricFindings:"漏洞发现",
+    vulnMetricProductiveDimensions:"有数据的维度", vulnMetricSourcesRun:"已执行信息源",
+    vulnMetricObservationMeta:"{count} 条证据", vulnMetricRunMeta:"{percent}% 流程已执行", vulnMetricOutputMeta:"{count} 个有产出", vulnMetricConfirmedMeta:"{count} 个已确认",
+    vulnCoverageTitle:"各维度实际产出", vulnCoverageHint:"“执行完成”只代表流程跑过；记录数才表示实际收集到了数据。",
+    vulnCollectionResult:"本次搜集结果", vulnCollectionSummary:"已收集 {assets} 个资产，来自 {productiveSources} 个有效信息源",
+    vulnCollectionMeaning:"资产是攻击面线索；继续补充 DNS、HTTP、服务、技术栈和漏洞验证证据后，才会成为可用于漏洞挖掘的目标。",
+    vulnCollectionLimit:"目前 {assets} 个资产仍是被动线索，只有 {verifiedAssets} 个完成了 DNS 或 HTTP 验证。",
+    vulnProductiveSources:"产生数据的信息源", vulnVerifiedAssets:"DNS/HTTP 已验证资产", vulnObservationMetric:"证据记录", vulnDataFreshness:"资产新鲜度", vulnFreshnessSummary:"{freshAssets} 个新鲜 · {staleAssets} 个过期",
+    vulnCollectedAssets:"当前已收集的资产", vulnCollectedAssetsHint:"直接说明发现了什么、从哪里发现、可信到什么程度以及下一步用途。",
+    vulnNoCollectedAssets:"尚未收集到资产。", vulnViewAllAssets:"查看全部资产", vulnViewSources:"查看信息源",
+    vulnResultState:"当前结论", vulnUse:"用途", vulnNeedsValidation:"被动线索 · 待验证", vulnVerified:"DNS/HTTP 已验证",
+    vulnUseDomain:"作为 DNS、HTTP、服务与内容发现的后续目标", vulnUseDependency:"用于版本匹配和漏洞情报关联", vulnUseGeneric:"作为下一步验证任务的输入",
+    vulnUnknownSource:"未知来源", vulnRecordsCollected:"{count} 条记录", vulnDimensionProduced:"该维度已产生数据", vulnDimensionNoOutput:"流程已执行，但没有产生数据",
+    vulnRecentChanges:"最近变化", vulnSourceHealth:"信息源健康状态", vulnSource:"信息源", vulnType:"类型",
+    vulnStatus:"状态", vulnFreshness:"新鲜度", vulnRecords:"记录数", vulnReconDomain:"域名与证书",
+    vulnCampaignDraft:"草稿 · 未采集", vulnCampaignRunning:"运行中 · 持续采集", vulnCampaignPaused:"已暂停", vulnCampaignCompleted:"已完成", vulnCampaignArchived:"已归档",
+    vulnSourceRan:"已执行", vulnSourceRunning:"执行中", vulnSourceNotRun:"未执行", vulnSourceDegraded:"异常", vulnSourceFailed:"失败", vulnSourceStale:"数据过期",
+    vulnChangeAssetAdded:"发现资产 {asset}", vulnChangeAssetSource:"来源：{source}", vulnChangeRefreshCompleted:"搜集流程已完成", vulnChangeRefreshDimensions:"已处理 {count} 个维度",
+    vulnChangeAdded:"新增：{asset}", vulnChangeChanged:"发生变化：{asset}", vulnChangeRemoved:"已移除：{asset}", vulnChangeStale:"已过期：{asset}", vulnChangeReappeared:"重新出现：{asset}", vulnChangeUnknown:"存在状态未知：{asset}", vulnChangeSnapshotDetail:"来源 {source} · 覆盖完整：{complete}", vulnFreshUntil:"TTL 边界：{time}", vulnYes:"是", vulnNo:"否",
+    vulnReconNetwork:"网络与服务", vulnReconWeb:"Web 与 API", vulnReconCode:"源码与敏感信息",
+    vulnReconSupply:"依赖与 SBOM", vulnReconIntel:"漏洞情报", vulnReconExternal:"外部攻击面",
+    vulnReconHistory:"历史变化", vulnCoverageDimension:"必需搜集维度",
+    vulnLastSuccess:"最后成功更新", vulnUpdatePolicy:"持续更新策略", vulnUpdatePolicyHint:"事件、定时和手动刷新使用同一条可审计数据管线。",
+    vulnRunIncremental:"执行增量更新", vulnEventDriven:"事件触发", vulnEventDrivenHint:"代码 Push 和 Webhook 立即更新。",
+    vulnScheduled:"定时更新", vulnScheduledHint:"更新频率由信息源限制和资产重要性决定。", vulnManual:"手动刷新",
+    vulnManualHint:"随时刷新项目、资产或单一维度。", vulnAssetInventory:"资产清单",
+    vulnAssetInventoryHint:"经过标准化、范围校验并带来源和新鲜度的资产。", vulnSearchAssets:"搜索资产...",
+    vulnIdentifier:"标识符", vulnScope:"范围", vulnTechnology:"技术栈", vulnRisk:"风险", vulnUpdated:"更新时间",
+    vulnAssetGraph:"资产关系", vulnAssetGraphHint:"在这里呈现域名、IP、服务、Web、仓库和依赖之间的关系。",
+    vulnAssetGraphHintReal:"展示项目资产之间已存储、去重的关系。", vulnRelations:"条关系", vulnNoRelations:"尚未导入资产关系。",
+    vulnProgress:"进度", vulnFindingQueue:"漏洞队列", vulnFindingQueueHint:"候选发现经过验证后才能进入已确认漏洞。",
+    vulnSeverity:"严重度", vulnFinding:"漏洞", vulnAsset:"资产", vulnConfidence:"置信度", vulnPreview:"预览",
+    vulnAuthorizationScope:"授权与范围", vulnExclusions:"排除项", vulnExecutionPolicy:"执行策略",
+    vulnActiveTesting:"主动测试", vulnActiveTestingHint:"默认关闭，并由范围校验强制约束。",
+    vulnApprovalRequired:"需要审批", vulnRateLimit:"速率限制", vulnConcurrency:"并发数", vulnRequestHeader:"测试标识 Header",
+    vulnEnabled:"已开启", vulnDisabled:"已关闭", vulnAuthorizationRequired:"需要授权", vulnNoCampaign:"尚无挖掘项目",
+    vulnWaitingCampaign:"等待创建项目", vulnLoading:"正在加载漏洞挖掘工作台...", vulnRetry:"重试",
+    vulnReconCoverageRings:"六维覆盖率", vulnReconCoverageRingsHint:"实时展示六个必需信息搜集维度的完成度。",
+    vulnReconFreshness:"数据新鲜度", vulnReconFreshnessHint:"当前 TTL 状态与调度器的下次更新时间。", vulnNeedsAttention:"需要关注", vulnAllFresh:"全部新鲜",
+    vulnFreshAssets:"新鲜资产", vulnStaleAssets:"过期资产", vulnNextUpdate:"下次更新",
+    vulnReconSourceHealthHint:"展示适配器最后成功时间、下次执行与当前健康状态。",
+    vulnBacklogTasks:"队列积压", vulnPendingApprovals:"待审批", vulnFailedTasks:"失败任务",
+    vulnReconWorkspace:"信息搜集工作区", vulnReconWorkspaceHint:"在同一视图管理资产、受控采集任务和漏洞情报。",
+    vulnReconAssetsTab:"资产清单", vulnReconTasksTab:"任务中心", vulnReconIntelTab:"情报看板",
+    vulnAllTypes:"全部类型", vulnAllScopes:"全部范围", vulnAllSources:"全部来源", vulnAllRisks:"全部风险", vulnAllStatuses:"全部状态", vulnReset:"重置",
+    vulnSourceCount:"来源数", vulnEvidenceCount:"证据数", vulnCoverageState:"覆盖状态", vulnImportance:"重要性", vulnRiskScore:"风险分",
+    vulnNoMatchingAssets:"没有资产符合当前筛选条件。", vulnAssetPageSummary:"共 {total} 个资产，当前 {from}–{to}",
+    vulnCollectionTaskCenter:"采集任务中心", vulnCollectionTaskCenterHint:"查看队列状态并完成可审计的审批决策。", vulnNoCollectionTasks:"当前状态下没有采集任务。",
+    vulnPolicyApproved:"策略自动批准", vulnAttempts:"尝试次数", vulnApproval:"审批", vulnCreated:"创建时间", vulnReject:"拒绝", vulnApprove:"通过",
+    vulnReconHypothesesHint:"AI 生成的线索仍属未确认假设，需要证据验证。", vulnRecentVulnIntel:"最近关联漏洞", vulnRecentVulnIntelHint:"最近发现的依赖漏洞与漏洞编号关联。", vulnNoVulnIntel:"尚无关联漏洞情报。",
+    vulnAssetDetail:"资产详情", vulnAssetDetailLoading:"正在加载资产证据与覆盖情况...", vulnFirstSeen:"首次发现", vulnLastSeen:"最近发现",
+    vulnAssetCoverageMatrix:"覆盖矩阵", vulnAssetCoverageMatrixHint:"逐维展示执行状态和证据产出。", vulnProducedEvidence:"产出证据",
+    vulnEvidenceList:"证据列表", vulnEvidenceListHint:"带来源的标准化观察记录。", vulnNoEvidence:"该资产尚无证据记录。",
+    vulnRelationMiniGraph:"关系小图", vulnRelationMiniGraphHint:"点击相邻资产可继续查看。",
+    vulnRelatedTasks:"关联任务", vulnNoRelatedTasks:"没有关联采集任务。", vulnRelatedFindings:"关联漏洞", vulnNoRelatedFindings:"没有关联漏洞发现。",
+    vulnRelatedHypotheses:"关联假设", vulnNoRelatedHypotheses:"没有关联漏洞假设。",
+    vulnTaskApprovalTitle:"采集任务审批", vulnTaskApprovalAuditHint:"本次决策将使用已认证审批人身份写入项目审计轨迹。",
+    vulnApprovalReason:"决策理由", vulnApprovalReasonPlaceholder:"填写授权依据或拒绝原因...", vulnSubmitting:"提交中...", vulnTaskApproved:"采集任务已批准。", vulnTaskRejected:"采集任务已拒绝。",
+    vulnManualRetry:"手动重试", vulnManualRetryConfirm:"是否基于该失败任务创建一个新的已批准任务？", vulnManualRetryReason:"复核失败原因后发起人工重试", vulnManualRetryCreated:"已创建新的人工重试任务。",
+    vulnAllImportance:"全部重要性", vulnGraphNodes:"个节点", vulnNoGraphAssets:"没有资产符合当前图谱筛选条件。", vulnAssetGraphClickHint:"点击节点可打开该资产的证据与覆盖详情。",
+    vulnUnifiedTasks:"统一挖掘任务视图", vulnUnifiedTasksHint:"在同一时间线展示项目任务及其受控采集子任务。", vulnOpenTaskCenter:"打开采集任务中心",
+    vulnUnifiedTotal:"可见记录", vulnJobRecords:"项目任务", vulnCollectionTaskRecords:"采集任务", vulnAllTaskKinds:"全部记录类型", vulnJobRecord:"项目任务", vulnCollectionTaskRecord:"采集任务", vulnParentJob:"父任务",
+    vulnFindingFromAsset:"从资产和 AI 假设生成候选漏洞", vulnFindingFromAssetHint:"选择范围内资产与待采纳的 AI 假设，生成带来源证据的候选漏洞。",
+    vulnHypothesisCandidateSafety:"此操作只创建 candidate，不执行扫描、自动验证、确认或 Fact 写入。", vulnCreateCandidate:"生成候选漏洞", vulnHypothesisFindingCreated:"AI 假设已转换为候选漏洞。",
+    vulnIncludeReconSummary:"包含信息收集摘要", vulnIncludeReconSummaryHint:"在报告中加入当前资产、证据、来源健康、六维覆盖、快照和最近变化。",
+    vulnNoCampaignTitle:"创建第一个已授权挖掘项目", vulnNoCampaignHint:"开始收集任何数据前，先定义目标、书面授权有效期和精确范围。",
+    vulnMockOnly:"项目数据由 API 持久化，执行前由后端强制校验范围。",
+    vulnMockRefreshDone:"信息搜集数据已刷新。", vulnCreateCampaignTitle:"新建挖掘项目",
+    vulnCreateMockBadge:"授权工作流", vulnCreateCampaignHint:"创建项目数据前，先定义合法授权边界。",
+    vulnBasicInfo:"基本信息", vulnAuthorization:"授权与范围", vulnPolicy:"执行策略",
+    vulnCampaignTitle:"项目标题", vulnCampaignTitlePlaceholder:"例如：外部攻击面持续挖掘",
+    vulnObjective:"成功目标", vulnObjectivePlaceholder:"说明本项目需要发现、验证并最终交付什么。",
+    vulnAuthorizationConfirm:"我确认已获得此范围的明确授权",
+    vulnAuthorizationConfirmHint:"这里只能填写书面授权覆盖的资产；未来接入任何主动能力前仍必须再次执行范围校验。",
+    vulnAuthorizationExpiry:"授权截止日期", vulnScopeLines:"范围内目标（每行一个）",
+    vulnScopeLinesPlaceholder:"*.example.com\n203.0.113.0/28\ngithub.com/org/repo",
+    vulnEnableActiveTesting:"申请主动测试", vulnEnableActiveTestingHint:"策略将由 API 保存，但当前没有配置主动执行适配器。",
+    vulnRequestsPerSecond:"每秒最大请求数", vulnMockSafetySummary:"后端会校验授权与范围；在单独配置执行器并通过同样检查前，主动请求仍不可用。",
+    vulnPrevious:"上一步", vulnNext:"下一步", vulnCreateMock:"创建挖掘项目", vulnCreating:"创建中...", vulnCampaignCreated:"挖掘项目已创建。",
+    vulnCampaignCreatedMock:"挖掘项目已创建。", vulnAllAuthorizedAssets:"全部授权资产", vulnActiveDryRunJob:"主动策略预检",
+    vulnPassiveRefreshJob:"被动信息刷新", vulnIncrementalRefreshJob:"增量信息刷新", vulnRefreshRecorded:"刷新预检已记录，未发送外部请求。",
+    vulnImportAssets:"导入资产", vulnImportAssetsHint:"手工添加标准化观察数据，每行填写一个标识符。", vulnAssetType:"资产类型",
+    vulnIdentifiersLines:"标识符（每行一个）", vulnIdentifiersPlaceholder:"api.example.com\n203.0.113.7", vulnImportScopeHint:"后端会把每项判定为范围内或范围外；范围外资产永远不能执行主动测试。",
+    vulnImport:"导入", vulnAssetsImported:"新增 {created} 个、更新 {updated} 个资产。", vulnNoTasks:"尚无任务记录。", vulnLogs:"日志", vulnNoLogs:"暂无日志。",
+    vulnAddFinding:"新增候选漏洞", vulnNoFindings:"尚无漏洞候选。", vulnFindingCreateHint:"新记录以候选状态进入，完成验证后才能确认为漏洞。",
+    vulnFindingType:"漏洞类型", vulnFindingTitle:"漏洞标题", vulnDescription:"描述", vulnFindingCreated:"候选漏洞已创建。", vulnFindingUpdated:"漏洞状态已更新。",
+    vulnGenerateReport:"生成项目报告", vulnNoReports:"尚未生成报告。", vulnCampaignReport:"项目报告", vulnReportGenerated:"报告已生成。",
+    vulnReportPreview:"报告预览", vulnDownload:"下载",
+    vulnSourceControl:"控制", vulnSourceUpdated:"信息源设置已更新。", vulnSettingsSaved:"项目设置已保存。",
+    vulnEditScopes:"编辑范围", vulnEditScopesHint:"排除项优先于包含项，保存后由后端立即强制执行。",
+    vulnIncludedScopes:"包含范围（每行一个）", vulnExcludedScopes:"排除范围（每行一个）", vulnScopesSaved:"授权范围已保存。",
+    vulnAuditTrail:"审计轨迹", vulnAuditTrailHint:"记录授权、范围、信息源、导入、漏洞和报告操作。", vulnNoAudit:"暂无审计事件。",
+    vulnSnapshots:"信息搜集快照", vulnSnapshotsHint:"由刷新任务生成的不可变摘要。", vulnNoSnapshots:"尚无快照。",
+    vulnAIAnalysisHint:"仅基于现有观察数据，执行受预算约束的实体、关系、覆盖缺口与漏洞假设分析。", vulnAIComprehensive:"综合分析", vulnAIEntities:"实体提取", vulnAIRelationships:"关系推断", vulnAICoverageGaps:"覆盖缺口", vulnAIStart:"创建 AI 分析", vulnAIQueuing:"创建中...", vulnAIQueued:"AI 分析 Intent 已进入队列。", vulnAISafety:"Worker 只能接收受限 JSON，且没有采集工具；建议的新采集任务仍需审批。", vulnAIRecent:"最近分析", vulnAIRecentHint:"展示调度器与 Worker 状态及已校验摘要。", vulnAIHypotheses:"生成的漏洞假设", vulnAIHypothesesHint:"这些是尚未确认的线索，仍需证据和验证。", vulnAIObservations:"条观察", vulnAIBudgetUnits:"预算单位", vulnAINoAnalyses:"尚无 AI 分析。", vulnAINoHypotheses:"尚无生成的漏洞假设。", vulnAIAwaiting:"等待分析 Worker。",
     reasonCompact:"推理 · {worker}", reasoning:"推理中 · {worker}{trigger}", exploring:"探索中 · {count}",
     replayLabel:"回放", replayProgress:"回放 {cur} / {total}",
     eventProject:"项目", eventHint:"提示", eventReason:"推理", eventIntent:"意图", eventExecute:"执行中",
@@ -1640,6 +2332,7 @@ function cairnApp() {
     },
 
     view: 'list',
+    ...vulnerabilityModule(),
     projects: [],
     project: null,
     selectedProjectId: '',
@@ -1721,6 +2414,7 @@ function cairnApp() {
       window.addEventListener('pointermove', this._panelResizeMove);
       window.addEventListener('pointerup', this._panelResizeStop);
       this.loadLocalPrefs();
+      this.loadVulnerabilityWorkspace();
       await this.loadProjects();
       await this.loadSettings();
       await this.loadCtfConfig();
@@ -1732,6 +2426,11 @@ function cairnApp() {
 
     handleRoute() {
       const hash = location.hash || '#/';
+      const vulnerabilityMatch = hash.match(/^#\/vulnerability(?:\/([^/]+))?\/?$/);
+      if (vulnerabilityMatch) {
+        this.openVulnerability(vulnerabilityMatch[1] || 'overview', true);
+        return;
+      }
       const m = hash.match(/^#\/projects\/(.+)$/);
       if (m) {
         const id = m[1];
@@ -1743,8 +2442,8 @@ function cairnApp() {
       }
     },
 
-    async api(method, path, body) {
-      const opts = { method, headers: { 'Content-Type': 'application/json' } };
+    async api(method, path, body, headers = {}) {
+      const opts = { method, headers: { 'Content-Type': 'application/json', ...headers } };
       if (body) opts.body = JSON.stringify(body);
       const r = await fetch(path, opts);
       if (r.status === 204) return null;

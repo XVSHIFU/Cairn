@@ -86,3 +86,31 @@ def ctf_bridge(server: str, once: bool, log_level: str):
         bridge.run_once()
     else:
         bridge.run()
+@main.command("vuln-collect")
+@click.option(
+    "--db-path",
+    type=click.Path(path_type=Path),
+    default=db.DEFAULT_DB,
+    show_default=True,
+    help="SQLite database path",
+)
+@click.option("--once", is_flag=True, help="Run one scheduling and queue-consumption tick")
+@click.option(
+    "--interval",
+    "interval_seconds",
+    type=click.IntRange(min=5, max=86400),
+    default=60,
+    show_default=True,
+    help="Seconds between scheduler ticks",
+)
+@click.option("--log-level", default="INFO", show_default=True, help="Log level")
+def vuln_collect(db_path: Path, once: bool, interval_seconds: int, log_level: str):
+    """Run the durable passive-collection scheduler and task consumer."""
+    configure_logging(log_level)
+    db.configure(db_path)
+    from cairn.server.vulnerability_collectors import run_collector_loop
+
+    try:
+        run_collector_loop(interval_seconds=interval_seconds, once=once)
+    except KeyboardInterrupt:
+        return

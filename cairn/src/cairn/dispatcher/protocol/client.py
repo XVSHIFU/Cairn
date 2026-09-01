@@ -48,8 +48,12 @@ class CairnClient:
         for session in sessions:
             session.close()
 
-    def list_projects(self) -> list[ProjectSummary]:
-        response = self._session().get(self._url("/projects"), timeout=self._timeout)
+    def list_projects(self, project_kind: str = "general") -> list[ProjectSummary]:
+        response = self._session().get(
+            self._url("/projects"),
+            params={"project_kind": project_kind},
+            timeout=self._timeout,
+        )
         response.raise_for_status()
         return self._summary_adapter.validate_python(response.json())
 
@@ -126,6 +130,73 @@ class CairnClient:
             "POST",
             f"/projects/{project_id}/intents",
             json={"from": from_ids, "description": description, "creator": creator, "worker": None},
+        )
+
+    def get_vulnerability_reason_context(
+        self, project_id: str, max_observations: int
+    ) -> dict[str, Any]:
+        response = self._session().get(
+            self._url(f"/vulnerability/projects/{project_id}/ai/context"),
+            params={"limit": max_observations},
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ProtocolError("invalid vulnerability reason context", response.status_code, response.text)
+        return data
+
+    def create_vulnerability_analysis(
+        self,
+        project_id: str,
+        from_ids: list[str],
+        analysis_type: str,
+        observation_ids: list[str],
+        budget_units: int,
+        creator: str,
+    ) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/vulnerability/projects/{project_id}/ai/analyses",
+            json={
+                "analysis_type": analysis_type,
+                "observation_ids": observation_ids,
+                "budget_units": budget_units,
+                "requested_by": creator,
+                "from_fact_ids": from_ids,
+            },
+        )
+
+    def start_vulnerability_analysis(
+        self, project_id: str, intent_id: str, worker: str
+    ) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/vulnerability/projects/{project_id}/intents/{intent_id}/ai/start",
+            json={"worker": worker},
+        )
+
+    def submit_vulnerability_analysis(
+        self,
+        project_id: str,
+        intent_id: str,
+        worker: str,
+        model: str | None,
+        output: dict[str, Any],
+    ) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/vulnerability/projects/{project_id}/intents/{intent_id}/ai/result",
+            json={"worker": worker, "model": model, "output": output},
+        )
+
+    def fail_vulnerability_analysis(
+        self, project_id: str, intent_id: str, worker: str, error: str
+    ) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/vulnerability/projects/{project_id}/intents/{intent_id}/ai/failure",
+            json={"worker": worker, "error": error[:2000]},
         )
 
     def _request_json(self, method: str, path: str, json: dict[str, Any]) -> ApiResult:
