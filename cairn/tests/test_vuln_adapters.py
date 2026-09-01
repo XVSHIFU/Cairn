@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -14,6 +16,7 @@ from cairn.server.vuln_adapters import (
     CertificateTransparencyAdapter,
     DnsxResolveAdapter,
     HttpxHttpMetadataAdapter,
+    NucleiPassiveResponseAdapter,
     OsvVulnerabilityIntelligenceAdapter,
     RATE_LIMIT_RESERVATION_WINDOW_SECONDS,
     RdapDomainAdapter,
@@ -229,6 +232,9 @@ def test_controlled_adapters_materialize_argument_arrays_and_parse_mocked_output
         assert {"-san", "-cn", "-so", "-serial"}.isdisjoint(
             argument for invocation in invocations for argument in invocation.argv
         )
+    if adapter.tool_id == "httpx.http-meta.v1":
+        assert "-include-response" in invocations[0].argv
+        assert "-omit-body" not in invocations[0].argv
     if adapter.uses_http:
         assert "X-Cairn-Research: campaign=vuln-test; task=task-test" in invocations[0].argv
 
@@ -262,6 +268,7 @@ def test_adapter_registry_exposes_complete_lifecycle_metadata() -> None:
         "dnsx.resolve.v1",
         "httpx.http-meta.v1",
         "tlsx.tls-meta.v1",
+        "nuclei.passive-response.v1",
     }
     for tool_id, adapter in ADAPTER_REGISTRY.items():
         assert adapter.tool_id == tool_id
@@ -416,3 +423,130 @@ def test_http_rate_limit_uses_durable_campaign_window(monkeypatch) -> None:
     assert [row["observed_at"] for row in rows] == [
         pytest.approx(100.0 + RATE_LIMIT_RESERVATION_WINDOW_SECONDS)
     ]
+
+
+def _mock_nuclei_template_policy(tmp_path: Path, monkeypatch) -> Path:
+    relative = "http/misconfiguration/http-missing-security-headers.yaml"
+    template = tmp_path / relative
+    template.parent.mkdir(parents=True)
+    content = """id: http-missing-security-headers
+info:
+  name: HTTP Missing Security Headers
+  severity: info
+  tags: misconfig,headers
+http:
+  - method: GET
+    path:
+      - \"{{BaseURL}}\"
+    matchers:
+      - type: word
+        part: header
+        words: [\"Server:\"]
+# digest: aabbcc:ddeeff
+"""
+    template.write_text(content, encoding="utf-8")
+    monkeypatch.setenv("CAIRN_NUCLEI_TEMPLATES_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        "cairn.server.vuln_adapters.NUCLEI_TEMPLATE_ALLOWLIST",
+        (
+            (
+                "http-missing-security-headers",
+                relative,
+                hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            ),
+        ),
+    )
+    return template
+
+
+def test_nuclei_passive_adapter_only_reads_captured_response(
+    tmp_path, monkeypatch
+) -> None:
+    _mock_nuclei_template_policy(tmp_path, monkeypatch)
+    response_text = "HTTP/1.1 200 OK\r\nServer: nginx\r\n\r\nhello"
+    context = _context()
+    context = AdapterContext(
+        **{
+            **context.__dict__,
+            "http_responses": (
+                {
+                    "id": "http_response_001",
+                    "domain": "example.com",
+                    "asset_id": "asset_001",
+                    "task_id": "capture_task_001",
+                    "request_text": "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                    "response_text": response_text,
+                    "response_hash": hashlib.sha256(response_text.encode()).hexdigest(),
+                    "content_truncated": 0,
+                },
+            ),
+        }
+    )
+    adapter = NucleiPassiveResponseAdapter()
+    calls: list[list[str]] = []
+    captured_inputs: list[str] = []
+    monkeypatch.setattr(
+        "cairn.server.vuln_adapters.shutil.which", lambda binary: f"/mock/{binary}"
+    )
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if str(argv[0]).startswith("/mock/"):
+            return subprocess.CompletedProcess(argv, 0, "Nuclei Engine Version: v3.11.1\n", "")
+        assert "-passive" in argv
+        assert "-no-interactsh" in argv
+        assert "-disable-unsigned-templates" in argv
+        assert "-no-stdin" in argv
+        target_path = Path(argv[argv.index("-target") + 1])
+        captured_inputs.append(target_path.read_text(encoding="utf-8"))
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            json.dumps(
+                {
+                    "template-id": "http-missing-security-headers",
+                    "matcher-name": "strict-transport-security",
+                    "matched-at": "https://example.com",
+                    "info": {
+                        "name": "HTTP Missing Security Headers",
+                        "severity": "info",
+                    },
+                }
+            )
+            + "\n",
+            "",
+        )
+
+    monkeypatch.setattr("cairn.server.vuln_adapters.subprocess.run", fake_run)
+    assert adapter.health()["healthy"] is True
+    execution = adapter.execute(context)
+    parsed = adapter.parse(execution)
+
+    assert len(calls) == 2
+    assert "GET / HTTP/1.1" in captured_inputs[0]
+    assert "HTTP/1.1 200 OK" in captured_inputs[0]
+    assert parsed["findings"][0]["response_id"] == "http_response_001"
+    assert parsed["findings"][0]["template_id"] == "http-missing-security-headers"
+    assert adapter.coverage_complete(context, parsed) is True
+
+
+def test_nuclei_passive_adapter_rejects_tampered_or_dangerous_template(
+    tmp_path, monkeypatch
+) -> None:
+    template = _mock_nuclei_template_policy(tmp_path, monkeypatch)
+    template.write_text(
+        template.read_text(encoding="utf-8") + "\ncode:\n  - engine: python3\n",
+        encoding="utf-8",
+    )
+    adapter = NucleiPassiveResponseAdapter()
+    monkeypatch.setattr(
+        "cairn.server.vuln_adapters.shutil.which", lambda binary: f"/mock/{binary}"
+    )
+    monkeypatch.setattr(
+        "cairn.server.vuln_adapters.subprocess.run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, "v3.11.1\n", ""),
+    )
+
+    health = adapter.health()
+    assert health["healthy"] is False
+    assert "hash mismatch" in health["error"]

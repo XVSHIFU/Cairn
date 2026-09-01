@@ -3,13 +3,16 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import quote, urlsplit
 
@@ -21,7 +24,40 @@ DOMAIN_PATTERN = re.compile(
 )
 HTTP_HEADER_NAME_PATTERN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 FORBIDDEN_REQUEST_HEADERS = {"host", "content-length"}
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 RATE_LIMIT_RESERVATION_WINDOW_SECONDS = 1.01
+HTTP_RESPONSE_MAX_BYTES = 262_144
+HTTP_REQUEST_MAX_BYTES = 65_536
+NUCLEI_TEMPLATES_COMMIT = "74e8267021b061b726fe997d322444d3c20988b7"
+NUCLEI_TEMPLATE_ALLOWLIST: tuple[tuple[str, str, str], ...] = (
+    (
+        "http-missing-security-headers",
+        "http/misconfiguration/http-missing-security-headers.yaml",
+        "7f45803f73ac6810b9b302df6be2c472a82d9164a7807328614efa83e6eac275",
+    ),
+    (
+        "nginx-version",
+        "http/technologies/nginx/nginx-version.yaml",
+        "aa410fb8361f2109ac247b16419040cc2cce1e3d9c76f0a51593806e7c1b7cd7",
+    ),
+)
+NUCLEI_FORBIDDEN_TEMPLATE_PATTERN = re.compile(
+    r"^(?:code|headless|javascript|fuzzing|payloads|workflows)\s*:|"
+    r"interactsh|^\s*tags\s*:.*\b(?:dos|fuzz|bruteforce|intrusive)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _configured_user_binary(name: str, environment_name: str) -> str:
+    """Resolve an allowlisted tool without relying on an interactive-shell PATH."""
+
+    configured = os.getenv(environment_name)
+    if configured:
+        return str(Path(configured).expanduser())
+    user_local = Path.home() / ".local" / "bin" / name
+    if user_local.is_file() and os.access(user_local, os.X_OK):
+        return str(user_local)
+    return name
 
 
 class AdapterError(RuntimeError):
@@ -69,6 +105,7 @@ class AdapterContext:
     source: Mapping[str, Any]
     targets: tuple[str, ...] = ()
     packages: tuple[Mapping[str, Any], ...] = ()
+    http_responses: tuple[Mapping[str, Any], ...] = ()
     cursor: Mapping[str, Any] = field(default_factory=dict)
     request_header: str = "X-Cairn-Research"
     max_requests_per_second: int = 30
@@ -297,7 +334,9 @@ class VulnSourceAdapter(ABC):
                 "version": None,
                 "error": f"Version probe failed: {type(exc).__name__}",
             }
-        output = completed.stdout.strip() or completed.stderr.strip()
+        output = ANSI_ESCAPE_PATTERN.sub(
+            "", completed.stdout.strip() or completed.stderr.strip()
+        )
         first_line = output.splitlines()[0][:256] if output else None
         if completed.returncode != 0:
             detail = f": {first_line}" if first_line else ""
@@ -316,8 +355,15 @@ class VulnSourceAdapter(ABC):
 
     def _execute_materialized(self, context: AdapterContext) -> AdapterExecution:
         self.validate(context)
+        return self._execute_invocations(context, self.materialize(context))
+
+    def _execute_invocations(
+        self,
+        context: AdapterContext,
+        invocations: list[AdapterInvocation],
+    ) -> AdapterExecution:
         results: list[CommandResult] = []
-        for invocation in self.materialize(context):
+        for invocation in invocations:
             if self.uses_http or self.uses_network:
                 acquire_campaign_http_rate_limit(context)
             started = time.monotonic()
@@ -913,6 +959,68 @@ def _update_domain_technologies(
     return str(row["id"])
 
 
+def _bounded_utf8(value: Any, limit: int) -> tuple[str, bool, int]:
+    raw = str(value or "").encode("utf-8", errors="replace")
+    original_size = len(raw)
+    if original_size <= limit:
+        return raw.decode("utf-8", errors="replace"), False, original_size
+    return raw[:limit].decode("utf-8", errors="replace"), True, original_size
+
+
+_SENSITIVE_HTTP_HEADER = re.compile(
+    r"(?im)^(authorization|proxy-authorization|cookie|set-cookie|x-api-key)\s*:\s*.*$"
+)
+
+
+def _redact_http_message(value: str) -> str:
+    return _SENSITIVE_HTTP_HEADER.sub(lambda match: f"{match.group(1)}: [REDACTED]", value)
+
+
+def _http_response_envelope(
+    payload: Mapping[str, Any], url: str, headers: Mapping[str, str]
+) -> tuple[str, str, bool, int, str]:
+    parsed_url = urlsplit(url)
+    request = str(payload.get("request") or "")
+    if not request.strip():
+        path = parsed_url.path or "/"
+        if parsed_url.query:
+            path = f"{path}?{parsed_url.query}"
+        request_lines = [
+            f"{payload.get('method') or 'GET'} {path} HTTP/1.1",
+            f"Host: {parsed_url.netloc}",
+            *(f"{name}: {value}" for name, value in headers.items()),
+        ]
+        request = "\r\n".join(request_lines) + "\r\n\r\n"
+    response = str(payload.get("response") or "")
+    if not response.strip() and payload.get("raw_header"):
+        response = f"{payload.get('raw_header') or ''}{payload.get('body') or ''}"
+    if not response.strip():
+        status_code = payload.get("status_code") or 0
+        response_lines = [f"HTTP/1.1 {status_code} Captured"]
+        for name, value in (
+            ("Server", payload.get("webserver")),
+            ("Content-Type", payload.get("content_type")),
+            ("Content-Length", payload.get("content_length")),
+        ):
+            if value not in (None, ""):
+                response_lines.append(f"{name}: {value}")
+        response = "\r\n".join(response_lines) + "\r\n\r\n"
+    request, request_truncated, _ = _bounded_utf8(
+        _redact_http_message(request), HTTP_REQUEST_MAX_BYTES
+    )
+    response, response_truncated, response_bytes = _bounded_utf8(
+        _redact_http_message(response), HTTP_RESPONSE_MAX_BYTES
+    )
+    response_hash = hashlib.sha256(response.encode("utf-8")).hexdigest()
+    return (
+        request,
+        response,
+        request_truncated or response_truncated or response_bytes >= HTTP_RESPONSE_MAX_BYTES,
+        response_bytes,
+        response_hash,
+    )
+
+
 class DnsxResolveAdapter(DomainAdapter):
     tool_id = "dnsx.resolve.v1"
     version = "1.0.0"
@@ -1056,7 +1164,11 @@ class HttpxHttpMetadataAdapter(DomainAdapter):
                             url,
                             "-no-fallback-scheme",
                             "-json",
-                            "-omit-body",
+                            "-include-response",
+                            "-response-size-to-read",
+                            str(HTTP_RESPONSE_MAX_BYTES),
+                            "-response-size-to-save",
+                            str(HTTP_RESPONSE_MAX_BYTES),
                             "-status-code",
                             "-title",
                             "-tech-detect",
@@ -1089,6 +1201,9 @@ class HttpxHttpMetadataAdapter(DomainAdapter):
         for payload in _parse_json_lines(execution, tool_id=self.tool_id):
             url = str(payload.get("url") or payload["_invocation_target"])
             domain = normalize_domain(str(payload.get("input") or url))
+            request, response, content_truncated, response_bytes, response_hash = (
+                _http_response_envelope(payload, url, {})
+            )
             records.append(
                 {
                     "domain": domain,
@@ -1104,6 +1219,11 @@ class HttpxHttpMetadataAdapter(DomainAdapter):
                     "content_type": str(payload.get("content_type") or "")[:512] or None,
                     "content_length": payload.get("content_length"),
                     "response_time": str(payload.get("response_time") or "")[:128] or None,
+                    "request_text": request,
+                    "response_text": response,
+                    "response_hash": response_hash,
+                    "response_bytes": response_bytes,
+                    "content_truncated": content_truncated,
                 }
             )
         return {"records": records}
@@ -1128,7 +1248,9 @@ class HttpxHttpMetadataAdapter(DomainAdapter):
                     "content_type": record.get("content_type"),
                     "content_length": record.get("content_length"),
                     "response_time": record.get("response_time"),
-                    "body_recorded": False,
+                    "body_recorded": True,
+                    "response_hash": record.get("response_hash"),
+                    "content_truncated": bool(record.get("content_truncated")),
                 },
                 "network_path": "proxy" if context.proxy_url else "direct",
             }
@@ -1139,9 +1261,50 @@ class HttpxHttpMetadataAdapter(DomainAdapter):
                 data,
                 dimension="web",
             )
-            _update_domain_technologies(
+            asset_id = _update_domain_technologies(
                 context, record["domain"], record.get("technologies", [])
             )
+            if asset_id is not None:
+                from cairn.server.services import utcnow
+                from cairn.server.vulnerability_services import next_vulnerability_id
+
+                response_id = next_vulnerability_id(
+                    context.conn, "http_response", "http_response"
+                )
+                context.conn.execute(
+                    """
+                    INSERT INTO vuln_http_responses
+                        (id, campaign_id, task_id, source_id, asset_id, url, method,
+                         status_code, request_text, response_text, response_hash,
+                         response_bytes, content_truncated, redacted, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                    ON CONFLICT(task_id, url) DO UPDATE SET
+                        method = excluded.method,
+                        status_code = excluded.status_code,
+                        request_text = excluded.request_text,
+                        response_text = excluded.response_text,
+                        response_hash = excluded.response_hash,
+                        response_bytes = excluded.response_bytes,
+                        content_truncated = excluded.content_truncated,
+                        redacted = 1
+                    """,
+                    (
+                        response_id,
+                        context.campaign_id,
+                        context.task_id,
+                        context.source["id"],
+                        asset_id,
+                        record["url"],
+                        record.get("method") or "GET",
+                        record.get("status_code"),
+                        record["request_text"],
+                        record["response_text"],
+                        record["response_hash"],
+                        record["response_bytes"],
+                        int(record["content_truncated"]),
+                        utcnow(),
+                    ),
+                )
             created += int(was_created)
             updated += int(not was_created)
         return {"observations_created": created, "observations_updated": updated}
@@ -1303,6 +1466,257 @@ class TlsxTlsMetadataAdapter(DomainAdapter):
             created += int(was_created)
             updated += int(not was_created)
         return {"observations_created": created, "observations_updated": updated}
+
+
+def _audited_nuclei_template_paths() -> tuple[Path, ...]:
+    configured_root = os.getenv("CAIRN_NUCLEI_TEMPLATES_ROOT")
+    root = Path(configured_root).expanduser() if configured_root else (
+        Path.home()
+        / ".local"
+        / "share"
+        / "cairn"
+        / "nuclei-templates"
+        / NUCLEI_TEMPLATES_COMMIT
+    )
+    root = root.resolve()
+    paths: list[Path] = []
+    for template_id, relative_path, expected_hash in NUCLEI_TEMPLATE_ALLOWLIST:
+        path = (root / relative_path).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise AdapterValidationError("Nuclei template path escapes the audited root") from exc
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise AdapterUnavailableError(
+                f"Audited Nuclei template is unavailable: {relative_path}"
+            ) from exc
+        actual_hash = hashlib.sha256(content).hexdigest()
+        if not expected_hash or actual_hash != expected_hash:
+            raise AdapterValidationError(
+                f"Nuclei template hash mismatch: {relative_path}"
+            )
+        text = content.decode("utf-8", errors="strict")
+        if not re.search(rf"(?m)^id:\s*{re.escape(template_id)}\s*$", text):
+            raise AdapterValidationError(
+                f"Nuclei template ID mismatch: {relative_path}"
+            )
+        if not re.search(r"(?m)^# digest:\s*[0-9a-f]+:[0-9a-f]+\s*$", text):
+            raise AdapterValidationError(
+                f"Nuclei template is not signed: {relative_path}"
+            )
+        if NUCLEI_FORBIDDEN_TEMPLATE_PATTERN.search(text):
+            raise AdapterValidationError(
+                f"Nuclei template violates the offline passive policy: {relative_path}"
+            )
+        if '"{{BaseURL}}"' not in text or text.count("{{BaseURL}}") != 1:
+            raise AdapterValidationError(
+                f"Nuclei template is not a single BaseURL passive matcher: {relative_path}"
+            )
+        paths.append(path)
+    return tuple(paths)
+
+
+class NucleiPassiveResponseAdapter(DomainAdapter):
+    """Run a fixed signed-template allowlist against captured HTTP responses only."""
+
+    tool_id = "nuclei.passive-response.v1"
+    version = "1.0.0"
+    risk_class = "R2"
+    source_type = "nuclei_passive"
+    dimension = "intelligence"
+    binary = _configured_user_binary("nuclei", "CAIRN_NUCLEI_BINARY")
+    version_args = ("-version",)
+    timeout_seconds = 60
+    uses_http = False
+    uses_network = False
+    input_schema = {
+        "type": "object",
+        "required": ["domains", "http_responses"],
+        "properties": {
+            "domains": {"type": "array", "items": {"type": "string"}},
+            "http_responses": {"type": "array", "items": {"type": "object"}},
+        },
+        "additionalProperties": False,
+    }
+    output_schema = {
+        "type": "object",
+        "required": ["findings", "coverage_complete"],
+        "properties": {
+            "findings": {"type": "array", "items": {"type": "object"}},
+            "coverage_complete": {"type": "boolean"},
+        },
+    }
+
+    def validate(self, context: AdapterContext) -> None:
+        super().validate(context)
+        if not context.http_responses:
+            raise AdapterValidationError(
+                "Nuclei passive analysis requires a captured HTTP response"
+            )
+        if len(context.http_responses) > 20:
+            raise AdapterValidationError(
+                "Nuclei passive analysis accepts at most 20 captured responses per task"
+            )
+        allowed_targets = {normalize_domain(target) for target in context.targets}
+        for response in context.http_responses:
+            response_domain = normalize_domain(str(response.get("domain") or ""))
+            if response_domain not in allowed_targets:
+                raise AdapterValidationError(
+                    "Captured HTTP response does not match the task target"
+                )
+            if not response.get("file_path") and not response.get("response_text"):
+                raise AdapterValidationError("Captured HTTP response content is missing")
+        _audited_nuclei_template_paths()
+
+    def estimate(self, context: AdapterContext) -> dict[str, Any]:
+        return {
+            "command_count": len(context.http_responses),
+            "timeout_seconds": self.timeout_seconds,
+            "risk_class": self.risk_class,
+            "network_request_count": 0,
+            "offline_only": True,
+            "template_count": len(NUCLEI_TEMPLATE_ALLOWLIST),
+        }
+
+    def health(self) -> dict[str, Any]:
+        result = super().health()
+        if not result.get("healthy"):
+            return result
+        try:
+            paths = _audited_nuclei_template_paths()
+        except AdapterError as exc:
+            return {
+                "healthy": False,
+                "tool_id": self.tool_id,
+                "version": result.get("version"),
+                "error": str(exc),
+            }
+        return {
+            **result,
+            "templates_commit": NUCLEI_TEMPLATES_COMMIT,
+            "template_ids": [item[0] for item in NUCLEI_TEMPLATE_ALLOWLIST],
+            "template_count": len(paths),
+        }
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        template_paths = _audited_nuclei_template_paths()
+        template_args = tuple(
+            argument
+            for path in template_paths
+            for argument in ("-templates", str(path))
+        )
+        template_ids = ",".join(item[0] for item in NUCLEI_TEMPLATE_ALLOWLIST)
+        invocations: list[AdapterInvocation] = []
+        for response in context.http_responses:
+            file_path = str(response.get("file_path") or "")
+            if not file_path:
+                raise AdapterValidationError("Nuclei response file was not materialized")
+            invocations.append(
+                AdapterInvocation(
+                    argv=(
+                        self.binary,
+                        "-passive",
+                        "-target",
+                        file_path,
+                        *template_args,
+                        "-template-id",
+                        template_ids,
+                        "-type",
+                        "http",
+                        "-disable-unsigned-templates",
+                        "-exclude-tags",
+                        "code,headless,fuzz,dos,bruteforce,intrusive",
+                        "-no-interactsh",
+                        "-jsonl",
+                        "-silent",
+                        "-omit-raw",
+                        "-concurrency",
+                        "1",
+                        "-bulk-size",
+                        "1",
+                        "-rate-limit",
+                        "1",
+                        "-retries",
+                        "0",
+                        "-timeout",
+                        "5",
+                        "-no-stdin",
+                        "-disable-update-check",
+                    ),
+                    target=str(response["id"]),
+                )
+            )
+        return invocations
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        self.validate(context)
+        with tempfile.TemporaryDirectory(prefix="cairn-nuclei-passive-") as directory:
+            materialized: list[Mapping[str, Any]] = []
+            for index, response in enumerate(context.http_responses):
+                request_text = str(response.get("request_text") or "").rstrip()
+                response_text = str(response.get("response_text") or "").lstrip()
+                # Nuclei's offlinehttp parser accepts the exact wire-shaped
+                # request followed by the response, matching httpx
+                # -store-response output. No URL is passed back to the network.
+                capture = (
+                    request_text.rstrip("\r\n")
+                    + "\r\n\r\n"
+                    + response_text.lstrip("\r\n")
+                )
+                path = Path(directory) / f"response-{index:03d}.txt"
+                path.write_text(capture, encoding="utf-8")
+                materialized.append({**response, "file_path": str(path)})
+            execution_context = replace(
+                context, http_responses=tuple(materialized)
+            )
+            return self._execute_invocations(
+                execution_context, self.materialize(execution_context)
+            )
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        findings: list[dict[str, Any]] = []
+        for payload in _parse_json_lines(execution, tool_id=self.tool_id):
+            info = payload.get("info")
+            info = info if isinstance(info, dict) else {}
+            classification = info.get("classification")
+            classification = classification if isinstance(classification, dict) else {}
+            findings.append(
+                {
+                    "response_id": payload.get("_invocation_target"),
+                    "template_id": str(payload.get("template-id") or "")[:256],
+                    "matcher_name": str(payload.get("matcher-name") or "")[:256] or None,
+                    "title": str(info.get("name") or payload.get("template-id") or "Nuclei passive match")[:1000],
+                    "description": str(info.get("description") or "Offline passive response match")[:8000],
+                    "severity": str(info.get("severity") or "unknown").lower(),
+                    "cwe": str(classification.get("cwe-id") or "")[:128] or None,
+                    "remediation": str(info.get("remediation") or "")[:8000] or None,
+                    "matched_at": str(payload.get("matched-at") or payload.get("host") or "")[:4096],
+                }
+            )
+        return {"findings": findings}
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        from cairn.server.vulnerability_services import reconcile_passive_findings
+
+        coverage_complete = self.coverage_complete(context, parsed)
+        return reconcile_passive_findings(
+            context.conn,
+            campaign_id=context.campaign_id,
+            task_id=context.task_id,
+            adapter=self.tool_id,
+            targets=list(context.targets),
+            responses=list(context.http_responses),
+            matches=list(parsed.get("findings", [])),
+            coverage_complete=coverage_complete,
+        )
+
+    def coverage_complete(self, context: AdapterContext, parsed: Any) -> bool:
+        return bool(context.http_responses) and all(
+            not bool(response.get("content_truncated"))
+            for response in context.http_responses
+        )
 
 
 class OsvVulnerabilityIntelligenceAdapter(VulnSourceAdapter):
@@ -1519,6 +1933,7 @@ _ADAPTERS: tuple[VulnSourceAdapter, ...] = (
     DnsxResolveAdapter(),
     HttpxHttpMetadataAdapter(),
     TlsxTlsMetadataAdapter(),
+    NucleiPassiveResponseAdapter(),
 )
 
 ADAPTER_REGISTRY: dict[str, VulnSourceAdapter] = {

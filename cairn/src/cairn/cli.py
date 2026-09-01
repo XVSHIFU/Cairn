@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 import click
 import uvicorn
@@ -86,6 +87,101 @@ def ctf_bridge(server: str, once: bool, log_level: str):
         bridge.run_once()
     else:
         bridge.run()
+
+
+@main.group("vuln-approver")
+def vuln_approver():
+    """Manage database-backed vulnerability approval credentials."""
+
+
+@vuln_approver.command("issue")
+@click.option("--identity", required=True, help="Audited approver identity")
+@click.option(
+    "--role",
+    type=click.Choice(["approver", "senior_approver", "admin"]),
+    default="approver",
+    show_default=True,
+)
+@click.option("--expires-in-days", type=click.IntRange(1, 3650), default=90, show_default=True)
+@click.option("--issued-by", default="cli-admin", show_default=True)
+@click.option(
+    "--db-path",
+    type=click.Path(path_type=Path),
+    default=db.DEFAULT_DB,
+    show_default=True,
+)
+def issue_vuln_approver(
+    identity: str,
+    role: str,
+    expires_in_days: int,
+    issued_by: str,
+    db_path: Path,
+):
+    """Issue a high-entropy API key; the plaintext is printed only once."""
+
+    from cairn.server.vulnerability_auth import issue_vulnerability_approver_credential
+
+    db.configure(db_path)
+    try:
+        with db.get_conn() as conn:
+            result = issue_vulnerability_approver_credential(
+                conn,
+                identity=identity,
+                role=role,
+                expires_in_days=expires_in_days,
+                issued_by=issued_by,
+            )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
+
+
+@vuln_approver.command("list")
+@click.option(
+    "--db-path",
+    type=click.Path(path_type=Path),
+    default=db.DEFAULT_DB,
+    show_default=True,
+)
+def list_vuln_approvers(db_path: Path):
+    """List identities and credential metadata without key hashes or plaintext."""
+
+    from cairn.server.vulnerability_auth import list_vulnerability_approvers
+
+    db.configure(db_path)
+    with db.get_conn() as conn:
+        result = list_vulnerability_approvers(conn)
+    click.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
+
+
+@vuln_approver.command("revoke")
+@click.option("--credential-id", required=True)
+@click.option("--revoked-by", default="cli-admin", show_default=True)
+@click.option(
+    "--db-path",
+    type=click.Path(path_type=Path),
+    default=db.DEFAULT_DB,
+    show_default=True,
+)
+def revoke_vuln_approver(
+    credential_id: str,
+    revoked_by: str,
+    db_path: Path,
+):
+    """Revoke one credential while preserving its audit history."""
+
+    from cairn.server.vulnerability_auth import revoke_vulnerability_approver_credential
+
+    db.configure(db_path)
+    with db.get_conn() as conn:
+        revoked = revoke_vulnerability_approver_credential(
+            conn, credential_id, revoked_by=revoked_by
+        )
+    if not revoked:
+        raise click.ClickException("Vulnerability approver credential not found")
+    click.echo(json.dumps({"credential_id": credential_id, "revoked": True}))
+
+
 @main.command("vuln-collect")
 @click.option(
     "--db-path",

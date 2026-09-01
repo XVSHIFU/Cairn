@@ -506,6 +506,81 @@ CREATE INDEX IF NOT EXISTS idx_vuln_http_rate_events_window
 ON vuln_http_rate_events(campaign_id, observed_at);
 """
 
+VULNERABILITY_PASSIVE_FINDINGS_AND_APPROVERS_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS vuln_http_responses (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES vuln_collection_tasks(id) ON DELETE CASCADE,
+    source_id TEXT NOT NULL REFERENCES vuln_sources(id) ON DELETE CASCADE,
+    asset_id TEXT NOT NULL REFERENCES vuln_assets(id) ON DELETE CASCADE,
+    observation_id TEXT REFERENCES vuln_observations(id) ON DELETE SET NULL,
+    url TEXT NOT NULL,
+    method TEXT NOT NULL DEFAULT 'GET',
+    status_code INTEGER,
+    request_text TEXT NOT NULL,
+    response_text TEXT NOT NULL,
+    response_hash TEXT NOT NULL,
+    response_bytes INTEGER NOT NULL DEFAULT 0,
+    content_truncated INTEGER NOT NULL DEFAULT 0,
+    redacted INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    UNIQUE(task_id, url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_http_responses_asset
+ON vuln_http_responses(campaign_id, asset_id, created_at);
+
+CREATE TABLE IF NOT EXISTS vuln_finding_import_runs (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES vuln_collection_tasks(id) ON DELETE CASCADE,
+    adapter TEXT NOT NULL,
+    target TEXT NOT NULL,
+    coverage_complete INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    seen_fingerprints_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+    UNIQUE(task_id, target)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_finding_import_runs_target
+ON vuln_finding_import_runs(campaign_id, adapter, target, created_at);
+
+CREATE TABLE IF NOT EXISTS vuln_approvers (
+    id TEXT PRIMARY KEY,
+    identity TEXT NOT NULL UNIQUE,
+    role TEXT NOT NULL DEFAULT 'approver',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vuln_approver_credentials (
+    id TEXT PRIMARY KEY,
+    approver_id TEXT NOT NULL REFERENCES vuln_approvers(id) ON DELETE CASCADE,
+    key_hash TEXT NOT NULL UNIQUE,
+    key_prefix TEXT NOT NULL,
+    issued_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT,
+    last_used_at TEXT,
+    issued_by TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_approver_credentials_active
+ON vuln_approver_credentials(key_hash, expires_at, revoked_at);
+
+CREATE TABLE IF NOT EXISTS vuln_approver_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+"""
+
 
 def configure(path: Path) -> None:
     global _db_path
@@ -801,6 +876,61 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         )
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (10, 'vulnerability_r2_and_auto_analysis', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 11 not in applied:
+        finding_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_findings)")
+        }
+        for column, ddl in (
+            ("source_adapter", "ALTER TABLE vuln_findings ADD COLUMN source_adapter TEXT"),
+            ("template_id", "ALTER TABLE vuln_findings ADD COLUMN template_id TEXT"),
+            ("target", "ALTER TABLE vuln_findings ADD COLUMN target TEXT"),
+            (
+                "evidence_fingerprint",
+                "ALTER TABLE vuln_findings ADD COLUMN evidence_fingerprint TEXT",
+            ),
+            (
+                "reimport_state",
+                "ALTER TABLE vuln_findings ADD COLUMN reimport_state TEXT NOT NULL DEFAULT 'NEW'",
+            ),
+            ("first_seen_at", "ALTER TABLE vuln_findings ADD COLUMN first_seen_at TEXT"),
+            ("last_seen_at", "ALTER TABLE vuln_findings ADD COLUMN last_seen_at TEXT"),
+            (
+                "candidate_resolved_at",
+                "ALTER TABLE vuln_findings ADD COLUMN candidate_resolved_at TEXT",
+            ),
+            ("last_task_id", "ALTER TABLE vuln_findings ADD COLUMN last_task_id TEXT"),
+        ):
+            if column not in finding_columns:
+                conn.execute(ddl)
+        conn.execute(
+            "UPDATE vuln_findings SET first_seen_at = COALESCE(first_seen_at, created_at), last_seen_at = COALESCE(last_seen_at, updated_at)"
+        )
+        conn.executescript(VULNERABILITY_PASSIVE_FINDINGS_AND_APPROVERS_SCHEMA)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vuln_findings_reimport ON vuln_findings(campaign_id, source_adapter, target, reimport_state)"
+        )
+        conn.execute(
+            """
+            INSERT INTO vuln_sources
+                (id, campaign_id, name, source_type, status, enabled,
+                 freshness_seconds, config_json, created_at, updated_at)
+            SELECT 'source-r2-nuclei-passive-' || campaign.id,
+                   campaign.id, 'Nuclei passive HTTP response', 'nuclei_passive',
+                   'idle', 0, 21600,
+                   '{"adapter":"nuclei.passive-response.v1"}',
+                   strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                   strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            FROM vuln_campaigns AS campaign
+            WHERE NOT EXISTS (
+                SELECT 1 FROM vuln_sources AS source
+                WHERE source.campaign_id = campaign.id
+                  AND source.source_type = 'nuclei_passive'
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (11, 'vulnerability_passive_findings_and_approvers', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
         )
 
 
