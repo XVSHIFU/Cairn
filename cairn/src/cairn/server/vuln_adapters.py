@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import re
 import shutil
@@ -20,6 +21,7 @@ DOMAIN_PATTERN = re.compile(
 )
 HTTP_HEADER_NAME_PATTERN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 FORBIDDEN_REQUEST_HEADERS = {"host", "content-length"}
+RATE_LIMIT_RESERVATION_WINDOW_SECONDS = 1.01
 
 
 class AdapterError(RuntimeError):
@@ -70,12 +72,14 @@ class AdapterContext:
     cursor: Mapping[str, Any] = field(default_factory=dict)
     request_header: str = "X-Cairn-Research"
     max_requests_per_second: int = 30
+    proxy_url: str | None = None
 
 
 @dataclass(frozen=True)
 class AdapterInvocation:
     argv: tuple[str, ...]
     target: str | None = None
+    stdin: str | None = None
 
 
 @dataclass(frozen=True)
@@ -140,7 +144,7 @@ def acquire_campaign_http_rate_limit(context: AdapterContext) -> None:
             context.conn.execute("BEGIN IMMEDIATE")
             context.conn.execute(
                 "DELETE FROM vuln_http_rate_events WHERE campaign_id = ? AND observed_at <= ?",
-                (context.campaign_id, now - 1.0),
+                (context.campaign_id, now - RATE_LIMIT_RESERVATION_WINDOW_SECONDS),
             )
             rows = context.conn.execute(
                 "SELECT observed_at FROM vuln_http_rate_events WHERE campaign_id = ? ORDER BY observed_at",
@@ -159,11 +163,16 @@ def acquire_campaign_http_rate_limit(context: AdapterContext) -> None:
             if context.conn.in_transaction:
                 context.conn.rollback()
             raise
-        time.sleep(max(0.001, oldest + 1.0 - now))
+        # A small conservative margin absorbs scheduler/clock jitter between
+        # reserving a token and starting the external process. This keeps the
+        # actual one-second request window at or below the Campaign limit.
+        time.sleep(
+            max(0.001, oldest + RATE_LIMIT_RESERVATION_WINDOW_SECONDS - now)
+        )
 
 
 class VulnSourceAdapter(ABC):
-    """Lifecycle contract for allowlisted, argument-array-only R1 collectors."""
+    """Lifecycle contract for allowlisted, argument-array-only collectors."""
 
     tool_id: str
     version: str
@@ -176,6 +185,8 @@ class VulnSourceAdapter(ABC):
     version_args: tuple[str, ...] = ("--version",)
     timeout_seconds: int = 30
     uses_http: bool = False
+    uses_network: bool = False
+    accept_complete_json_on_timeout: bool = False
 
     @property
     def spec(self) -> AdapterSpec:
@@ -217,6 +228,9 @@ class VulnSourceAdapter(ABC):
             "command_count": len(invocations),
             "timeout_seconds": self.timeout_seconds,
             "risk_class": self.risk_class,
+            "network_request_count": sum(
+                1 for invocation in invocations if self.uses_http or self.uses_network
+            ),
         }
 
     @abstractmethod
@@ -304,18 +318,20 @@ class VulnSourceAdapter(ABC):
         self.validate(context)
         results: list[CommandResult] = []
         for invocation in self.materialize(context):
-            if self.uses_http:
+            if self.uses_http or self.uses_network:
                 acquire_campaign_http_rate_limit(context)
             started = time.monotonic()
             try:
-                completed = subprocess.run(
-                    list(invocation.argv),
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout_seconds,
-                    check=False,
-                    shell=False,
-                )
+                run_kwargs: dict[str, Any] = {
+                    "capture_output": True,
+                    "text": True,
+                    "timeout": self.timeout_seconds,
+                    "check": False,
+                    "shell": False,
+                }
+                if invocation.stdin is not None:
+                    run_kwargs["input"] = invocation.stdin
+                completed = subprocess.run(list(invocation.argv), **run_kwargs)
             except subprocess.TimeoutExpired as exc:
                 stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
                 stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
@@ -329,6 +345,21 @@ class VulnSourceAdapter(ABC):
                     )
                 )
                 execution = AdapterExecution(tuple(results))
+                if self.accept_complete_json_on_timeout and stdout.strip():
+                    try:
+                        payloads = [
+                            json.loads(line)
+                            for line in stdout.splitlines()
+                            if line.strip()
+                        ]
+                    except json.JSONDecodeError:
+                        payloads = []
+                    if payloads and all(isinstance(payload, dict) for payload in payloads):
+                        # Some tlsx builds emit a complete JSON record but keep
+                        # background goroutines alive. subprocess.run has killed
+                        # the process at the hard boundary; retain the complete,
+                        # auditable output and mark it in normalized evidence.
+                        continue
                 raise AdapterExecutionError(
                     f"{self.tool_id} timed out after {self.timeout_seconds}s", execution
                 ) from exc
@@ -604,6 +635,9 @@ def _record_domain_metadata(
     record_type: str,
     target: str,
     data: Mapping[str, Any],
+    *,
+    dimension: str = "external",
+    confidence: float = 0.9,
 ) -> bool:
     from cairn.server.services import utcnow
     from cairn.server.vulnerability_services import (
@@ -633,7 +667,7 @@ def _record_domain_metadata(
         INSERT INTO vuln_observations
             (id, campaign_id, asset_id, source_id, dimension, data_json, evidence_hash,
              confidence, status, raw_reference, first_seen_at, last_seen_at)
-        VALUES (?, ?, ?, ?, 'external', ?, ?, 0.9, 'current', ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'current', ?, ?, ?)
         ON CONFLICT(campaign_id, evidence_hash) DO UPDATE SET last_seen_at = excluded.last_seen_at
         """,
         (
@@ -641,8 +675,10 @@ def _record_domain_metadata(
             context.campaign_id,
             asset["id"] if asset is not None else None,
             context.source["id"],
+            dimension,
             json.dumps(payload, ensure_ascii=False),
             digest,
+            confidence,
             f"collection-task:{context.task_id}",
             now,
             now,
@@ -814,6 +850,456 @@ class WhoisDomainAdapter(DomainAdapter):
             if not target:
                 continue
             was_created = _record_domain_metadata(context, "whois", target, record)
+            created += int(was_created)
+            updated += int(not was_created)
+        return {"observations_created": created, "observations_updated": updated}
+
+
+def _parse_json_lines(
+    execution: AdapterExecution, *, tool_id: str
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for result in execution.results:
+        for line in result.stdout.splitlines()[:10000]:
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise AdapterExecutionError(
+                    f"{tool_id} returned invalid JSONL", execution
+                ) from exc
+            if not isinstance(payload, dict):
+                raise AdapterExecutionError(
+                    f"{tool_id} JSONL record must be an object", execution
+                )
+            payload.setdefault("_invocation_target", result.target)
+            payload.setdefault("_invocation_returncode", result.returncode)
+            records.append(payload)
+    return records
+
+
+def _bounded_string_list(value: Any, *, limit: int = 100) -> list[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        return []
+    return [str(item)[:2048] for item in values[:limit] if str(item).strip()]
+
+
+def _update_domain_technologies(
+    context: AdapterContext, domain: str, technologies: list[str]
+) -> str | None:
+    from cairn.server.services import utcnow
+    from cairn.server.vulnerability_services import normalize_target, record_collection_task_asset
+
+    row = context.conn.execute(
+        "SELECT id, technology_json FROM vuln_assets WHERE campaign_id = ? AND asset_type = 'domain' AND normalized_identifier = ?",
+        (context.campaign_id, normalize_target(domain)),
+    ).fetchone()
+    if row is None:
+        return None
+    existing = set(json.loads(row["technology_json"]))
+    merged = sorted(existing | {item for item in technologies if item})
+    context.conn.execute(
+        "UPDATE vuln_assets SET technology_json = ?, last_seen_at = ? WHERE id = ?",
+        (json.dumps(merged, ensure_ascii=False), utcnow(), row["id"]),
+    )
+    record_collection_task_asset(
+        context.conn, context.task_id, str(context.source["id"]), row["id"]
+    )
+    return str(row["id"])
+
+
+class DnsxResolveAdapter(DomainAdapter):
+    tool_id = "dnsx.resolve.v1"
+    version = "1.0.0"
+    risk_class = "R2"
+    source_type = "dns"
+    dimension = "external"
+    binary = "dnsx"
+    version_args = ("-version",)
+    timeout_seconds = 30
+    uses_network = True
+    output_schema = {
+        "type": "object",
+        "required": ["records"],
+        "properties": {"records": {"type": "array", "items": {"type": "object"}}},
+    }
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        return [
+            AdapterInvocation(
+                argv=(
+                    self.binary,
+                    "-silent",
+                    "-json",
+                    "-omit-raw",
+                    "-a",
+                    "-aaaa",
+                    "-cname",
+                    "-ns",
+                    "-threads",
+                    "1",
+                    "-rate-limit",
+                    str(max(1, context.max_requests_per_second)),
+                    "-retry",
+                    "1",
+                    "-disable-update-check",
+                ),
+                target=normalize_domain(domain),
+                stdin=f"{normalize_domain(domain)}\n",
+            )
+            for domain in context.targets
+        ]
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        return self._execute_materialized(context)
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        records = []
+        for payload in _parse_json_lines(execution, tool_id=self.tool_id):
+            domain = normalize_domain(
+                str(payload.get("host") or payload.get("input") or payload["_invocation_target"])
+            )
+            records.append(
+                {
+                    "domain": domain,
+                    "rcode": payload.get("status_code") or payload.get("rcode"),
+                    "a": _bounded_string_list(payload.get("a")),
+                    "aaaa": _bounded_string_list(payload.get("aaaa")),
+                    "cname": _bounded_string_list(payload.get("cname")),
+                    "ns": _bounded_string_list(payload.get("ns")),
+                    "resolver": _bounded_string_list(payload.get("resolver"), limit=10),
+                }
+            )
+        return {"records": records}
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        from cairn.server.vulnerability_models import AssetInput
+        from cairn.server.vulnerability_services import record_collection_task_asset, upsert_asset
+
+        observations = 0
+        assets_created = 0
+        for record in parsed.get("records", []):
+            data = {
+                **record,
+                "request": {"query_types": ["A", "AAAA", "CNAME", "NS"]},
+                "network_path": "direct",
+            }
+            observations += int(
+                _record_domain_metadata(context, "dns", record["domain"], data)
+            )
+            _update_domain_technologies(context, record["domain"], [])
+            for address in [*record.get("a", []), *record.get("aaaa", [])]:
+                try:
+                    ipaddress.ip_address(address)
+                except ValueError:
+                    continue
+                asset, created = upsert_asset(
+                    context.conn,
+                    context.campaign_id,
+                    AssetInput(
+                        asset_type="ip",
+                        identifier=address,
+                        source_name=str(context.source["name"]),
+                    ),
+                )
+                record_collection_task_asset(
+                    context.conn,
+                    context.task_id,
+                    str(context.source["id"]),
+                    asset.id,
+                )
+                assets_created += int(created)
+        return {
+            "observations_created": observations,
+            "assets_created": assets_created,
+        }
+
+
+class HttpxHttpMetadataAdapter(DomainAdapter):
+    tool_id = "httpx.http-meta.v1"
+    version = "1.0.0"
+    risk_class = "R2"
+    source_type = "http"
+    dimension = "web"
+    binary = "httpx-toolkit"
+    version_args = ("-version",)
+    timeout_seconds = 30
+    uses_http = True
+    output_schema = {
+        "type": "object",
+        "required": ["records"],
+        "properties": {"records": {"type": "array", "items": {"type": "object"}}},
+    }
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        header_args = tuple(
+            argument
+            for name, value in self.get_headers(context).items()
+            for argument in ("-H", f"{name}: {value}")
+        )
+        proxy_args = ("-http-proxy", context.proxy_url) if context.proxy_url else ()
+        invocations: list[AdapterInvocation] = []
+        for domain in context.targets:
+            normalized = normalize_domain(domain)
+            for scheme in ("https", "http"):
+                url = f"{scheme}://{normalized}"
+                invocations.append(
+                    AdapterInvocation(
+                        argv=(
+                            self.binary,
+                            "-u",
+                            url,
+                            "-no-fallback-scheme",
+                            "-json",
+                            "-omit-body",
+                            "-status-code",
+                            "-title",
+                            "-tech-detect",
+                            "-server",
+                            "-ip",
+                            "-cname",
+                            "-method",
+                            "-response-time",
+                            "-threads",
+                            "1",
+                            "-rate-limit",
+                            str(max(1, context.max_requests_per_second)),
+                            "-timeout",
+                            "10",
+                            "-no-stdin",
+                            "-disable-update-check",
+                            *header_args,
+                            *proxy_args,
+                        ),
+                        target=url,
+                    )
+                )
+        return invocations
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        return self._execute_materialized(context)
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        records = []
+        for payload in _parse_json_lines(execution, tool_id=self.tool_id):
+            url = str(payload.get("url") or payload["_invocation_target"])
+            domain = normalize_domain(str(payload.get("input") or url))
+            records.append(
+                {
+                    "domain": domain,
+                    "url": url[:4096],
+                    "scheme": payload.get("scheme") or urlsplit(url).scheme,
+                    "method": payload.get("method") or "GET",
+                    "status_code": payload.get("status_code"),
+                    "title": str(payload.get("title") or "")[:1000] or None,
+                    "server": str(payload.get("webserver") or "")[:512] or None,
+                    "technologies": _bounded_string_list(payload.get("tech"), limit=100),
+                    "host_ip": str(payload.get("host_ip") or "")[:128] or None,
+                    "cname": _bounded_string_list(payload.get("cname"), limit=20),
+                    "content_type": str(payload.get("content_type") or "")[:512] or None,
+                    "content_length": payload.get("content_length"),
+                    "response_time": str(payload.get("response_time") or "")[:128] or None,
+                }
+            )
+        return {"records": records}
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        created = 0
+        updated = 0
+        for record in parsed.get("records", []):
+            data = {
+                **record,
+                "request": {
+                    "method": record.get("method") or "GET",
+                    "url": record["url"],
+                    "headers": self.get_headers(context),
+                    "follow_redirects": False,
+                },
+                "response": {
+                    "status_code": record.get("status_code"),
+                    "title": record.get("title"),
+                    "server": record.get("server"),
+                    "technologies": record.get("technologies", []),
+                    "content_type": record.get("content_type"),
+                    "content_length": record.get("content_length"),
+                    "response_time": record.get("response_time"),
+                    "body_recorded": False,
+                },
+                "network_path": "proxy" if context.proxy_url else "direct",
+            }
+            was_created = _record_domain_metadata(
+                context,
+                "http_metadata",
+                record["domain"],
+                data,
+                dimension="web",
+            )
+            _update_domain_technologies(
+                context, record["domain"], record.get("technologies", [])
+            )
+            created += int(was_created)
+            updated += int(not was_created)
+        return {"observations_created": created, "observations_updated": updated}
+
+
+def _certificate_chain_summary(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    summaries: list[dict[str, Any]] = []
+    for certificate in value[:20]:
+        if not isinstance(certificate, dict):
+            continue
+        summaries.append(
+            {
+                key: certificate.get(key)
+                for key in (
+                    "subject_cn",
+                    "subject_dn",
+                    "subject_org",
+                    "issuer_cn",
+                    "issuer_dn",
+                    "issuer_org",
+                    "serial",
+                    "not_before",
+                    "not_after",
+                    "fingerprint_hash",
+                )
+                if certificate.get(key) is not None
+            }
+        )
+    return summaries
+
+
+class TlsxTlsMetadataAdapter(DomainAdapter):
+    tool_id = "tlsx.tls-meta.v1"
+    version = "1.0.0"
+    risk_class = "R2"
+    source_type = "tls"
+    dimension = "web"
+    binary = "tlsx"
+    version_args = ("-version",)
+    timeout_seconds = 30
+    uses_network = True
+    accept_complete_json_on_timeout = True
+    output_schema = {
+        "type": "object",
+        "required": ["records"],
+        "properties": {"records": {"type": "array", "items": {"type": "object"}}},
+    }
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        proxy_args = (
+            ("-proxy", context.proxy_url)
+            if context.proxy_url and urlsplit(context.proxy_url).scheme == "socks5"
+            else ()
+        )
+        invocations: list[AdapterInvocation] = []
+        for domain in context.targets:
+            normalized = normalize_domain(domain)
+            common = (
+                self.binary,
+                "-u",
+                normalized,
+                "-json",
+                "-silent",
+                "-concurrency",
+                "1",
+                "-retry",
+                "1",
+                "-timeout",
+                "10",
+                "-disable-update-check",
+                *proxy_args,
+            )
+            # tlsx rejects SAN/CN projection flags when combined with other
+            # probes. Separate negotiated metadata from certificate-chain
+            # materialization and merge their bounded JSON below.
+            invocations.extend(
+                (
+                    AdapterInvocation(
+                        argv=(*common, "-tls-version", "-cipher", "-probe-status"),
+                        target=normalized,
+                    ),
+                    AdapterInvocation(
+                        argv=(*common, "-certificate", "-tls-chain"),
+                        target=normalized,
+                    ),
+                )
+            )
+        return invocations
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        return self._execute_materialized(context)
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        records: dict[str, dict[str, Any]] = {}
+        for payload in _parse_json_lines(execution, tool_id=self.tool_id):
+            domain = normalize_domain(
+                str(payload.get("host") or payload.get("input") or payload["_invocation_target"])
+            )
+            certificate = payload.get("certificate_response")
+            certificate = certificate if isinstance(certificate, dict) else payload
+            raw_chain = (
+                payload.get("certificate_chain")
+                or payload.get("chain")
+                or payload.get("tls_chain")
+                or certificate.get("certificate_chain")
+                or []
+            )
+            candidate = {
+                "domain": domain,
+                "port": payload.get("port") or 443,
+                "probe_status": payload.get("probe_status"),
+                "tls_version": payload.get("tls_version"),
+                "cipher": payload.get("cipher"),
+                "key_exchange": payload.get("key_exchange"),
+                "subject_cn": certificate.get("subject_cn"),
+                "subject_an": _bounded_string_list(certificate.get("subject_an"), limit=200),
+                "subject_org": _bounded_string_list(certificate.get("subject_org"), limit=20),
+                "issuer_cn": certificate.get("issuer_cn"),
+                "serial": certificate.get("serial"),
+                "not_before": certificate.get("not_before"),
+                "not_after": certificate.get("not_after"),
+                "fingerprint_hash": certificate.get("fingerprint_hash"),
+                "certificate_chain": _certificate_chain_summary(raw_chain),
+                "process_timeout_after_output": payload.get("_invocation_returncode") == -1,
+            }
+            current = records.setdefault(domain, {"domain": domain})
+            for key, value in candidate.items():
+                if value not in (None, "", []):
+                    current[key] = value
+        return {"records": list(records.values())}
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        created = 0
+        updated = 0
+        for record in parsed.get("records", []):
+            data = {
+                **record,
+                "request": {
+                    "host": record["domain"],
+                    "port": record.get("port") or 443,
+                    "handshake_only": True,
+                },
+                "network_path": (
+                    "socks5_proxy"
+                    if context.proxy_url and urlsplit(context.proxy_url).scheme == "socks5"
+                    else "direct"
+                ),
+            }
+            was_created = _record_domain_metadata(
+                context,
+                "tls_metadata",
+                record["domain"],
+                data,
+                dimension="web",
+            )
+            _update_domain_technologies(context, record["domain"], [])
             created += int(was_created)
             updated += int(not was_created)
         return {"observations_created": created, "observations_updated": updated}
@@ -1030,6 +1516,9 @@ _ADAPTERS: tuple[VulnSourceAdapter, ...] = (
     AmassPassiveEnumAdapter(),
     RdapDomainAdapter(),
     WhoisDomainAdapter(),
+    DnsxResolveAdapter(),
+    HttpxHttpMetadataAdapter(),
+    TlsxTlsMetadataAdapter(),
 )
 
 ADAPTER_REGISTRY: dict[str, VulnSourceAdapter] = {

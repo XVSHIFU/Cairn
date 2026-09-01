@@ -147,6 +147,13 @@ CREATE TABLE IF NOT EXISTS vuln_campaigns (
     authorization_confirmed INTEGER NOT NULL DEFAULT 0,
     authorization_expires_at TEXT NOT NULL,
     active_testing_enabled INTEGER NOT NULL DEFAULT 0,
+    r2_enabled INTEGER NOT NULL DEFAULT 0,
+    r2_auto_approve INTEGER NOT NULL DEFAULT 0,
+    r2_proxy_url TEXT,
+    auto_analysis_enabled INTEGER NOT NULL DEFAULT 0,
+    auto_analysis_budget_units INTEGER NOT NULL DEFAULT 8,
+    auto_analysis_daily_budget_units INTEGER NOT NULL DEFAULT 20,
+    auto_analysis_min_observations INTEGER NOT NULL DEFAULT 5,
     max_requests_per_second INTEGER NOT NULL DEFAULT 30,
     max_concurrency INTEGER NOT NULL DEFAULT 3,
     request_header TEXT NOT NULL DEFAULT 'X-Cairn-Research',
@@ -420,6 +427,7 @@ CREATE TABLE IF NOT EXISTS vuln_ai_analyses (
     worker TEXT,
     model TEXT,
     budget_units INTEGER NOT NULL,
+    trigger_kind TEXT NOT NULL DEFAULT 'manual',
     started_at TEXT,
     finished_at TEXT,
     error TEXT,
@@ -733,6 +741,66 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             )
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (9, 'vulnerability_ai_execution_metadata', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 10 not in applied:
+        campaign_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_campaigns)")
+        }
+        for column, ddl in (
+            ("r2_enabled", "ALTER TABLE vuln_campaigns ADD COLUMN r2_enabled INTEGER NOT NULL DEFAULT 0"),
+            ("r2_auto_approve", "ALTER TABLE vuln_campaigns ADD COLUMN r2_auto_approve INTEGER NOT NULL DEFAULT 0"),
+            ("r2_proxy_url", "ALTER TABLE vuln_campaigns ADD COLUMN r2_proxy_url TEXT"),
+            ("auto_analysis_enabled", "ALTER TABLE vuln_campaigns ADD COLUMN auto_analysis_enabled INTEGER NOT NULL DEFAULT 0"),
+            ("auto_analysis_budget_units", "ALTER TABLE vuln_campaigns ADD COLUMN auto_analysis_budget_units INTEGER NOT NULL DEFAULT 8"),
+            ("auto_analysis_daily_budget_units", "ALTER TABLE vuln_campaigns ADD COLUMN auto_analysis_daily_budget_units INTEGER NOT NULL DEFAULT 20"),
+            ("auto_analysis_min_observations", "ALTER TABLE vuln_campaigns ADD COLUMN auto_analysis_min_observations INTEGER NOT NULL DEFAULT 5"),
+        ):
+            if column not in campaign_columns:
+                conn.execute(ddl)
+        analysis_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_ai_analyses)")
+        }
+        if "trigger_kind" not in analysis_columns:
+            conn.execute(
+                "ALTER TABLE vuln_ai_analyses ADD COLUMN trigger_kind TEXT NOT NULL DEFAULT 'manual'"
+            )
+        for source_type, adapter in (
+            ("dns", "dnsx.resolve.v1"),
+            ("http", "httpx.http-meta.v1"),
+        ):
+            for source in conn.execute(
+                "SELECT id, config_json FROM vuln_sources WHERE source_type = ?",
+                (source_type,),
+            ).fetchall():
+                try:
+                    config = json.loads(source["config_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    config = {}
+                if not isinstance(config, dict):
+                    config = {}
+                config["adapter"] = adapter
+                conn.execute(
+                    "UPDATE vuln_sources SET config_json = ? WHERE id = ?",
+                    (json.dumps(config), source["id"]),
+                )
+        conn.execute(
+            """
+            INSERT INTO vuln_sources
+                (id, campaign_id, name, source_type, status, enabled,
+                 freshness_seconds, config_json, created_at, updated_at)
+            SELECT 'source-r2-tls-' || campaign.id, campaign.id, 'TLS metadata', 'tls',
+                   'idle', 1, 21600, '{"adapter":"tlsx.tls-meta.v1"}',
+                   strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                   strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            FROM vuln_campaigns AS campaign
+            WHERE NOT EXISTS (
+                SELECT 1 FROM vuln_sources AS source
+                WHERE source.campaign_id = campaign.id AND source.source_type = 'tls'
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (10, 'vulnerability_r2_and_auto_analysis', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
         )
 
 

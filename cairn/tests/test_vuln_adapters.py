@@ -12,9 +12,13 @@ from cairn.server.vuln_adapters import (
     AdapterValidationError,
     AmassPassiveEnumAdapter,
     CertificateTransparencyAdapter,
+    DnsxResolveAdapter,
+    HttpxHttpMetadataAdapter,
     OsvVulnerabilityIntelligenceAdapter,
+    RATE_LIMIT_RESERVATION_WINDOW_SECONDS,
     RdapDomainAdapter,
     SubfinderPassiveDnsAdapter,
+    TlsxTlsMetadataAdapter,
     WhoisDomainAdapter,
     acquire_campaign_http_rate_limit,
 )
@@ -119,6 +123,73 @@ ADAPTER_CASES = (
             "name_servers": ["NS1.EXAMPLE.COM"],
         },
     ),
+    (
+        DnsxResolveAdapter(),
+        _context(),
+        json.dumps(
+            {
+                "host": "example.com",
+                "status_code": "NOERROR",
+                "a": ["93.184.216.34"],
+                "aaaa": ["2606:2800:220:1:248:1893:25c8:1946"],
+                "cname": ["edge.example.net"],
+                "ns": ["a.iana-servers.net"],
+                "resolver": ["1.1.1.1:53"],
+            }
+        ),
+        lambda parsed: parsed["records"][0]["a"] == ["93.184.216.34"],
+    ),
+    (
+        HttpxHttpMetadataAdapter(),
+        _context(),
+        json.dumps(
+            {
+                "input": "example.com",
+                "url": "https://example.com",
+                "scheme": "https",
+                "method": "GET",
+                "status_code": 200,
+                "title": "Example Domain",
+                "webserver": "nginx",
+                "tech": ["nginx"],
+                "host_ip": "93.184.216.34",
+                "content_type": "text/html",
+                "content_length": 1256,
+            }
+        ),
+        lambda parsed: parsed["records"][0]["status_code"] == 200,
+    ),
+    (
+        TlsxTlsMetadataAdapter(),
+        _context(),
+        json.dumps(
+            {
+                "host": "example.com",
+                "port": "443",
+                "probe_status": True,
+                "tls_version": "tls13",
+                "cipher": "TLS_AES_256_GCM_SHA384",
+                "subject_cn": "example.com",
+                "subject_an": ["example.com", "www.example.com"],
+                "issuer_cn": "Example CA",
+                "serial": "01",
+                "not_before": "2026-01-01T00:00:00Z",
+                "not_after": "2027-01-01T00:00:00Z",
+                "chain": [
+                    {
+                        "subject_cn": "Example CA",
+                        "issuer_cn": "Example Root",
+                        "serial": "02",
+                    }
+                ],
+            }
+        ),
+        lambda parsed: (
+            parsed["records"][0]["tls_version"] == "tls13"
+            and parsed["records"][0]["certificate_chain"][0]["issuer_cn"]
+            == "Example Root"
+        ),
+    ),
 )
 
 
@@ -127,7 +198,7 @@ ADAPTER_CASES = (
     ADAPTER_CASES,
     ids=[case[0].tool_id for case in ADAPTER_CASES],
 )
-def test_r1_adapters_materialize_argument_arrays_and_parse_mocked_output(
+def test_controlled_adapters_materialize_argument_arrays_and_parse_mocked_output(
     adapter, context, stdout, assert_parsed, monkeypatch
 ) -> None:
     calls: list[tuple[list[str], dict]] = []
@@ -146,11 +217,18 @@ def test_r1_adapters_materialize_argument_arrays_and_parse_mocked_output(
     adapter.validate(context)
     invocations = adapter.materialize(context)
     estimate = adapter.estimate(context)
-    assert estimate["command_count"] == 1
+    assert estimate["command_count"] == len(invocations)
     assert all(isinstance(invocation.argv, tuple) for invocation in invocations)
     assert all(isinstance(argument, str) for invocation in invocations for argument in invocation.argv)
     if adapter.tool_id == "amass.passive-enum.v1":
         assert "-passive" in invocations[0].argv
+    if adapter.tool_id == "tlsx.tls-meta.v1":
+        assert len(invocations) == 2
+        assert {"-tls-version", "-cipher", "-probe-status"} <= set(invocations[0].argv)
+        assert {"-certificate", "-tls-chain"} <= set(invocations[1].argv)
+        assert {"-san", "-cn", "-so", "-serial"}.isdisjoint(
+            argument for invocation in invocations for argument in invocation.argv
+        )
     if adapter.uses_http:
         assert "X-Cairn-Research: campaign=vuln-test; task=task-test" in invocations[0].argv
 
@@ -162,13 +240,15 @@ def test_r1_adapters_materialize_argument_arrays_and_parse_mocked_output(
     assert health["version"] == f"{adapter.binary} mock 1.0"
     assert assert_parsed(parsed)
     assert len(execution.output_hash) == 64
-    assert execution.output_size == len(stdout.encode("utf-8"))
+    assert execution.output_size == len(stdout.encode("utf-8")) * len(invocations)
     actual_call = calls[-1]
-    assert actual_call[0] == list(invocations[0].argv)
+    assert actual_call[0] == list(invocations[-1].argv)
     assert actual_call[1]["capture_output"] is True
     assert actual_call[1]["text"] is True
     assert actual_call[1]["timeout"] == adapter.timeout_seconds
     assert actual_call[1]["shell"] is False
+    if isinstance(adapter, DnsxResolveAdapter):
+        assert actual_call[1]["input"] == "example.com\n"
 
 
 def test_adapter_registry_exposes_complete_lifecycle_metadata() -> None:
@@ -179,11 +259,14 @@ def test_adapter_registry_exposes_complete_lifecycle_metadata() -> None:
         "amass.passive-enum.v1",
         "rdap.domain.v1",
         "whois.domain.v1",
+        "dnsx.resolve.v1",
+        "httpx.http-meta.v1",
+        "tlsx.tls-meta.v1",
     }
     for tool_id, adapter in ADAPTER_REGISTRY.items():
         assert adapter.tool_id == tool_id
         assert adapter.version
-        assert adapter.risk_class == "R1"
+        assert adapter.risk_class in {"R1", "R2"}
         assert adapter.input_schema["type"] == "object"
         assert adapter.output_schema["type"] == "object"
         for method in (
@@ -197,6 +280,44 @@ def test_adapter_registry_exposes_complete_lifecycle_metadata() -> None:
             "health",
         ):
             assert callable(getattr(adapter, method))
+
+
+def test_tlsx_accepts_complete_json_emitted_before_hard_process_timeout(
+    monkeypatch,
+) -> None:
+    adapter = TlsxTlsMetadataAdapter()
+    context = _context()
+    payload = json.dumps(
+        {
+            "host": "example.com",
+            "tls_version": "tls13",
+            "cipher": "TLS_AES_128_GCM_SHA256",
+            "probe_status": True,
+            "chain": [{"subject_cn": "Intermediate", "issuer_cn": "Root"}],
+        }
+    )
+    monkeypatch.setattr(
+        "cairn.server.vuln_adapters.shutil.which", lambda binary: f"/mock/{binary}"
+    )
+
+    def timeout_after_output(argv, **kwargs):
+        raise subprocess.TimeoutExpired(
+            argv,
+            kwargs["timeout"],
+            output=f"{payload}\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        "cairn.server.vuln_adapters.subprocess.run", timeout_after_output
+    )
+    execution = adapter.execute(context)
+    parsed = adapter.parse(execution)
+
+    assert len(execution.results) == 2
+    assert {result.returncode for result in execution.results} == {-1}
+    assert parsed["records"][0]["tls_version"] == "tls13"
+    assert parsed["records"][0]["process_timeout_after_output"] is True
 
 
 def test_adapter_health_rejects_nonzero_version_probe(monkeypatch) -> None:
@@ -287,9 +408,11 @@ def test_http_rate_limit_uses_durable_campaign_window(monkeypatch) -> None:
     acquire_campaign_http_rate_limit(context)
     acquire_campaign_http_rate_limit(context)
     assert len(sleeps) == 1
-    assert sleeps[0] == pytest.approx(1.0)
+    assert sleeps[0] == pytest.approx(RATE_LIMIT_RESERVATION_WINDOW_SECONDS)
     rows = context.conn.execute(
         "SELECT observed_at FROM vuln_http_rate_events WHERE campaign_id = ?",
         (context.campaign_id,),
     ).fetchall()
-    assert [row["observed_at"] for row in rows] == [pytest.approx(101.0)]
+    assert [row["observed_at"] for row in rows] == [
+        pytest.approx(100.0 + RATE_LIMIT_RESERVATION_WINDOW_SECONDS)
+    ]
