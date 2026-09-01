@@ -14,7 +14,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 
 USER_AGENT = "Cairn/0.2 authorized-passive-research"
@@ -112,6 +112,7 @@ class AdapterContext:
     request_header: str = "X-Cairn-Research"
     max_requests_per_second: int = 30
     proxy_url: str | None = None
+    options: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -169,6 +170,43 @@ def normalize_domain(value: str) -> str:
     if not DOMAIN_PATTERN.fullmatch(ascii_domain):
         raise AdapterValidationError(f"Invalid domain target: {value}")
     return ascii_domain
+
+
+def normalize_network_host(value: str) -> str:
+    """Return one exact IP or FQDN from an approved network target."""
+
+    text = value.strip()
+    if text.startswith(("http://", "https://")):
+        parsed = urlsplit(text)
+        if parsed.username is not None or parsed.password is not None:
+            raise AdapterValidationError("Network targets may not contain credentials")
+        text = parsed.hostname or ""
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return normalize_domain(text)
+
+
+def normalize_web_target(value: str) -> str:
+    """Normalize an exact HTTP(S) crawl root without query or fragment data."""
+
+    text = value.strip()
+    if not text.startswith(("http://", "https://")):
+        return f"https://{normalize_network_host(text)}"
+    parsed = urlsplit(text)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise AdapterValidationError("Web targets must use http or https")
+    if parsed.username is not None or parsed.password is not None:
+        raise AdapterValidationError("Web targets may not contain credentials")
+    host = normalize_network_host(parsed.hostname)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise AdapterValidationError("Web target contains an invalid port") from exc
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = host if port is None else f"{host}:{port}"
+    return urlunsplit((parsed.scheme.lower(), netloc, parsed.path or "/", "", ""))
 
 
 def acquire_campaign_http_rate_limit(context: AdapterContext) -> None:
@@ -246,6 +284,9 @@ class VulnSourceAdapter(ABC):
     def validate(self, context: AdapterContext) -> None:
         if not context.campaign_id or not context.task_id:
             raise AdapterValidationError("Adapter context is missing campaign or task identity")
+
+    def normalize_task_target(self, value: str) -> str:
+        return value.strip()
 
     def get_headers(self, context: AdapterContext) -> dict[str, str]:
         name = context.request_header.strip()
@@ -481,6 +522,30 @@ class DomainAdapter(VulnSourceAdapter):
             raise AdapterValidationError(f"{self.tool_id} accepts at most 10 domains")
         for target in context.targets:
             normalize_domain(target)
+
+
+class ActiveNetworkTargetAdapter(VulnSourceAdapter):
+    input_schema = {
+        "type": "object",
+        "required": ["active_targets"],
+        "properties": {
+            "active_targets": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 10,
+            }
+        },
+        "additionalProperties": False,
+    }
+
+    def validate(self, context: AdapterContext) -> None:
+        super().validate(context)
+        if not context.targets:
+            raise AdapterValidationError(f"{self.tool_id} requires an explicit target")
+        if len(context.targets) > 10:
+            raise AdapterValidationError(f"{self.tool_id} accepts at most 10 targets")
+        for target in context.targets:
+            self.normalize_task_target(target)
 
 
 class DomainDiscoveryAdapter(DomainAdapter):
@@ -729,7 +794,14 @@ def _record_domain_metadata(
     now = utcnow()
     normalized = normalize_target(target)
     asset = context.conn.execute(
-        "SELECT id FROM vuln_assets WHERE campaign_id = ? AND asset_type = 'domain' AND normalized_identifier = ?",
+        """
+        SELECT id FROM vuln_assets
+        WHERE campaign_id = ?
+          AND asset_type IN ('domain', 'ip', 'ipv4', 'ipv6', 'url')
+          AND normalized_identifier = ?
+        ORDER BY CASE WHEN asset_type IN ('ip', 'ipv4', 'ipv6') THEN 0 ELSE 1 END, id
+        LIMIT 1
+        """,
         (context.campaign_id, normalized),
     ).fetchone()
     payload = {"record_type": record_type, "domain": target, "data": data}
@@ -1559,7 +1631,7 @@ def _audited_nuclei_template_paths() -> tuple[Path, ...]:
     return tuple(paths)
 
 
-class NaabuPortScanAdapter(DomainAdapter):
+class NaabuPortScanAdapter(ActiveNetworkTargetAdapter):
     """Constrained R3 port discovery; never materializes arbitrary CLI arguments."""
 
     tool_id = "naabu.port-scan.v1"
@@ -1579,16 +1651,37 @@ class NaabuPortScanAdapter(DomainAdapter):
         "properties": {"ports": {"type": "array", "items": {"type": "object"}}},
     }
 
+    def normalize_task_target(self, value: str) -> str:
+        return normalize_network_host(value)
+
+    def validate(self, context: AdapterContext) -> None:
+        super().validate(context)
+        ports = context.options.get("ports")
+        if ports is None:
+            return
+        if (
+            not isinstance(ports, list)
+            or not ports
+            or len(ports) > 32
+            or any(not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535 for port in ports)
+        ):
+            raise AdapterValidationError("Naabu requires 1-32 explicit TCP ports")
+
     def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
         rate = min(25, max(1, context.max_requests_per_second))
+        configured_ports = context.options.get("ports")
+        port_arguments = (
+            ("-p", ",".join(str(port) for port in dict.fromkeys(configured_ports)))
+            if configured_ports is not None
+            else ("-top-ports", "100")
+        )
         return [
             AdapterInvocation(
                 argv=(
                     self.binary,
                     "-host",
-                    normalize_domain(domain),
-                    "-top-ports",
-                    "100",
+                    normalize_network_host(target),
+                    *port_arguments,
                     "-rate",
                     str(rate),
                     "-c",
@@ -1599,9 +1692,9 @@ class NaabuPortScanAdapter(DomainAdapter):
                     "-silent",
                     "-disable-update-check",
                 ),
-                target=normalize_domain(domain),
+                target=normalize_network_host(target),
             )
-            for domain in context.targets
+            for target in context.targets
         ]
 
     def execute(self, context: AdapterContext) -> AdapterExecution:
@@ -1615,7 +1708,7 @@ class NaabuPortScanAdapter(DomainAdapter):
                 continue
             ports.append(
                 {
-                    "domain": normalize_domain(
+                    "domain": normalize_network_host(
                         str(payload.get("host") or payload.get("input") or payload["_invocation_target"])
                     ),
                     "ip": str(payload.get("ip") or "")[:128] or None,
@@ -1639,7 +1732,12 @@ class NaabuPortScanAdapter(DomainAdapter):
                 {
                     "domain": domain,
                     "ports": ports,
-                    "scan_profile": "fixed-top-100-tcp",
+                    "scan_profile": (
+                        "explicit-tcp-ports:"
+                        + ",".join(str(port) for port in context.options.get("ports", []))
+                        if context.options.get("ports") is not None
+                        else "fixed-top-100-tcp"
+                    ),
                     "network_path": "direct",
                 },
                 dimension="external",
@@ -1649,8 +1747,8 @@ class NaabuPortScanAdapter(DomainAdapter):
         return {"observations_created": created, "observations_updated": updated}
 
 
-class KatanaCrawlerAdapter(DomainAdapter):
-    """Depth-one, no-form, no-headless R3 discovery profile."""
+class KatanaCrawlerAdapter(ActiveNetworkTargetAdapter):
+    """Bounded same-host, no-form, no-headless R3 discovery profile."""
 
     tool_id = "katana.crawler.v1"
     version = "0.1.0"
@@ -1669,7 +1767,17 @@ class KatanaCrawlerAdapter(DomainAdapter):
         "properties": {"urls": {"type": "array", "items": {"type": "object"}}},
     }
 
+    def normalize_task_target(self, value: str) -> str:
+        return normalize_web_target(value)
+
+    def validate(self, context: AdapterContext) -> None:
+        super().validate(context)
+        depth = context.options.get("depth", 1)
+        if not isinstance(depth, int) or isinstance(depth, bool) or not 1 <= depth <= 2:
+            raise AdapterValidationError("Katana depth must be between 1 and 2")
+
     def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        depth = int(context.options.get("depth", 1))
         headers = tuple(
             argument
             for name, value in self.get_headers(context).items()
@@ -1680,9 +1788,11 @@ class KatanaCrawlerAdapter(DomainAdapter):
                 argv=(
                     self.binary,
                     "-u",
-                    f"https://{normalize_domain(domain)}",
+                    normalize_web_target(target),
                     "-d",
-                    "1",
+                    str(depth),
+                    "-fs",
+                    "fqdn",
                     "-c",
                     "1",
                     "-p",
@@ -1696,9 +1806,9 @@ class KatanaCrawlerAdapter(DomainAdapter):
                     "-disable-update-check",
                     *headers,
                 ),
-                target=normalize_domain(domain),
+                target=normalize_web_target(target),
             )
-            for domain in context.targets
+            for target in context.targets
         ]
 
     def execute(self, context: AdapterContext) -> AdapterExecution:
@@ -1712,8 +1822,8 @@ class KatanaCrawlerAdapter(DomainAdapter):
             parsed = urlsplit(endpoint)
             if parsed.scheme not in {"http", "https"} or not parsed.hostname:
                 continue
-            invocation_domain = normalize_domain(str(payload["_invocation_target"]))
-            endpoint_domain = normalize_domain(parsed.hostname)
+            invocation_domain = normalize_network_host(str(payload["_invocation_target"]))
+            endpoint_domain = normalize_network_host(parsed.hostname)
             if endpoint_domain != invocation_domain and not endpoint_domain.endswith(f".{invocation_domain}"):
                 continue
             urls.append({"domain": invocation_domain, "url": endpoint})
@@ -1733,7 +1843,10 @@ class KatanaCrawlerAdapter(DomainAdapter):
                 {
                     "domain": domain,
                     "urls": sorted(set(urls))[:1000],
-                    "crawl_profile": "depth-1-no-headless-no-form-submission",
+                    "crawl_profile": (
+                        f"depth-{int(context.options.get('depth', 1))}"
+                        "-fqdn-scope-no-headless-no-form-submission"
+                    ),
                     "request_headers": self.get_headers(context),
                 },
                 dimension="web",

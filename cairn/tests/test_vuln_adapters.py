@@ -35,6 +35,7 @@ def _context(
     *,
     targets: tuple[str, ...] = ("example.com",),
     packages: tuple[dict, ...] = (),
+    options: dict | None = None,
 ) -> AdapterContext:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -55,6 +56,7 @@ def _context(
         source={"id": "source-test", "name": "test-source"},
         targets=targets,
         packages=packages,
+        options=options or {},
     )
 
 
@@ -314,6 +316,54 @@ def test_r3_adapters_materialize_fixed_bounded_profiles() -> None:
     assert "-headless" not in katana_invocation.argv
     assert "-form-fill" not in katana_invocation.argv
     assert any("X-Cairn-Research: campaign=vuln-test" in value for value in katana_invocation.argv)
+
+
+def test_r3_adapters_materialize_approved_ip_url_profile() -> None:
+    naabu_context = _context(
+        targets=("39.106.48.91",),
+        options={"ports": [80, 443, 8080, 8443]},
+    )
+    katana_context = _context(
+        targets=("http://39.106.48.91/",),
+        options={"depth": 2},
+    )
+    naabu_context = AdapterContext(
+        **{**naabu_context.__dict__, "max_requests_per_second": 2}
+    )
+    katana_context = AdapterContext(
+        **{**katana_context.__dict__, "max_requests_per_second": 2}
+    )
+
+    naabu = NaabuPortScanAdapter()
+    naabu.validate(naabu_context)
+    naabu_argv = naabu.materialize(naabu_context)[0].argv
+    assert naabu_argv[naabu_argv.index("-host") + 1] == "39.106.48.91"
+    assert naabu_argv[naabu_argv.index("-p") + 1] == "80,443,8080,8443"
+    assert "-top-ports" not in naabu_argv
+    assert naabu_argv[naabu_argv.index("-rate") + 1] == "2"
+    assert naabu_argv[naabu_argv.index("-c") + 1] == "1"
+
+    katana = KatanaCrawlerAdapter()
+    katana.validate(katana_context)
+    katana_argv = katana.materialize(katana_context)[0].argv
+    assert katana_argv[katana_argv.index("-u") + 1] == "http://39.106.48.91/"
+    assert katana_argv[katana_argv.index("-d") + 1] == "2"
+    assert katana_argv[katana_argv.index("-fs") + 1] == "fqdn"
+    assert katana_argv[katana_argv.index("-rl") + 1] == "2"
+    assert katana_argv[katana_argv.index("-c") + 1] == "1"
+    assert katana_argv[katana_argv.index("-p") + 1] == "1"
+
+
+@pytest.mark.parametrize(
+    ("adapter", "context"),
+    [
+        (NaabuPortScanAdapter(), _context(options={"ports": [0]})),
+        (KatanaCrawlerAdapter(), _context(options={"depth": 3})),
+    ],
+)
+def test_r3_adapters_reject_out_of_policy_options(adapter, context) -> None:
+    with pytest.raises(AdapterValidationError):
+        adapter.validate(context)
 
 
 def test_r3_adapters_parse_only_bounded_in_scope_records() -> None:
