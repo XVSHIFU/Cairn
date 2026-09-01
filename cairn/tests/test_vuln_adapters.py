@@ -12,6 +12,7 @@ from cairn.server.vuln_adapters import (
     ADAPTER_REGISTRY,
     AdapterContext,
     AdapterExecution,
+    AdapterExecutionError,
     AdapterValidationError,
     AmassPassiveEnumAdapter,
     CertificateTransparencyAdapter,
@@ -261,6 +262,9 @@ def test_controlled_adapters_materialize_argument_arrays_and_parse_mocked_output
     assert actual_call[1]["shell"] is False
     if isinstance(adapter, DnsxResolveAdapter):
         assert actual_call[1]["input"] == "example.com\n"
+        assert "stdin" not in actual_call[1]
+    else:
+        assert actual_call[1]["stdin"] is subprocess.DEVNULL
 
 
 def test_adapter_registry_exposes_complete_lifecycle_metadata() -> None:
@@ -342,6 +346,9 @@ def test_r3_adapters_materialize_approved_ip_url_profile() -> None:
     assert "-top-ports" not in naabu_argv
     assert naabu_argv[naabu_argv.index("-rate") + 1] == "2"
     assert naabu_argv[naabu_argv.index("-c") + 1] == "1"
+    assert naabu_argv[naabu_argv.index("-scan-type") + 1] == "c"
+    assert "-Pn" in naabu_argv
+    assert naabu_argv[naabu_argv.index("-timeout") + 1] == "1s"
 
     katana = KatanaCrawlerAdapter()
     katana.validate(katana_context)
@@ -352,6 +359,11 @@ def test_r3_adapters_materialize_approved_ip_url_profile() -> None:
     assert katana_argv[katana_argv.index("-rl") + 1] == "2"
     assert katana_argv[katana_argv.index("-c") + 1] == "1"
     assert katana_argv[katana_argv.index("-p") + 1] == "1"
+    assert katana_argv[katana_argv.index("-ct") + 1] == "60s"
+    assert "-or" in katana_argv
+    assert "-ob" in katana_argv
+    assert "-jc" not in katana_argv
+    assert "-kf" not in katana_argv
 
 
 @pytest.mark.parametrize(
@@ -407,6 +419,97 @@ def test_r3_adapters_parse_only_bounded_in_scope_records() -> None:
         )
     )
     assert urls == {"urls": [{"domain": "api.example.com", "url": "https://api.example.com/v1"}]}
+
+
+def test_r3_adapters_parse_realistic_projectdiscovery_jsonl() -> None:
+    naabu = NaabuPortScanAdapter()
+    naabu_execution = AdapterExecution(
+        (
+            CommandResult(
+                target="39.106.48.91",
+                stdout="\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "ip": "39.106.48.91",
+                                "port": 80,
+                                "protocol": "tcp",
+                                "tls": False,
+                            }
+                        ),
+                        # Naabu can emit a duplicate during CONNECT verification.
+                        json.dumps(
+                            {
+                                "ip": "39.106.48.91",
+                                "port": 80,
+                                "protocol": "tcp",
+                                "tls": False,
+                            }
+                        ),
+                    ]
+                ),
+                stderr="",
+                returncode=0,
+                duration_ms=100,
+            ),
+        )
+    )
+    assert naabu.parse(naabu_execution) == {
+        "ports": [
+            {
+                "domain": "39.106.48.91",
+                "ip": "39.106.48.91",
+                "port": 80,
+                "protocol": "tcp",
+            }
+        ]
+    }
+
+    katana = KatanaCrawlerAdapter()
+    katana_execution = AdapterExecution(
+        (
+            CommandResult(
+                target="http://39.106.48.91/",
+                stdout=json.dumps(
+                    {
+                        "request": {
+                            "method": "GET",
+                            "endpoint": "http://39.106.48.91/login",
+                        },
+                        "response": {"status_code": 200},
+                    }
+                ),
+                stderr="",
+                returncode=0,
+                duration_ms=100,
+            ),
+        )
+    )
+    assert katana.parse(katana_execution) == {
+        "urls": [
+            {"domain": "39.106.48.91", "url": "http://39.106.48.91/login"}
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    "adapter",
+    [NaabuPortScanAdapter(), KatanaCrawlerAdapter()],
+)
+def test_r3_adapters_reject_empty_success_output(adapter) -> None:
+    execution = AdapterExecution(
+        (
+            CommandResult(
+                target="39.106.48.91",
+                stdout="",
+                stderr="",
+                returncode=0,
+                duration_ms=1,
+            ),
+        )
+    )
+    with pytest.raises(AdapterExecutionError, match="produced no JSONL output"):
+        adapter.parse(execution)
 
 
 def test_rdap_redirects_remain_https_only_and_bounded() -> None:

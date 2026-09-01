@@ -373,6 +373,7 @@ class VulnSourceAdapter(ABC):
                 timeout=5,
                 check=False,
                 shell=False,
+                stdin=subprocess.DEVNULL,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             return {
@@ -449,8 +450,14 @@ class VulnSourceAdapter(ABC):
                     "timeout": self.timeout_seconds,
                     "check": False,
                     "shell": False,
+                    # Long-running collectors have an open inherited stdin.
+                    # ProjectDiscovery tools wait for pipeline input before
+                    # starting when that stream is left open, so commands that
+                    # do not intentionally consume input must see immediate EOF.
+                    "stdin": subprocess.DEVNULL,
                 }
                 if invocation.stdin is not None:
+                    run_kwargs.pop("stdin")
                     run_kwargs["input"] = invocation.stdin
                 completed = subprocess.run(list(invocation.argv), **run_kwargs)
             except subprocess.TimeoutExpired as exc:
@@ -1682,6 +1689,11 @@ class NaabuPortScanAdapter(ActiveNetworkTargetAdapter):
                     "-host",
                     normalize_network_host(target),
                     *port_arguments,
+                    "-scan-type",
+                    "c",
+                    "-Pn",
+                    "-timeout",
+                    "1s",
                     "-rate",
                     str(rate),
                     "-c",
@@ -1701,21 +1713,34 @@ class NaabuPortScanAdapter(ActiveNetworkTargetAdapter):
         return self._execute_materialized(context)
 
     def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        if not any(result.stdout.strip() for result in execution.results):
+            raise AdapterExecutionError(
+                f"{self.tool_id} produced no JSONL output; open-port coverage cannot be evidenced",
+                execution,
+            )
         ports: list[dict[str, Any]] = []
+        seen: set[tuple[str, str | None, int, str]] = set()
         for payload in _parse_json_lines(execution, tool_id=self.tool_id):
             port = payload.get("port")
             if not isinstance(port, int) or not 1 <= port <= 65535:
                 continue
-            ports.append(
-                {
-                    "domain": normalize_network_host(
-                        str(payload.get("host") or payload.get("input") or payload["_invocation_target"])
-                    ),
-                    "ip": str(payload.get("ip") or "")[:128] or None,
-                    "port": port,
-                    "protocol": str(payload.get("protocol") or "tcp")[:16],
-                }
+            record = {
+                "domain": normalize_network_host(
+                    str(payload.get("host") or payload.get("input") or payload["_invocation_target"])
+                ),
+                "ip": str(payload.get("ip") or "")[:128] or None,
+                "port": port,
+                "protocol": str(payload.get("protocol") or "tcp")[:16],
+            }
+            identity = (
+                str(record["domain"]),
+                record["ip"],
+                int(record["port"]),
+                str(record["protocol"]),
             )
+            if identity not in seen:
+                ports.append(record)
+                seen.add(identity)
         return {"ports": ports}
 
     def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
@@ -1791,6 +1816,8 @@ class KatanaCrawlerAdapter(ActiveNetworkTargetAdapter):
                     normalize_web_target(target),
                     "-d",
                     str(depth),
+                    "-ct",
+                    "60s",
                     "-fs",
                     "fqdn",
                     "-c",
@@ -1803,6 +1830,8 @@ class KatanaCrawlerAdapter(ActiveNetworkTargetAdapter):
                     "10",
                     "-jsonl",
                     "-silent",
+                    "-or",
+                    "-ob",
                     "-disable-update-check",
                     *headers,
                 ),
@@ -1815,6 +1844,11 @@ class KatanaCrawlerAdapter(ActiveNetworkTargetAdapter):
         return self._execute_materialized(context)
 
     def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        if not any(result.stdout.strip() for result in execution.results):
+            raise AdapterExecutionError(
+                f"{self.tool_id} produced no JSONL output; crawl coverage cannot be evidenced",
+                execution,
+            )
         urls: list[dict[str, str]] = []
         for payload in _parse_json_lines(execution, tool_id=self.tool_id):
             request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
