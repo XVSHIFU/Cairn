@@ -105,6 +105,7 @@ def test_analysis_driver_commands_disable_dangerous_tool_access() -> None:
     claude = ClaudeCodeDriver().build_analysis(claude_worker, "analyze").argv
     assert "--dangerously-skip-permissions" not in claude
     assert claude[claude.index("--tools") + 1] == ""
+    assert claude[claude.index("--output-format") + 1] == "json"
 
     codex_worker = base_worker.model_copy(
         update={
@@ -133,3 +134,44 @@ def test_analysis_driver_commands_disable_dangerous_tool_access() -> None:
     )
     pi = PiDriver().build_analysis(pi_worker, "analyze").argv
     assert pi[pi.index("--tools") + 1] == ""
+
+
+def test_claude_analysis_response_extracts_bounded_usage_metadata() -> None:
+    response = ClaudeCodeDriver().extract_analysis_response(
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": '{"accepted":true,"data":{"summary":"ok"}}',
+                "duration_ms": 1234,
+                "duration_api_ms": 900,
+                "num_turns": 1,
+                "total_cost_usd": 0.0123,
+                "usage": {
+                    "input_tokens": 111,
+                    "output_tokens": 22,
+                    "cache_creation_input_tokens": 33,
+                    "cache_read_input_tokens": 44,
+                    "ignored_future_field": "not persisted",
+                },
+                "modelUsage": {"claude-sonnet-test": {"inputTokens": 111}},
+                "session_id": "must-not-be-persisted",
+            }
+        ),
+        "",
+    )
+
+    assert response.text.startswith('{"accepted":true')
+    assert response.model == "claude-sonnet-test"
+    assert response.metadata == {
+        "provider": "claude-code",
+        "provider_duration_ms": 1234,
+        "provider_api_duration_ms": 900,
+        "num_turns": 1,
+        "input_tokens": 111,
+        "output_tokens": 22,
+        "cache_creation_input_tokens": 33,
+        "cache_read_input_tokens": 44,
+        "total_cost_usd": 0.0123,
+    }

@@ -723,6 +723,17 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (8, 'vulnerability_production_safety', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
         )
+    if 9 not in applied:
+        analysis_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_ai_analyses)")
+        }
+        if "execution_metadata_json" not in analysis_columns:
+            conn.execute(
+                "ALTER TABLE vuln_ai_analyses ADD COLUMN execution_metadata_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (9, 'vulnerability_ai_execution_metadata', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
 
 
 def _ensure_ctf_columns(conn: sqlite3.Connection) -> None:
