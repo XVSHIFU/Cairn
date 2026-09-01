@@ -301,13 +301,15 @@ def test_r3_adapters_materialize_fixed_bounded_profiles() -> None:
     katana = KatanaCrawlerAdapter()
 
     naabu_invocation = naabu.materialize(context)[0]
-    assert naabu_invocation.argv[:3] == ("naabu", "-host", "api.example.com")
+    assert naabu_invocation.argv[0].endswith("naabu")
+    assert naabu_invocation.argv[1:3] == ("-host", "api.example.com")
     assert naabu_invocation.argv[naabu_invocation.argv.index("-top-ports") + 1] == "100"
     assert naabu_invocation.argv[naabu_invocation.argv.index("-c") + 1] == "1"
     assert all(";" not in value for value in naabu_invocation.argv)
 
     katana_invocation = katana.materialize(context)[0]
-    assert katana_invocation.argv[:3] == ("katana", "-u", "https://api.example.com")
+    assert katana_invocation.argv[0].endswith("katana")
+    assert katana_invocation.argv[1:3] == ("-u", "https://api.example.com")
     assert katana_invocation.argv[katana_invocation.argv.index("-d") + 1] == "1"
     assert "-headless" not in katana_invocation.argv
     assert "-form-fill" not in katana_invocation.argv
@@ -410,6 +412,23 @@ def test_adapter_health_rejects_nonzero_version_probe(monkeypatch) -> None:
     assert health["healthy"] is False
     assert health["version"] is None
     assert "exited with code 1" in health["error"]
+
+
+def test_r3_adapter_health_rejects_pinned_version_drift(monkeypatch) -> None:
+    adapter = NaabuPortScanAdapter()
+    monkeypatch.setattr(
+        "cairn.server.vuln_adapters.shutil.which", lambda binary: str(binary)
+    )
+    monkeypatch.setattr(
+        "cairn.server.vuln_adapters.subprocess.run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, "[INF] Current Version: 2.5.0\n", ""
+        ),
+    )
+    health = adapter.health()
+    assert health["healthy"] is False
+    assert health["expected_version"] == "2.6.1"
+    assert "Version drift" in health["error"]
 
 
 def test_domain_adapter_rejects_shell_shaped_target_before_materialization() -> None:

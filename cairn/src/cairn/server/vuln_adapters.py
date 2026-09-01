@@ -87,6 +87,8 @@ class AdapterSpec:
     output_schema: Mapping[str, Any]
     source_type: str
     dimension: str
+    expected_tool_version: str | None = None
+    release_sha256: str | None = None
 
     @property
     def adapter_id(self) -> str:
@@ -224,6 +226,8 @@ class VulnSourceAdapter(ABC):
     uses_http: bool = False
     uses_network: bool = False
     accept_complete_json_on_timeout: bool = False
+    expected_tool_version: str | None = None
+    release_sha256: str | None = None
 
     @property
     def spec(self) -> AdapterSpec:
@@ -235,6 +239,8 @@ class VulnSourceAdapter(ABC):
             output_schema=self.output_schema,
             source_type=self.source_type,
             dimension=self.dimension,
+            expected_tool_version=self.expected_tool_version,
+            release_sha256=self.release_sha256,
         )
 
     def validate(self, context: AdapterContext) -> None:
@@ -337,7 +343,20 @@ class VulnSourceAdapter(ABC):
         output = ANSI_ESCAPE_PATTERN.sub(
             "", completed.stdout.strip() or completed.stderr.strip()
         )
-        first_line = output.splitlines()[0][:256] if output else None
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        first_line = lines[0][:256] if lines else None
+        version_line = next(
+            (
+                line[:256]
+                for line in lines
+                if "version" in line.casefold()
+                or (
+                    self.expected_tool_version is not None
+                    and self.expected_tool_version in line
+                )
+            ),
+            first_line,
+        )
         if completed.returncode != 0:
             detail = f": {first_line}" if first_line else ""
             return {
@@ -346,10 +365,24 @@ class VulnSourceAdapter(ABC):
                 "version": None,
                 "error": f"Version probe exited with code {completed.returncode}{detail}",
             }
+        if self.expected_tool_version and (
+            not version_line or self.expected_tool_version not in version_line
+        ):
+            return {
+                "healthy": False,
+                "tool_id": self.tool_id,
+                "version": version_line,
+                "expected_version": self.expected_tool_version,
+                "error": (
+                    f"Version drift: expected {self.expected_tool_version}, "
+                    f"received {version_line or 'no version output'}"
+                ),
+            }
         return {
             "healthy": True,
             "tool_id": self.tool_id,
-            "version": first_line,
+            "version": version_line,
+            "expected_version": self.expected_tool_version,
             "error": None,
         }
 
@@ -1526,7 +1559,9 @@ class NaabuPortScanAdapter(DomainAdapter):
     risk_class = "R3"
     source_type = "naabu_port_scan"
     dimension = "external"
-    binary = "naabu"
+    binary = _configured_user_binary("naabu", "CAIRN_NAABU_BINARY")
+    expected_tool_version = "2.6.1"
+    release_sha256 = "018c4c9884dea971eda860435ede3021d1150732f34cfd245498c6726d8cab90"
     version_args = ("-version",)
     timeout_seconds = 90
     uses_network = True
@@ -1614,7 +1649,9 @@ class KatanaCrawlerAdapter(DomainAdapter):
     risk_class = "R3"
     source_type = "katana_crawler"
     dimension = "web"
-    binary = "katana"
+    binary = _configured_user_binary("katana", "CAIRN_KATANA_BINARY")
+    expected_tool_version = "1.7.0"
+    release_sha256 = "fe1142d92f418549338ea46d67a472124878482e225d279e9a42700c75d76a4d"
     version_args = ("-version",)
     timeout_seconds = 90
     uses_http = True

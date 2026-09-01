@@ -653,6 +653,8 @@ CREATE TABLE IF NOT EXISTS vuln_source_adapters (
     source_type TEXT NOT NULL UNIQUE,
     dimension TEXT NOT NULL,
     executable TEXT NOT NULL,
+    expected_tool_version TEXT,
+    release_sha256 TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     input_schema_json TEXT NOT NULL DEFAULT '{}',
     output_schema_json TEXT NOT NULL DEFAULT '{}',
@@ -1210,6 +1212,25 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             )
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (13, 'vulnerability_control_plane_integrity', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 14 not in applied:
+        adapter_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_source_adapters)")
+        }
+        for column, ddl in (
+            (
+                "expected_tool_version",
+                "ALTER TABLE vuln_source_adapters ADD COLUMN expected_tool_version TEXT",
+            ),
+            (
+                "release_sha256",
+                "ALTER TABLE vuln_source_adapters ADD COLUMN release_sha256 TEXT",
+            ),
+        ):
+            if column not in adapter_columns:
+                conn.execute(ddl)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (14, 'vulnerability_pinned_adapter_releases', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
         )
 
 
