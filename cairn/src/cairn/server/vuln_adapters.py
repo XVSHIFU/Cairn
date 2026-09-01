@@ -1518,6 +1518,186 @@ def _audited_nuclei_template_paths() -> tuple[Path, ...]:
     return tuple(paths)
 
 
+class NaabuPortScanAdapter(DomainAdapter):
+    """Constrained R3 port discovery; never materializes arbitrary CLI arguments."""
+
+    tool_id = "naabu.port-scan.v1"
+    version = "0.1.0"
+    risk_class = "R3"
+    source_type = "naabu_port_scan"
+    dimension = "external"
+    binary = "naabu"
+    version_args = ("-version",)
+    timeout_seconds = 90
+    uses_network = True
+    output_schema = {
+        "type": "object",
+        "required": ["ports"],
+        "properties": {"ports": {"type": "array", "items": {"type": "object"}}},
+    }
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        rate = min(25, max(1, context.max_requests_per_second))
+        return [
+            AdapterInvocation(
+                argv=(
+                    self.binary,
+                    "-host",
+                    normalize_domain(domain),
+                    "-top-ports",
+                    "100",
+                    "-rate",
+                    str(rate),
+                    "-c",
+                    "1",
+                    "-retries",
+                    "1",
+                    "-json",
+                    "-silent",
+                    "-disable-update-check",
+                ),
+                target=normalize_domain(domain),
+            )
+            for domain in context.targets
+        ]
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        return self._execute_materialized(context)
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        ports: list[dict[str, Any]] = []
+        for payload in _parse_json_lines(execution, tool_id=self.tool_id):
+            port = payload.get("port")
+            if not isinstance(port, int) or not 1 <= port <= 65535:
+                continue
+            ports.append(
+                {
+                    "domain": normalize_domain(
+                        str(payload.get("host") or payload.get("input") or payload["_invocation_target"])
+                    ),
+                    "ip": str(payload.get("ip") or "")[:128] or None,
+                    "port": port,
+                    "protocol": str(payload.get("protocol") or "tcp")[:16],
+                }
+            )
+        return {"ports": ports}
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        created = 0
+        updated = 0
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for record in parsed.get("ports", []):
+            grouped.setdefault(record["domain"], []).append(record)
+        for domain, ports in grouped.items():
+            was_created = _record_domain_metadata(
+                context,
+                "open_ports",
+                domain,
+                {
+                    "domain": domain,
+                    "ports": ports,
+                    "scan_profile": "fixed-top-100-tcp",
+                    "network_path": "direct",
+                },
+                dimension="external",
+            )
+            created += int(was_created)
+            updated += int(not was_created)
+        return {"observations_created": created, "observations_updated": updated}
+
+
+class KatanaCrawlerAdapter(DomainAdapter):
+    """Depth-one, no-form, no-headless R3 discovery profile."""
+
+    tool_id = "katana.crawler.v1"
+    version = "0.1.0"
+    risk_class = "R3"
+    source_type = "katana_crawler"
+    dimension = "web"
+    binary = "katana"
+    version_args = ("-version",)
+    timeout_seconds = 90
+    uses_http = True
+    output_schema = {
+        "type": "object",
+        "required": ["urls"],
+        "properties": {"urls": {"type": "array", "items": {"type": "object"}}},
+    }
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        headers = tuple(
+            argument
+            for name, value in self.get_headers(context).items()
+            for argument in ("-H", f"{name}: {value}")
+        )
+        return [
+            AdapterInvocation(
+                argv=(
+                    self.binary,
+                    "-u",
+                    f"https://{normalize_domain(domain)}",
+                    "-d",
+                    "1",
+                    "-c",
+                    "1",
+                    "-p",
+                    "1",
+                    "-rl",
+                    str(min(10, max(1, context.max_requests_per_second))),
+                    "-timeout",
+                    "10",
+                    "-jsonl",
+                    "-silent",
+                    "-disable-update-check",
+                    *headers,
+                ),
+                target=normalize_domain(domain),
+            )
+            for domain in context.targets
+        ]
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        return self._execute_materialized(context)
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        urls: list[dict[str, str]] = []
+        for payload in _parse_json_lines(execution, tool_id=self.tool_id):
+            request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+            endpoint = str(payload.get("url") or request.get("endpoint") or "")[:4096]
+            parsed = urlsplit(endpoint)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                continue
+            invocation_domain = normalize_domain(str(payload["_invocation_target"]))
+            endpoint_domain = normalize_domain(parsed.hostname)
+            if endpoint_domain != invocation_domain and not endpoint_domain.endswith(f".{invocation_domain}"):
+                continue
+            urls.append({"domain": invocation_domain, "url": endpoint})
+        return {"urls": urls}
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        created = 0
+        updated = 0
+        grouped: dict[str, list[str]] = {}
+        for record in parsed.get("urls", []):
+            grouped.setdefault(record["domain"], []).append(record["url"])
+        for domain, urls in grouped.items():
+            was_created = _record_domain_metadata(
+                context,
+                "web_discovery",
+                domain,
+                {
+                    "domain": domain,
+                    "urls": sorted(set(urls))[:1000],
+                    "crawl_profile": "depth-1-no-headless-no-form-submission",
+                    "request_headers": self.get_headers(context),
+                },
+                dimension="web",
+            )
+            created += int(was_created)
+            updated += int(not was_created)
+        return {"observations_created": created, "observations_updated": updated}
+
+
 class NucleiPassiveResponseAdapter(DomainAdapter):
     """Run a fixed signed-template allowlist against captured HTTP responses only."""
 
@@ -1855,6 +2035,8 @@ _ADAPTERS: tuple[VulnSourceAdapter, ...] = (
     HttpxHttpMetadataAdapter(),
     TlsxTlsMetadataAdapter(),
     NucleiPassiveResponseAdapter(),
+    NaabuPortScanAdapter(),
+    KatanaCrawlerAdapter(),
 )
 
 ADAPTER_REGISTRY: dict[str, VulnSourceAdapter] = {

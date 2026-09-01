@@ -645,6 +645,94 @@ CREATE INDEX IF NOT EXISTS idx_vuln_ai_reviews_campaign
 ON vuln_ai_reviews(campaign_id, status, created_at);
 """
 
+VULNERABILITY_CONTROL_PLANE_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS vuln_source_adapters (
+    tool_id TEXT PRIMARY KEY,
+    version TEXT NOT NULL,
+    risk_class TEXT NOT NULL,
+    source_type TEXT NOT NULL UNIQUE,
+    dimension TEXT NOT NULL,
+    executable TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    input_schema_json TEXT NOT NULL DEFAULT '{}',
+    output_schema_json TEXT NOT NULL DEFAULT '{}',
+    registered_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vuln_policy_snapshots (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    scope_version INTEGER NOT NULL,
+    policy_digest TEXT NOT NULL,
+    policy_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(campaign_id, scope_version, policy_digest)
+);
+
+CREATE TABLE IF NOT EXISTS vuln_approvals (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    job_id TEXT NOT NULL REFERENCES vuln_jobs(id) ON DELETE CASCADE,
+    policy_snapshot_id TEXT NOT NULL REFERENCES vuln_policy_snapshots(id),
+    plan_hash TEXT NOT NULL,
+    scope_version INTEGER NOT NULL,
+    targets_digest TEXT NOT NULL,
+    adapter_digest TEXT NOT NULL,
+    approval_kind TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT,
+    UNIQUE(job_id, decision)
+);
+
+CREATE TABLE IF NOT EXISTS vuln_collection_artifacts (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES vuln_collection_tasks(id) ON DELETE CASCADE,
+    stream TEXT NOT NULL,
+    content TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    original_size INTEGER NOT NULL,
+    truncated INTEGER NOT NULL DEFAULT 0,
+    redacted INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    UNIQUE(task_id, stream)
+);
+
+CREATE TABLE IF NOT EXISTS vuln_source_runs (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    source_id TEXT NOT NULL REFERENCES vuln_sources(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES vuln_collection_tasks(id) ON DELETE CASCADE,
+    adapter TEXT NOT NULL,
+    status TEXT NOT NULL,
+    output_hash TEXT,
+    produced_evidence_count INTEGER NOT NULL DEFAULT 0,
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS vuln_backlog_state (
+    campaign_id TEXT PRIMARY KEY REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    backlog_count INTEGER NOT NULL DEFAULT 0,
+    alerted INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_approvals_campaign
+ON vuln_approvals(campaign_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_vuln_source_runs_campaign
+ON vuln_source_runs(campaign_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_vuln_collection_artifacts_task
+ON vuln_collection_artifacts(task_id, stream);
+"""
+
 
 def configure(path: Path) -> None:
     global _db_path
@@ -1048,6 +1136,80 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         conn.executescript(VULNERABILITY_AI_GOVERNANCE_SCHEMA)
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (12, 'vulnerability_ai_governance_and_asset_scoring', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 13 not in applied:
+        campaign_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_campaigns)")
+        }
+        for column, ddl in (
+            (
+                "scope_version",
+                "ALTER TABLE vuln_campaigns ADD COLUMN scope_version INTEGER NOT NULL DEFAULT 1",
+            ),
+            (
+                "collection_backlog_alert_threshold",
+                "ALTER TABLE vuln_campaigns ADD COLUMN collection_backlog_alert_threshold INTEGER NOT NULL DEFAULT 100",
+            ),
+        ):
+            if column not in campaign_columns:
+                conn.execute(ddl)
+        task_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_collection_tasks)")
+        }
+        for column, ddl in (
+            ("plan_hash", "ALTER TABLE vuln_collection_tasks ADD COLUMN plan_hash TEXT"),
+            (
+                "policy_snapshot_id",
+                "ALTER TABLE vuln_collection_tasks ADD COLUMN policy_snapshot_id TEXT",
+            ),
+            ("approval_id", "ALTER TABLE vuln_collection_tasks ADD COLUMN approval_id TEXT"),
+        ):
+            if column not in task_columns:
+                conn.execute(ddl)
+        coverage_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_asset_coverage)")
+        }
+        for column, ddl in (
+            (
+                "source_adapter_id",
+                "ALTER TABLE vuln_asset_coverage ADD COLUMN source_adapter_id TEXT",
+            ),
+            (
+                "produced_evidence_count",
+                "ALTER TABLE vuln_asset_coverage ADD COLUMN produced_evidence_count INTEGER NOT NULL DEFAULT 0",
+            ),
+        ):
+            if column not in coverage_columns:
+                conn.execute(ddl)
+        conn.executescript(VULNERABILITY_CONTROL_PLANE_SCHEMA)
+        for source_type, name, adapter, dimension in (
+            ("naabu_port_scan", "Naabu controlled port discovery", "naabu.port-scan.v1", "external"),
+            ("katana_crawler", "Katana controlled web discovery", "katana.crawler.v1", "web"),
+        ):
+            conn.execute(
+                """
+                INSERT INTO vuln_sources
+                    (id, campaign_id, name, source_type, status, enabled,
+                     freshness_seconds, config_json, created_at, updated_at)
+                SELECT ? || campaign.id, campaign.id, ?, ?, 'idle', 0, 86400, ?,
+                       strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                       strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                FROM vuln_campaigns AS campaign
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM vuln_sources AS source
+                    WHERE source.campaign_id = campaign.id AND source.source_type = ?
+                )
+                """,
+                (
+                    f"source-r3-{dimension}-",
+                    name,
+                    source_type,
+                    json.dumps({"adapter": adapter}),
+                    source_type,
+                ),
+            )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (13, 'vulnerability_control_plane_integrity', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
         )
 
 

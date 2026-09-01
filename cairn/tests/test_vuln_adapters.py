@@ -11,11 +11,15 @@ import pytest
 from cairn.server.vuln_adapters import (
     ADAPTER_REGISTRY,
     AdapterContext,
+    AdapterExecution,
     AdapterValidationError,
     AmassPassiveEnumAdapter,
     CertificateTransparencyAdapter,
+    CommandResult,
     DnsxResolveAdapter,
     HttpxHttpMetadataAdapter,
+    KatanaCrawlerAdapter,
+    NaabuPortScanAdapter,
     NucleiPassiveResponseAdapter,
     OsvVulnerabilityIntelligenceAdapter,
     RATE_LIMIT_RESERVATION_WINDOW_SECONDS,
@@ -269,11 +273,13 @@ def test_adapter_registry_exposes_complete_lifecycle_metadata() -> None:
         "httpx.http-meta.v1",
         "tlsx.tls-meta.v1",
         "nuclei.passive-response.v1",
+        "naabu.port-scan.v1",
+        "katana.crawler.v1",
     }
     for tool_id, adapter in ADAPTER_REGISTRY.items():
         assert adapter.tool_id == tool_id
         assert adapter.version
-        assert adapter.risk_class in {"R1", "R2"}
+        assert adapter.risk_class in {"R1", "R2", "R3"}
         assert adapter.input_schema["type"] == "object"
         assert adapter.output_schema["type"] == "object"
         for method in (
@@ -287,6 +293,68 @@ def test_adapter_registry_exposes_complete_lifecycle_metadata() -> None:
             "health",
         ):
             assert callable(getattr(adapter, method))
+
+
+def test_r3_adapters_materialize_fixed_bounded_profiles() -> None:
+    context = _context(targets=("api.example.com",))
+    naabu = NaabuPortScanAdapter()
+    katana = KatanaCrawlerAdapter()
+
+    naabu_invocation = naabu.materialize(context)[0]
+    assert naabu_invocation.argv[:3] == ("naabu", "-host", "api.example.com")
+    assert naabu_invocation.argv[naabu_invocation.argv.index("-top-ports") + 1] == "100"
+    assert naabu_invocation.argv[naabu_invocation.argv.index("-c") + 1] == "1"
+    assert all(";" not in value for value in naabu_invocation.argv)
+
+    katana_invocation = katana.materialize(context)[0]
+    assert katana_invocation.argv[:3] == ("katana", "-u", "https://api.example.com")
+    assert katana_invocation.argv[katana_invocation.argv.index("-d") + 1] == "1"
+    assert "-headless" not in katana_invocation.argv
+    assert "-form-fill" not in katana_invocation.argv
+    assert any("X-Cairn-Research: campaign=vuln-test" in value for value in katana_invocation.argv)
+
+
+def test_r3_adapters_parse_only_bounded_in_scope_records() -> None:
+    naabu = NaabuPortScanAdapter()
+    ports = naabu.parse(
+        AdapterExecution(
+            (
+                CommandResult(
+                    target="api.example.com",
+                    stdout=json.dumps({"host": "api.example.com", "ip": "203.0.113.7", "port": 443}),
+                    stderr="",
+                    returncode=0,
+                    duration_ms=1,
+                ),
+            )
+        )
+    )
+    assert ports == {
+        "ports": [
+            {"domain": "api.example.com", "ip": "203.0.113.7", "port": 443, "protocol": "tcp"}
+        ]
+    }
+
+    katana = KatanaCrawlerAdapter()
+    urls = katana.parse(
+        AdapterExecution(
+            (
+                CommandResult(
+                    target="api.example.com",
+                    stdout="\n".join(
+                        [
+                            json.dumps({"url": "https://api.example.com/v1"}),
+                            json.dumps({"url": "https://outside.invalid/ignored"}),
+                        ]
+                    ),
+                    stderr="",
+                    returncode=0,
+                    duration_ms=1,
+                ),
+            )
+        )
+    )
+    assert urls == {"urls": [{"domain": "api.example.com", "url": "https://api.example.com/v1"}]}
 
 
 def test_tlsx_accepts_complete_json_emitted_before_hard_process_timeout(
