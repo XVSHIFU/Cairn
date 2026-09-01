@@ -1802,97 +1802,18 @@ class OsvVulnerabilityIntelligenceAdapter(VulnSourceAdapter):
         return payload
 
     def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
-        from fastapi import HTTPException
+        from cairn.server.vulnerability_services import reconcile_osv_findings
 
-        from cairn.server.vulnerability_models import FindingInput
-        from cairn.server.vulnerability_services import (
-            create_finding,
-            record_audit,
-            record_collection_task_asset,
+        return reconcile_osv_findings(
+            context.conn,
+            campaign_id=context.campaign_id,
+            task_id=context.task_id,
+            source_id=str(context.source["id"]),
+            adapter=self.tool_id,
+            packages=list(context.packages),
+            results=list(parsed.get("results", [])),
+            coverage_complete=self.coverage_complete(context, parsed),
         )
-
-        created = 0
-        duplicates = 0
-        unmatched = 0
-        results = parsed.get("results", [])
-        for package, result in zip(context.packages, results, strict=False):
-            identifier = str(
-                package.get("identifier")
-                or f"{package['ecosystem']}:{package['name']}@{package['version']}"
-            )
-            asset = context.conn.execute(
-                """
-                SELECT id
-                FROM vuln_assets
-                WHERE campaign_id = ?
-                  AND asset_type IN ('dependency', 'package')
-                  AND identifier = ? COLLATE BINARY
-                ORDER BY id
-                LIMIT 1
-                """,
-                (context.campaign_id, identifier),
-            ).fetchone()
-            asset_id = str(asset["id"]) if asset is not None else None
-            if asset_id is not None:
-                record_collection_task_asset(
-                    context.conn,
-                    context.task_id,
-                    str(context.source["id"]),
-                    asset_id,
-                )
-            else:
-                unmatched += 1
-                record_audit(
-                    context.conn,
-                    context.campaign_id,
-                    "osv.asset_unmatched",
-                    actor="osv.vuln-intel.v1",
-                    target=context.task_id,
-                    detail={"identifier": identifier},
-                )
-            package_key = str(package["normalized_identifier"])
-            result_hash = hashlib.sha256(
-                json.dumps(result, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            ).hexdigest()
-            previous_hashes = context.cursor.get("package_hashes", {})
-            if isinstance(previous_hashes, Mapping) and previous_hashes.get(package_key) == result_hash:
-                continue
-            for vulnerability in result.get("vulns", []):
-                vulnerability_id = vulnerability.get("id", "OSV-UNKNOWN")
-                severity = str(
-                    vulnerability.get("database_specific", {}).get("severity", "unknown")
-                ).lower()
-                if severity not in {"low", "medium", "high", "critical"}:
-                    severity = "unknown"
-                try:
-                    create_finding(
-                        context.conn,
-                        context.campaign_id,
-                        FindingInput(
-                            asset_id=asset_id,
-                            title=f"{vulnerability_id}: {vulnerability.get('summary') or 'Dependency vulnerability'}",
-                            description=vulnerability.get("details")
-                            or vulnerability.get("summary")
-                            or vulnerability_id,
-                            finding_type="dependency_vulnerability",
-                            severity=severity,
-                            confidence=0.85,
-                            fingerprint=(
-                                f"osv:{package['normalized_identifier']}:{vulnerability_id}"
-                            ),
-                        ),
-                    )
-                    created += 1
-                except HTTPException as exc:
-                    if exc.status_code == 409:
-                        duplicates += 1
-                    else:
-                        raise
-        return {
-            "findings_created": created,
-            "duplicates": duplicates,
-            "unmatched_assets": unmatched,
-        }
 
     def coverage_complete(self, context: AdapterContext, parsed: Any) -> bool:
         return len(parsed.get("results", [])) == len(context.packages)

@@ -24,6 +24,9 @@ class ClaudeCodeDriver(SeedSessionDriver):
     def local_binary(self) -> str | None:
         return "claude"
 
+    def supports_hard_cost_budget(self) -> bool:
+        return True
+
     def check_health(self, worker: WorkerConfig, *, timeout: float) -> HealthResult:
         env = worker.env
         return http_ping(
@@ -72,6 +75,10 @@ class ClaudeCodeDriver(SeedSessionDriver):
         ]
 
     def build_analysis(self, worker: WorkerConfig, prompt: str) -> DriverResult:
+        max_cost = worker.env.get("CAIRN_AI_MAX_COST_USD")
+        json_schema = worker.env.get("CAIRN_AI_JSON_SCHEMA")
+        budget_args = ["--max-budget-usd", max_cost] if max_cost else []
+        schema_args = ["--json-schema", json_schema] if json_schema else []
         return DriverResult(
             argv=[
                 "claude",
@@ -79,6 +86,8 @@ class ClaudeCodeDriver(SeedSessionDriver):
                 "",
                 "--output-format",
                 "json",
+                *budget_args,
+                *schema_args,
                 "-p",
                 "--",
                 prompt,
@@ -95,7 +104,12 @@ class ClaudeCodeDriver(SeedSessionDriver):
             raise ValueError("Claude Code analysis output must be a JSON object")
         if payload.get("is_error") is True:
             raise ValueError("Claude Code reported an analysis error")
-        result = payload.get("result")
+        structured = payload.get("structured_output")
+        result = (
+            json.dumps(structured, ensure_ascii=False)
+            if isinstance(structured, dict)
+            else payload.get("result")
+        )
         if not isinstance(result, str) or not result.strip():
             raise ValueError("Claude Code analysis output is missing the result text")
 

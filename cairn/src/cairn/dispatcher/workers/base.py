@@ -29,6 +29,14 @@ class WorkerDriver(abc.ABC):
     def supports_conclude(self) -> bool:
         return True
 
+    def supports_hard_cost_budget(self) -> bool:
+        """Whether analysis commands enforce a provider-side pre-execution cost cap."""
+        return False
+
+    def supports_hard_token_budget(self) -> bool:
+        """Whether analysis commands can cap both provider input and output tokens."""
+        return False
+
     def local_binary(self) -> str | None:
         """Executable this driver invokes in local mode, checked on PATH at startup.
 

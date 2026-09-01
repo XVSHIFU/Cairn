@@ -168,6 +168,12 @@ class MockDriver(SeedSessionDriver):
     def local_binary(self) -> str | None:
         return "python3"
 
+    def supports_hard_cost_budget(self) -> bool:
+        return True
+
+    def supports_hard_token_budget(self) -> bool:
+        return True
+
     @staticmethod
     def _argv(worker: WorkerConfig, prompt: str) -> list[str]:
         behavior = resolve_mock_behavior(worker.name, worker.env)

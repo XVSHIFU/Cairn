@@ -154,6 +154,18 @@ CREATE TABLE IF NOT EXISTS vuln_campaigns (
     auto_analysis_budget_units INTEGER NOT NULL DEFAULT 8,
     auto_analysis_daily_budget_units INTEGER NOT NULL DEFAULT 20,
     auto_analysis_min_observations INTEGER NOT NULL DEFAULT 5,
+    ai_max_cost_usd REAL NOT NULL DEFAULT 0.50,
+    ai_daily_cost_limit_usd REAL NOT NULL DEFAULT 2.00,
+    ai_max_input_tokens INTEGER NOT NULL DEFAULT 12000,
+    ai_max_output_tokens INTEGER NOT NULL DEFAULT 4096,
+    ai_daily_token_limit INTEGER NOT NULL DEFAULT 50000,
+    ai_require_hard_cost_limit INTEGER NOT NULL DEFAULT 1,
+    ai_require_hard_token_limit INTEGER NOT NULL DEFAULT 0,
+    ai_circuit_failure_threshold INTEGER NOT NULL DEFAULT 3,
+    ai_circuit_cooldown_seconds INTEGER NOT NULL DEFAULT 3600,
+    ai_relation_confidence_threshold REAL NOT NULL DEFAULT 0.60,
+    ai_hypothesis_confidence_threshold REAL NOT NULL DEFAULT 0.60,
+    ai_review_sample_rate REAL NOT NULL DEFAULT 0.10,
     max_requests_per_second INTEGER NOT NULL DEFAULT 30,
     max_concurrency INTEGER NOT NULL DEFAULT 3,
     request_header TEXT NOT NULL DEFAULT 'X-Cairn-Research',
@@ -186,6 +198,10 @@ CREATE TABLE IF NOT EXISTS vuln_assets (
     last_seen_at TEXT NOT NULL,
     stale_after TEXT,
     source_count INTEGER NOT NULL DEFAULT 0,
+    importance_score REAL NOT NULL DEFAULT 50,
+    risk_score REAL NOT NULL DEFAULT 0,
+    scoring_factors_json TEXT NOT NULL DEFAULT '{}',
+    scored_at TEXT,
     UNIQUE(campaign_id, asset_type, normalized_identifier)
 );
 
@@ -197,6 +213,8 @@ CREATE TABLE IF NOT EXISTS vuln_asset_relations (
     relation_type TEXT NOT NULL,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
+    visible INTEGER NOT NULL DEFAULT 1,
+    review_state TEXT NOT NULL DEFAULT 'auto_visible',
     UNIQUE(campaign_id, source_asset_id, target_asset_id, relation_type)
 );
 
@@ -448,6 +466,8 @@ CREATE TABLE IF NOT EXISTS vuln_hypotheses (
     confidence REAL NOT NULL DEFAULT 0.5,
     evidence_refs_json TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'proposed',
+    visible INTEGER NOT NULL DEFAULT 1,
+    review_state TEXT NOT NULL DEFAULT 'auto_visible',
     fingerprint TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -579,6 +599,50 @@ CREATE TABLE IF NOT EXISTS vuln_approver_audit (
     detail_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
 );
+"""
+
+VULNERABILITY_AI_GOVERNANCE_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS vuln_ai_budget_events (
+    analysis_id TEXT PRIMARY KEY REFERENCES vuln_ai_analyses(id) ON DELETE CASCADE,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'reserved',
+    reserved_cost_usd REAL NOT NULL,
+    reserved_tokens INTEGER NOT NULL,
+    actual_cost_usd REAL,
+    actual_input_tokens INTEGER,
+    actual_output_tokens INTEGER,
+    created_at TEXT NOT NULL,
+    finalized_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_ai_budget_campaign_day
+ON vuln_ai_budget_events(campaign_id, created_at, status);
+
+CREATE TABLE IF NOT EXISTS vuln_ai_circuit_breakers (
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    opened_until TEXT,
+    reason TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(campaign_id, provider)
+);
+
+CREATE TABLE IF NOT EXISTS vuln_ai_reviews (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    analysis_id TEXT NOT NULL UNIQUE REFERENCES vuln_ai_analyses(id) ON DELETE CASCADE,
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'pending',
+    reviewer TEXT,
+    review_reason TEXT,
+    reviewed_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_ai_reviews_campaign
+ON vuln_ai_reviews(campaign_id, status, created_at);
 """
 
 
@@ -931,6 +995,59 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         )
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (11, 'vulnerability_passive_findings_and_approvers', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 12 not in applied:
+        campaign_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_campaigns)")
+        }
+        for column, ddl in (
+            ("ai_max_cost_usd", "ALTER TABLE vuln_campaigns ADD COLUMN ai_max_cost_usd REAL NOT NULL DEFAULT 0.50"),
+            ("ai_daily_cost_limit_usd", "ALTER TABLE vuln_campaigns ADD COLUMN ai_daily_cost_limit_usd REAL NOT NULL DEFAULT 2.00"),
+            ("ai_max_input_tokens", "ALTER TABLE vuln_campaigns ADD COLUMN ai_max_input_tokens INTEGER NOT NULL DEFAULT 12000"),
+            ("ai_max_output_tokens", "ALTER TABLE vuln_campaigns ADD COLUMN ai_max_output_tokens INTEGER NOT NULL DEFAULT 4096"),
+            ("ai_daily_token_limit", "ALTER TABLE vuln_campaigns ADD COLUMN ai_daily_token_limit INTEGER NOT NULL DEFAULT 50000"),
+            ("ai_require_hard_cost_limit", "ALTER TABLE vuln_campaigns ADD COLUMN ai_require_hard_cost_limit INTEGER NOT NULL DEFAULT 1"),
+            ("ai_require_hard_token_limit", "ALTER TABLE vuln_campaigns ADD COLUMN ai_require_hard_token_limit INTEGER NOT NULL DEFAULT 0"),
+            ("ai_circuit_failure_threshold", "ALTER TABLE vuln_campaigns ADD COLUMN ai_circuit_failure_threshold INTEGER NOT NULL DEFAULT 3"),
+            ("ai_circuit_cooldown_seconds", "ALTER TABLE vuln_campaigns ADD COLUMN ai_circuit_cooldown_seconds INTEGER NOT NULL DEFAULT 3600"),
+            ("ai_relation_confidence_threshold", "ALTER TABLE vuln_campaigns ADD COLUMN ai_relation_confidence_threshold REAL NOT NULL DEFAULT 0.60"),
+            ("ai_hypothesis_confidence_threshold", "ALTER TABLE vuln_campaigns ADD COLUMN ai_hypothesis_confidence_threshold REAL NOT NULL DEFAULT 0.60"),
+            ("ai_review_sample_rate", "ALTER TABLE vuln_campaigns ADD COLUMN ai_review_sample_rate REAL NOT NULL DEFAULT 0.10"),
+        ):
+            if column not in campaign_columns:
+                conn.execute(ddl)
+        asset_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_assets)")
+        }
+        for column, ddl in (
+            ("importance_score", "ALTER TABLE vuln_assets ADD COLUMN importance_score REAL NOT NULL DEFAULT 50"),
+            ("risk_score", "ALTER TABLE vuln_assets ADD COLUMN risk_score REAL NOT NULL DEFAULT 0"),
+            ("scoring_factors_json", "ALTER TABLE vuln_assets ADD COLUMN scoring_factors_json TEXT NOT NULL DEFAULT '{}'"),
+            ("scored_at", "ALTER TABLE vuln_assets ADD COLUMN scored_at TEXT"),
+        ):
+            if column not in asset_columns:
+                conn.execute(ddl)
+        relation_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_asset_relations)")
+        }
+        for column, ddl in (
+            ("visible", "ALTER TABLE vuln_asset_relations ADD COLUMN visible INTEGER NOT NULL DEFAULT 1"),
+            ("review_state", "ALTER TABLE vuln_asset_relations ADD COLUMN review_state TEXT NOT NULL DEFAULT 'auto_visible'"),
+        ):
+            if column not in relation_columns:
+                conn.execute(ddl)
+        hypothesis_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_hypotheses)")
+        }
+        for column, ddl in (
+            ("visible", "ALTER TABLE vuln_hypotheses ADD COLUMN visible INTEGER NOT NULL DEFAULT 1"),
+            ("review_state", "ALTER TABLE vuln_hypotheses ADD COLUMN review_state TEXT NOT NULL DEFAULT 'auto_visible'"),
+        ):
+            if column not in hypothesis_columns:
+                conn.execute(ddl)
+        conn.executescript(VULNERABILITY_AI_GOVERNANCE_SCHEMA)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (12, 'vulnerability_ai_governance_and_asset_scoring', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
         )
 
 
