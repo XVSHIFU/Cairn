@@ -113,3 +113,42 @@ def test_migration_16_adds_campaign_retest_limit_and_queue_indexes(
         "idx_vuln_collection_tasks_auto_retest_daily",
         "idx_vuln_collection_tasks_pending_retest",
     } <= indexes
+
+
+def test_migration_17_adds_queue_governance_columns_and_indexes(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "queue-governance.db"
+    monkeypatch.setattr(db, "_db_path", None)
+    db.configure(path)
+
+    with db.get_conn() as conn:
+        versions = {
+            row["version"] for row in conn.execute("SELECT version FROM schema_migrations")
+        }
+        source_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_sources)")
+        }
+        task_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(vuln_collection_tasks)")
+        }
+        job_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_jobs)")
+        }
+        run_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_job_runs)")
+        }
+        indexes = {
+            row["name"]
+            for row in conn.execute("PRAGMA index_list(vuln_collection_tasks)")
+        }
+    assert 17 in versions
+    assert "schedule_offset" in source_columns
+    assert "archived_at" in task_columns
+    assert "archived_at" in job_columns
+    assert "archived_at" in run_columns
+    assert {
+        "idx_vuln_collection_tasks_source_status",
+        "idx_vuln_collection_tasks_archive",
+    } <= indexes

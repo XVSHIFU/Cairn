@@ -210,3 +210,44 @@ def vuln_collect(db_path: Path, once: bool, interval_seconds: int, log_level: st
         run_collector_loop(interval_seconds=interval_seconds, once=once)
     except KeyboardInterrupt:
         return
+
+
+@main.command("vuln-queue-maintain")
+@click.option(
+    "--db-path",
+    type=click.Path(path_type=Path),
+    default=db.DEFAULT_DB,
+    show_default=True,
+    help="SQLite database path",
+)
+@click.option("--apply", is_flag=True, help="Apply changes; otherwise report a dry run")
+@click.option(
+    "--compact-scheduled",
+    is_flag=True,
+    help="Archive historic queued scheduled/policy batches above the threshold",
+)
+@click.option("--compact-threshold", type=click.IntRange(min=1), default=100, show_default=True)
+@click.option("--terminal-retention-days", type=click.IntRange(min=0), default=7, show_default=True)
+@click.option("--pending-expiry-days", type=click.IntRange(min=1), default=30, show_default=True)
+def vuln_queue_maintain(
+    db_path: Path,
+    apply: bool,
+    compact_scheduled: bool,
+    compact_threshold: int,
+    terminal_retention_days: int,
+    pending_expiry_days: int,
+):
+    """Expire stale approvals and archive retained collection queue records."""
+    db.configure(db_path)
+    from cairn.server.vulnerability_collectors import maintain_collection_queue
+
+    with db.get_conn() as conn:
+        result = maintain_collection_queue(
+            conn,
+            apply=apply,
+            terminal_retention_days=terminal_retention_days,
+            pending_expiry_days=pending_expiry_days,
+            compact_scheduled=compact_scheduled,
+            compact_threshold=compact_threshold,
+        )
+    click.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))

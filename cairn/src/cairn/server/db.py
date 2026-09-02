@@ -231,6 +231,7 @@ CREATE TABLE IF NOT EXISTS vuln_sources (
     next_run_at TEXT,
     last_error TEXT,
     cursor TEXT,
+    schedule_offset INTEGER NOT NULL DEFAULT 0,
     config_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -295,6 +296,7 @@ CREATE TABLE IF NOT EXISTS vuln_jobs (
     created_at TEXT NOT NULL,
     started_at TEXT,
     finished_at TEXT,
+    archived_at TEXT,
     error TEXT
 );
 
@@ -306,7 +308,8 @@ CREATE TABLE IF NOT EXISTS vuln_job_runs (
     log_json TEXT NOT NULL DEFAULT '[]',
     exit_code INTEGER,
     started_at TEXT,
-    finished_at TEXT
+    finished_at TEXT,
+    archived_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS vuln_findings (
@@ -419,6 +422,7 @@ CREATE TABLE IF NOT EXISTS vuln_collection_tasks (
     updated_at TEXT NOT NULL,
     started_at TEXT,
     finished_at TEXT,
+    archived_at TEXT,
     UNIQUE(campaign_id, idempotency_key)
 );
 
@@ -1323,6 +1327,31 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         )
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (16, 'vulnerability_asset_change_retests', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 17 not in applied:
+        source_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_sources)")
+        }
+        if "schedule_offset" not in source_columns:
+            conn.execute(
+                "ALTER TABLE vuln_sources ADD COLUMN schedule_offset INTEGER NOT NULL DEFAULT 0"
+            )
+        for table in ("vuln_collection_tasks", "vuln_jobs", "vuln_job_runs"):
+            columns = {
+                row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            if "archived_at" not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN archived_at TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vuln_collection_tasks_source_status "
+            "ON vuln_collection_tasks(source_id, status, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vuln_collection_tasks_archive "
+            "ON vuln_collection_tasks(campaign_id, archived_at, status, updated_at)"
+        )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (17, 'vulnerability_queue_governance', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
         )
 
 
