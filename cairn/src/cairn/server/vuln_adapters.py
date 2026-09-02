@@ -29,6 +29,9 @@ RATE_LIMIT_RESERVATION_WINDOW_SECONDS = 1.01
 HTTP_RESPONSE_MAX_BYTES = 262_144
 HTTP_REQUEST_MAX_BYTES = 65_536
 NUCLEI_TEMPLATES_COMMIT = "74e8267021b061b726fe997d322444d3c20988b7"
+NUCLEI_ENGINE_VERSION = "3.11.1"
+NUCLEI_RELEASE_SHA256 = "ea63d4ae232808cd7c6bc00d0142428e231fab59dae01042246097d195835ab6"
+NUCLEI_BINARY_SHA256 = "c49588140f357cbdddd5436dec11201953a4c5390faeec90777f9ee2cfd70251"
 NUCLEI_TEMPLATE_ALLOWLIST: tuple[tuple[str, str, str], ...] = (
     (
         "http-missing-security-headers",
@@ -40,6 +43,13 @@ NUCLEI_TEMPLATE_ALLOWLIST: tuple[tuple[str, str, str], ...] = (
         "http/technologies/nginx/nginx-version.yaml",
         "aa410fb8361f2109ac247b16419040cc2cce1e3d9c76f0a51593806e7c1b7cd7",
     ),
+)
+NUCLEI_TEMPLATE_CATEGORIES = {
+    "http-missing-security-headers": "misconfiguration",
+    "nginx-version": "exposure",
+}
+NUCLEI_ALLOWED_TEMPLATE_CATEGORIES = frozenset(
+    {"exposure", "cve", "misconfiguration"}
 )
 NUCLEI_FORBIDDEN_TEMPLATE_PATTERN = re.compile(
     r"^(?:code|headless|javascript|fuzzing|payloads|workflows)\s*:|"
@@ -58,6 +68,14 @@ def _configured_user_binary(name: str, environment_name: str) -> str:
     if user_local.is_file() and os.access(user_local, os.X_OK):
         return str(user_local)
     return name
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class AdapterError(RuntimeError):
@@ -89,6 +107,7 @@ class AdapterSpec:
     dimension: str
     expected_tool_version: str | None = None
     release_sha256: str | None = None
+    requires_human_approval: bool = False
 
     @property
     def adapter_id(self) -> str:
@@ -266,6 +285,7 @@ class VulnSourceAdapter(ABC):
     accept_complete_json_on_timeout: bool = False
     expected_tool_version: str | None = None
     release_sha256: str | None = None
+    requires_human_approval: bool = False
 
     @property
     def spec(self) -> AdapterSpec:
@@ -279,6 +299,7 @@ class VulnSourceAdapter(ABC):
             dimension=self.dimension,
             expected_tool_version=self.expected_tool_version,
             release_sha256=self.release_sha256,
+            requires_human_approval=self.requires_human_approval,
         )
 
     def validate(self, context: AdapterContext) -> None:
@@ -1601,6 +1622,11 @@ def _audited_nuclei_template_paths() -> tuple[Path, ...]:
     root = root.resolve()
     paths: list[Path] = []
     for template_id, relative_path, expected_hash in NUCLEI_TEMPLATE_ALLOWLIST:
+        category = NUCLEI_TEMPLATE_CATEGORIES.get(template_id)
+        if category not in NUCLEI_ALLOWED_TEMPLATE_CATEGORIES:
+            raise AdapterValidationError(
+                f"Nuclei template category is not allowlisted: {template_id}"
+            )
         path = (root / relative_path).resolve()
         try:
             path.relative_to(root)
@@ -1899,6 +1925,9 @@ class NucleiPassiveResponseAdapter(DomainAdapter):
     source_type = "nuclei_passive"
     dimension = "intelligence"
     binary = _configured_user_binary("nuclei", "CAIRN_NUCLEI_BINARY")
+    expected_tool_version = NUCLEI_ENGINE_VERSION
+    release_sha256 = NUCLEI_RELEASE_SHA256
+    requires_human_approval = True
     version_args = ("-version",)
     timeout_seconds = 60
     uses_http = False
@@ -1938,8 +1967,36 @@ class NucleiPassiveResponseAdapter(DomainAdapter):
                 raise AdapterValidationError(
                     "Captured HTTP response does not match the task target"
                 )
-            if not response.get("file_path") and not response.get("response_text"):
-                raise AdapterValidationError("Captured HTTP response content is missing")
+            missing = [
+                key
+                for key in (
+                    "id",
+                    "asset_id",
+                    "task_id",
+                    "request_text",
+                    "response_text",
+                    "response_hash",
+                )
+                if not response.get(key)
+            ]
+            if missing:
+                raise AdapterValidationError(
+                    "Captured HTTP response provenance is incomplete: "
+                    + ", ".join(missing)
+                )
+            request_text = str(response["request_text"])
+            response_text = str(response["response_text"])
+            if len(request_text.encode("utf-8")) > HTTP_REQUEST_MAX_BYTES:
+                raise AdapterValidationError("Captured HTTP request exceeds the offline limit")
+            if len(response_text.encode("utf-8")) > HTTP_RESPONSE_MAX_BYTES:
+                raise AdapterValidationError("Captured HTTP response exceeds the offline limit")
+            if not re.match(r"^[A-Z]+\s+\S+\s+HTTP/\d(?:\.\d)?(?:\r?\n|$)", request_text):
+                raise AdapterValidationError("Captured HTTP request is not wire-shaped")
+            if not re.match(r"^HTTP/\d(?:\.\d)?\s+\d{3}(?:\s|\r?\n|$)", response_text):
+                raise AdapterValidationError("Captured HTTP response is not wire-shaped")
+            actual_hash = hashlib.sha256(response_text.encode("utf-8")).hexdigest()
+            if actual_hash != str(response["response_hash"]):
+                raise AdapterValidationError("Captured HTTP response hash mismatch")
         _audited_nuclei_template_paths()
 
     def estimate(self, context: AdapterContext) -> dict[str, Any]:
@@ -1956,6 +2013,32 @@ class NucleiPassiveResponseAdapter(DomainAdapter):
         result = super().health()
         if not result.get("healthy"):
             return result
+        executable = shutil.which(self.binary)
+        assert executable is not None
+        try:
+            binary_sha256 = _sha256_file(Path(executable))
+        except OSError as exc:
+            return {
+                "healthy": False,
+                "tool_id": self.tool_id,
+                "version": result.get("version"),
+                "error": f"Unable to hash the Nuclei executable: {type(exc).__name__}",
+            }
+        if binary_sha256 != NUCLEI_BINARY_SHA256:
+            return {
+                "healthy": False,
+                "tool_id": self.tool_id,
+                "version": result.get("version"),
+                "error": "Nuclei executable hash does not match the audited release",
+            }
+        network_sandbox = shutil.which("unshare")
+        if network_sandbox is None:
+            return {
+                "healthy": False,
+                "tool_id": self.tool_id,
+                "version": result.get("version"),
+                "error": "Required offline network namespace tool is unavailable: unshare",
+            }
         try:
             paths = _audited_nuclei_template_paths()
         except AdapterError as exc:
@@ -1967,13 +2050,22 @@ class NucleiPassiveResponseAdapter(DomainAdapter):
             }
         return {
             **result,
+            "release_sha256": self.release_sha256,
+            "binary_sha256": binary_sha256,
+            "network_isolation": "linux-user-network-namespace",
             "templates_commit": NUCLEI_TEMPLATES_COMMIT,
             "template_ids": [item[0] for item in NUCLEI_TEMPLATE_ALLOWLIST],
+            "template_categories": dict(NUCLEI_TEMPLATE_CATEGORIES),
             "template_count": len(paths),
         }
 
     def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
         template_paths = _audited_nuclei_template_paths()
+        network_sandbox = shutil.which("unshare")
+        if network_sandbox is None:
+            raise AdapterUnavailableError(
+                "Nuclei passive analysis requires a Linux user network namespace"
+            )
         template_args = tuple(
             argument
             for path in template_paths
@@ -1988,6 +2080,11 @@ class NucleiPassiveResponseAdapter(DomainAdapter):
             invocations.append(
                 AdapterInvocation(
                     argv=(
+                        network_sandbox,
+                        "--user",
+                        "--map-current-user",
+                        "--net",
+                        "--",
                         self.binary,
                         "-passive",
                         "-target",
@@ -2004,6 +2101,8 @@ class NucleiPassiveResponseAdapter(DomainAdapter):
                         "-jsonl",
                         "-silent",
                         "-omit-raw",
+                        "-disable-redirects",
+                        "-restrict-local-network-access",
                         "-concurrency",
                         "1",
                         "-bulk-size",
@@ -2049,7 +2148,14 @@ class NucleiPassiveResponseAdapter(DomainAdapter):
 
     def parse(self, execution: AdapterExecution) -> dict[str, Any]:
         findings: list[dict[str, Any]] = []
+        allowed_template_ids = {item[0] for item in NUCLEI_TEMPLATE_ALLOWLIST}
         for payload in _parse_json_lines(execution, tool_id=self.tool_id):
+            template_id = str(payload.get("template-id") or "")[:256]
+            if template_id not in allowed_template_ids:
+                raise AdapterExecutionError(
+                    f"{self.tool_id} returned a non-allowlisted template ID",
+                    execution,
+                )
             info = payload.get("info")
             info = info if isinstance(info, dict) else {}
             classification = info.get("classification")
@@ -2057,7 +2163,7 @@ class NucleiPassiveResponseAdapter(DomainAdapter):
             findings.append(
                 {
                     "response_id": payload.get("_invocation_target"),
-                    "template_id": str(payload.get("template-id") or "")[:256],
+                    "template_id": template_id,
                     "matcher_name": str(payload.get("matcher-name") or "")[:256] or None,
                     "title": str(info.get("name") or payload.get("template-id") or "Nuclei passive match")[:1000],
                     "description": str(info.get("description") or "Offline passive response match")[:8000],
@@ -2065,6 +2171,9 @@ class NucleiPassiveResponseAdapter(DomainAdapter):
                     "cwe": str(classification.get("cwe-id") or "")[:128] or None,
                     "remediation": str(info.get("remediation") or "")[:8000] or None,
                     "matched_at": str(payload.get("matched-at") or payload.get("host") or "")[:4096],
+                    "extracted_results": _bounded_string_list(
+                        payload.get("extracted-results"), limit=20
+                    ),
                 }
             )
         return {"findings": findings}

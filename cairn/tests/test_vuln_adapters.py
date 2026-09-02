@@ -707,6 +707,31 @@ http:
     return template
 
 
+def _mock_nuclei_runtime(
+    tmp_path: Path, monkeypatch, adapter: NucleiPassiveResponseAdapter
+) -> tuple[Path, Path]:
+    binary = tmp_path / "nuclei"
+    network_sandbox = tmp_path / "unshare"
+    binary.write_bytes(b"audited nuclei test binary")
+    network_sandbox.write_bytes(b"network namespace test wrapper")
+    adapter.binary = str(binary)
+    monkeypatch.setattr(
+        "cairn.server.vuln_adapters.NUCLEI_BINARY_SHA256",
+        hashlib.sha256(binary.read_bytes()).hexdigest(),
+    )
+
+    def fake_which(value: str) -> str | None:
+        name = Path(value).name
+        if name == "nuclei":
+            return str(binary)
+        if name == "unshare":
+            return str(network_sandbox)
+        return None
+
+    monkeypatch.setattr("cairn.server.vuln_adapters.shutil.which", fake_which)
+    return binary, network_sandbox
+
+
 def test_nuclei_passive_adapter_only_reads_captured_response(
     tmp_path, monkeypatch
 ) -> None:
@@ -731,20 +756,32 @@ def test_nuclei_passive_adapter_only_reads_captured_response(
         }
     )
     adapter = NucleiPassiveResponseAdapter()
+    binary, network_sandbox = _mock_nuclei_runtime(tmp_path, monkeypatch, adapter)
     calls: list[list[str]] = []
     captured_inputs: list[str] = []
-    monkeypatch.setattr(
-        "cairn.server.vuln_adapters.shutil.which", lambda binary: f"/mock/{binary}"
-    )
 
     def fake_run(argv, **kwargs):
         calls.append(argv)
-        if str(argv[0]).startswith("/mock/"):
+        if argv[0] == str(binary):
             return subprocess.CompletedProcess(argv, 0, "Nuclei Engine Version: v3.11.1\n", "")
+        assert argv[:5] == [
+            str(network_sandbox),
+            "--user",
+            "--map-current-user",
+            "--net",
+            "--",
+        ]
+        assert argv[5] == str(binary)
         assert "-passive" in argv
         assert "-no-interactsh" in argv
         assert "-disable-unsigned-templates" in argv
         assert "-no-stdin" in argv
+        assert "-disable-update-check" in argv
+        assert "-disable-redirects" in argv
+        assert "-restrict-local-network-access" in argv
+        assert not any(
+            str(argument).startswith(("http://", "https://")) for argument in argv
+        )
         target_path = Path(argv[argv.index("-target") + 1])
         captured_inputs.append(target_path.read_text(encoding="utf-8"))
         return subprocess.CompletedProcess(
@@ -776,6 +813,11 @@ def test_nuclei_passive_adapter_only_reads_captured_response(
     assert parsed["findings"][0]["response_id"] == "http_response_001"
     assert parsed["findings"][0]["template_id"] == "http-missing-security-headers"
     assert adapter.coverage_complete(context, parsed) is True
+    assert adapter.uses_network is False
+    assert adapter.uses_http is False
+    assert adapter.requires_human_approval is True
+    assert adapter.expected_tool_version == "3.11.1"
+    assert adapter.release_sha256 == "ea63d4ae232808cd7c6bc00d0142428e231fab59dae01042246097d195835ab6"
 
 
 def test_nuclei_passive_adapter_rejects_tampered_or_dangerous_template(
@@ -787,14 +829,76 @@ def test_nuclei_passive_adapter_rejects_tampered_or_dangerous_template(
         encoding="utf-8",
     )
     adapter = NucleiPassiveResponseAdapter()
-    monkeypatch.setattr(
-        "cairn.server.vuln_adapters.shutil.which", lambda binary: f"/mock/{binary}"
-    )
+    binary, _ = _mock_nuclei_runtime(tmp_path, monkeypatch, adapter)
     monkeypatch.setattr(
         "cairn.server.vuln_adapters.subprocess.run",
-        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, "v3.11.1\n", ""),
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv,
+            0,
+            "v3.11.1\n" if argv[0] == str(binary) else "",
+            "",
+        ),
     )
 
     health = adapter.health()
     assert health["healthy"] is False
     assert "hash mismatch" in health["error"]
+
+
+def test_nuclei_passive_adapter_rejects_non_allowlisted_output(
+    tmp_path, monkeypatch
+) -> None:
+    _mock_nuclei_template_policy(tmp_path, monkeypatch)
+    adapter = NucleiPassiveResponseAdapter()
+    execution = AdapterExecution(
+        (
+            CommandResult(
+                target="http_response_001",
+                stdout=json.dumps(
+                    {
+                        "template-id": "unreviewed-active-template",
+                        "info": {"name": "Unexpected", "severity": "high"},
+                    }
+                ),
+                stderr="",
+                returncode=0,
+                duration_ms=1,
+            ),
+        )
+    )
+
+    with pytest.raises(AdapterExecutionError, match="non-allowlisted template ID"):
+        adapter.parse(execution)
+
+
+def test_nuclei_passive_adapter_rejects_allowlist_category_drift(
+    tmp_path, monkeypatch
+) -> None:
+    _mock_nuclei_template_policy(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "cairn.server.vuln_adapters.NUCLEI_TEMPLATE_CATEGORIES",
+        {"http-missing-security-headers": "fuzz"},
+    )
+    adapter = NucleiPassiveResponseAdapter()
+
+    with pytest.raises(AdapterValidationError, match="category is not allowlisted"):
+        adapter.validate(
+            AdapterContext(
+                **{
+                    **_context().__dict__,
+                    "http_responses": (
+                        {
+                            "id": "http_response_001",
+                            "domain": "example.com",
+                            "asset_id": "asset_001",
+                            "task_id": "capture_task_001",
+                            "request_text": "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                            "response_text": "HTTP/1.1 200 OK\r\n\r\n",
+                            "response_hash": hashlib.sha256(
+                                b"HTTP/1.1 200 OK\r\n\r\n"
+                            ).hexdigest(),
+                        },
+                    ),
+                }
+            )
+        )
