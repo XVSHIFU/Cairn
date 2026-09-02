@@ -87,3 +87,29 @@ def test_migration_15_adds_validation_linkage_and_disabled_passive_sources(
         }
     assert 15 in versions
     assert {"finding_id", "validation_kind"} <= task_columns
+
+
+def test_migration_16_adds_campaign_retest_limit_and_queue_indexes(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "retest.db"
+    monkeypatch.setattr(db, "_db_path", None)
+    db.configure(path)
+
+    with db.get_conn() as conn:
+        versions = {
+            row["version"] for row in conn.execute("SELECT version FROM schema_migrations")
+        }
+        campaign_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_campaigns)")
+        }
+        indexes = {
+            row["name"]
+            for row in conn.execute("PRAGMA index_list(vuln_collection_tasks)")
+        }
+    assert 16 in versions
+    assert "auto_retest_daily_limit" in campaign_columns
+    assert {
+        "idx_vuln_collection_tasks_auto_retest_daily",
+        "idx_vuln_collection_tasks_pending_retest",
+    } <= indexes

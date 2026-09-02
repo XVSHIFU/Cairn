@@ -166,6 +166,7 @@ CREATE TABLE IF NOT EXISTS vuln_campaigns (
     ai_relation_confidence_threshold REAL NOT NULL DEFAULT 0.60,
     ai_hypothesis_confidence_threshold REAL NOT NULL DEFAULT 0.60,
     ai_review_sample_rate REAL NOT NULL DEFAULT 0.10,
+    auto_retest_daily_limit INTEGER NOT NULL DEFAULT 20,
     max_requests_per_second INTEGER NOT NULL DEFAULT 30,
     max_concurrency INTEGER NOT NULL DEFAULT 3,
     request_header TEXT NOT NULL DEFAULT 'X-Cairn-Research',
@@ -1301,6 +1302,27 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             )
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (15, 'vulnerability_advisory_planning_and_validation', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 16 not in applied:
+        campaign_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_campaigns)")
+        }
+        if "auto_retest_daily_limit" not in campaign_columns:
+            conn.execute(
+                "ALTER TABLE vuln_campaigns ADD COLUMN auto_retest_daily_limit INTEGER NOT NULL DEFAULT 20"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vuln_collection_tasks_auto_retest_daily "
+            "ON vuln_collection_tasks(campaign_id, trigger_kind, created_at)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_vuln_collection_tasks_pending_retest "
+            "ON vuln_collection_tasks(finding_id, validation_kind) "
+            "WHERE trigger_kind = 'auto_retest' "
+            "AND status IN ('pending_approval', 'queued', 'running')"
+        )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (16, 'vulnerability_asset_change_retests', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
         )
 
 
