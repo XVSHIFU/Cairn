@@ -1232,6 +1232,76 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (14, 'vulnerability_pinned_adapter_releases', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
         )
+    if 15 not in applied:
+        task_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_collection_tasks)")
+        }
+        for column, ddl in (
+            (
+                "finding_id",
+                "ALTER TABLE vuln_collection_tasks ADD COLUMN finding_id TEXT REFERENCES vuln_findings(id) ON DELETE SET NULL",
+            ),
+            (
+                "validation_kind",
+                "ALTER TABLE vuln_collection_tasks ADD COLUMN validation_kind TEXT",
+            ),
+        ):
+            if column not in task_columns:
+                conn.execute(ddl)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vuln_collection_tasks_finding ON vuln_collection_tasks(finding_id, created_at)"
+        )
+        for source_type, name, adapter, dimension, freshness in (
+            (
+                "web_api_offline",
+                "Saved response Web/API discovery",
+                "webapi.saved-response.v1",
+                "web",
+                21600,
+            ),
+            (
+                "nvd_kev_intelligence",
+                "NVD and CISA KEV intelligence",
+                "nvd-kev.vuln-intel.v1",
+                "intelligence",
+                21600,
+            ),
+            (
+                "gitleaks_local",
+                "Gitleaks authorized local repository",
+                "gitleaks.secrets.v1",
+                "code",
+                86400,
+            ),
+        ):
+            conn.execute(
+                """
+                INSERT INTO vuln_sources
+                    (id, campaign_id, name, source_type, status, enabled,
+                     freshness_seconds, config_json, created_at, updated_at)
+                SELECT 'source-' || ? || '-' || campaign.id,
+                       campaign.id, ?, ?, 'idle', 0, ?, ?,
+                       strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                       strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                FROM vuln_campaigns AS campaign
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM vuln_sources AS source
+                    WHERE source.campaign_id = campaign.id
+                      AND source.source_type = ?
+                )
+                """,
+                (
+                    source_type,
+                    name,
+                    source_type,
+                    freshness,
+                    json.dumps({"adapter": adapter, "default_disabled": True}),
+                    source_type,
+                ),
+            )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (15, 'vulnerability_advisory_planning_and_validation', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
 
 
 def _ensure_ctf_columns(conn: sqlite3.Connection) -> None:

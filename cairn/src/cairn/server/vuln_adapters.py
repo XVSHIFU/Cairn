@@ -22,6 +22,7 @@ DOMAIN_PATTERN = re.compile(
     r"^(?=.{1,253}\.?$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.?$",
     re.IGNORECASE,
 )
+CVE_ID_PATTERN = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 HTTP_HEADER_NAME_PATTERN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 FORBIDDEN_REQUEST_HEADERS = {"host", "content-length"}
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
@@ -56,6 +57,10 @@ NUCLEI_FORBIDDEN_TEMPLATE_PATTERN = re.compile(
     r"interactsh|^\s*tags\s*:.*\b(?:dos|fuzz|bruteforce|intrusive)\b",
     re.IGNORECASE | re.MULTILINE,
 )
+GITLEAKS_PACKAGE_VERSION = "8.26.0-1+b1"
+GITLEAKS_PACKAGE_SHA256 = "b228ade47a811ffc94d258bd84b1c257458b4e81e37c55201c9d912c0e01bfdb"
+GITLEAKS_BINARY_SHA256 = "9f44b29dac56e2c43fc54735e7847f4e959b5ed157fdb890266b39e80328725b"
+GITLEAKS_CONFIG_SHA256 = "97930f7ef782a6cca176f6b71e6a1fae8a2fb12a665bb35078b1bce81e52e7cc"
 
 
 def _configured_user_binary(name: str, environment_name: str) -> str:
@@ -76,6 +81,38 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _audited_gitleaks_config_path() -> Path:
+    path = Path(__file__).with_name("policies") / "gitleaks-r1.toml"
+    if not path.is_file() or _sha256_file(path) != GITLEAKS_CONFIG_SHA256:
+        raise AdapterValidationError("Gitleaks policy is missing or its hash has drifted")
+    return path
+
+
+def authorized_local_repository(value: str) -> Path:
+    configured = os.getenv("CAIRN_GITLEAKS_ALLOWED_ROOTS", "")
+    if not configured.strip():
+        raise AdapterValidationError("CAIRN_GITLEAKS_ALLOWED_ROOTS is not configured")
+    candidate = Path(value).expanduser().resolve(strict=True)
+    if not candidate.is_dir():
+        raise AdapterValidationError("Gitleaks target must be an existing local directory")
+    allowed = False
+    for raw_root in configured.split(os.pathsep):
+        if not raw_root.strip():
+            continue
+        root = Path(raw_root).expanduser().resolve(strict=True)
+        if root == Path(root.anchor) or root == Path.home().resolve():
+            raise AdapterValidationError("Gitleaks allowed roots may not be filesystem or home roots")
+        try:
+            candidate.relative_to(root)
+            allowed = True
+            break
+        except ValueError:
+            continue
+    if not allowed:
+        raise AdapterValidationError("Repository path is outside configured Gitleaks roots")
+    return candidate
 
 
 class AdapterError(RuntimeError):
@@ -127,6 +164,8 @@ class AdapterContext:
     targets: tuple[str, ...] = ()
     packages: tuple[Mapping[str, Any], ...] = ()
     http_responses: tuple[Mapping[str, Any], ...] = ()
+    vulnerabilities: tuple[Mapping[str, Any], ...] = ()
+    repositories: tuple[Mapping[str, Any], ...] = ()
     cursor: Mapping[str, Any] = field(default_factory=dict)
     request_header: str = "X-Cairn-Research"
     max_requests_per_second: int = 30
@@ -1916,6 +1955,352 @@ class KatanaCrawlerAdapter(ActiveNetworkTargetAdapter):
         return {"observations_created": created, "observations_updated": updated}
 
 
+class GitleaksLocalRepositoryAdapter(VulnSourceAdapter):
+    """Scan only explicitly allowlisted local repository snapshots, fully redacted."""
+
+    tool_id = "gitleaks.secrets.v1"
+    version = "1.0.0"
+    risk_class = "R1"
+    source_type = "gitleaks_local"
+    dimension = "code"
+    binary = _configured_user_binary("gitleaks", "CAIRN_GITLEAKS_BINARY")
+    expected_tool_version = GITLEAKS_PACKAGE_VERSION
+    release_sha256 = GITLEAKS_PACKAGE_SHA256
+    requires_human_approval = True
+    uses_http = False
+    uses_network = False
+    timeout_seconds = 60
+    input_schema = {
+        "type": "object",
+        "required": ["repositories"],
+        "properties": {
+            "repositories": {"type": "array", "items": {"type": "object"}}
+        },
+        "additionalProperties": False,
+    }
+    output_schema = {
+        "type": "object",
+        "required": ["findings"],
+        "properties": {"findings": {"type": "array", "items": {"type": "object"}}},
+    }
+
+    def validate(self, context: AdapterContext) -> None:
+        super().validate(context)
+        if not context.repositories:
+            raise AdapterValidationError(
+                "Gitleaks requires an authorized local repository asset"
+            )
+        if len(context.repositories) > 5:
+            raise AdapterValidationError("Gitleaks accepts at most five repositories per task")
+        _audited_gitleaks_config_path()
+        for repository in context.repositories:
+            path = authorized_local_repository(str(repository.get("path") or ""))
+            if path != Path(str(repository.get("path") or "")).expanduser().resolve():
+                raise AdapterValidationError("Repository path did not resolve deterministically")
+            if not repository.get("asset_id"):
+                raise AdapterValidationError("Repository input is not linked to an asset")
+
+    def health(self) -> dict[str, Any]:
+        executable = shutil.which(self.binary)
+        if executable is None:
+            return {
+                "healthy": False,
+                "tool_id": self.tool_id,
+                "version": None,
+                "error": f"Executable not found: {self.binary}",
+            }
+        try:
+            binary_hash = _sha256_file(Path(executable))
+            config_path = _audited_gitleaks_config_path()
+        except (OSError, AdapterError) as exc:
+            return {
+                "healthy": False,
+                "tool_id": self.tool_id,
+                "version": None,
+                "error": str(exc),
+            }
+        if binary_hash != GITLEAKS_BINARY_SHA256:
+            return {
+                "healthy": False,
+                "tool_id": self.tool_id,
+                "version": self.expected_tool_version,
+                "error": "Gitleaks executable hash does not match the audited package",
+            }
+        return {
+            "healthy": True,
+            "tool_id": self.tool_id,
+            "version": self.expected_tool_version,
+            "expected_version": self.expected_tool_version,
+            "release_sha256": self.release_sha256,
+            "binary_sha256": binary_hash,
+            "config_sha256": _sha256_file(config_path),
+            "offline_only": True,
+            "error": None,
+        }
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        config_path = _audited_gitleaks_config_path()
+        return [
+            AdapterInvocation(
+                argv=(
+                    self.binary,
+                    "dir",
+                    "--config",
+                    str(config_path),
+                    "--no-banner",
+                    "--no-color",
+                    "--redact=100",
+                    "--report-format",
+                    "json",
+                    "--report-path",
+                    "-",
+                    "--exit-code",
+                    "0",
+                    "--max-decode-depth",
+                    "0",
+                    "--max-target-megabytes",
+                    "5",
+                    str(authorized_local_repository(str(repository["path"]))),
+                ),
+                target=str(repository["path"]),
+            )
+            for repository in context.repositories
+        ]
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        return self._execute_materialized(context)
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        findings: list[dict[str, Any]] = []
+        for result in execution.results:
+            try:
+                payload = json.loads(result.stdout or "[]")
+            except json.JSONDecodeError as exc:
+                raise AdapterExecutionError("Gitleaks returned invalid JSON", execution) from exc
+            if not isinstance(payload, list):
+                raise AdapterExecutionError("Gitleaks output must be a JSON array", execution)
+            repository = authorized_local_repository(str(result.target or ""))
+            for item in payload[:1000]:
+                if not isinstance(item, Mapping):
+                    continue
+                file_value = str(item.get("File") or "")
+                file_path = Path(file_value)
+                try:
+                    relative = (
+                        file_path.resolve(strict=False).relative_to(repository)
+                        if file_path.is_absolute()
+                        else file_path
+                    )
+                except ValueError as exc:
+                    raise AdapterExecutionError(
+                        "Gitleaks finding path escaped the approved repository", execution
+                    ) from exc
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise AdapterExecutionError(
+                        "Gitleaks finding path escaped the approved repository", execution
+                    )
+                rule_id = str(item.get("RuleID") or "unknown-rule")[:256]
+                start_line = max(0, int(item.get("StartLine") or 0))
+                fingerprint = hashlib.sha256(
+                    (
+                        f"{repository}\0{relative.as_posix()}\0{rule_id}\0{start_line}\0"
+                        f"{str(item.get('Commit') or '')[:128]}"
+                    ).encode()
+                ).hexdigest()
+                findings.append(
+                    {
+                        "repository": str(repository),
+                        "rule_id": rule_id,
+                        "description": str(item.get("Description") or rule_id)[:1000],
+                        "file": relative.as_posix()[:2048],
+                        "start_line": start_line,
+                        "end_line": max(start_line, int(item.get("EndLine") or start_line)),
+                        "commit": str(item.get("Commit") or "")[:128] or None,
+                        "fingerprint": fingerprint,
+                        "redacted": True,
+                    }
+                )
+        return {"findings": findings}
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        from cairn.server.vulnerability_services import reconcile_gitleaks_findings
+
+        return reconcile_gitleaks_findings(
+            context.conn,
+            campaign_id=context.campaign_id,
+            task_id=context.task_id,
+            source_id=str(context.source["id"]),
+            adapter=self.tool_id,
+            repositories=list(context.repositories),
+            matches=list(parsed.get("findings", [])),
+            coverage_complete=True,
+        )
+
+
+class SavedResponseWebApiAdapter(DomainAdapter):
+    """Identify API surfaces in already captured HTTP responses without networking."""
+
+    tool_id = "webapi.saved-response.v1"
+    version = "1.0.0"
+    risk_class = "R1"
+    source_type = "web_api_offline"
+    dimension = "web"
+    binary = "builtin:python"
+    uses_http = False
+    uses_network = False
+    input_schema = {
+        "type": "object",
+        "required": ["domains", "http_responses"],
+        "properties": {
+            "domains": {"type": "array", "items": {"type": "string"}},
+            "http_responses": {"type": "array", "items": {"type": "object"}},
+        },
+        "additionalProperties": False,
+    }
+    output_schema = {
+        "type": "object",
+        "required": ["records"],
+        "properties": {"records": {"type": "array", "items": {"type": "object"}}},
+    }
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "healthy": True,
+            "tool_id": self.tool_id,
+            "version": self.version,
+            "expected_version": self.version,
+            "error": None,
+            "offline_only": True,
+        }
+
+    def validate(self, context: AdapterContext) -> None:
+        super().validate(context)
+        if not context.http_responses:
+            raise AdapterValidationError(
+                "Saved-response API discovery requires captured HTTP responses"
+            )
+        if len(context.http_responses) > 20:
+            raise AdapterValidationError(
+                "Saved-response API discovery accepts at most 20 responses per task"
+            )
+        allowed_targets = {normalize_domain(target) for target in context.targets}
+        for response in context.http_responses:
+            if normalize_domain(str(response.get("domain") or "")) not in allowed_targets:
+                raise AdapterValidationError(
+                    "Captured HTTP response does not match the task target"
+                )
+            if not all(response.get(key) for key in ("id", "asset_id", "url", "response_hash")):
+                raise AdapterValidationError(
+                    "Captured HTTP response provenance is incomplete"
+                )
+
+    def estimate(self, context: AdapterContext) -> dict[str, Any]:
+        return {
+            "command_count": 0,
+            "timeout_seconds": 0,
+            "risk_class": self.risk_class,
+            "network_request_count": 0,
+            "offline_only": True,
+            "response_count": len(context.http_responses),
+        }
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        return []
+
+    @staticmethod
+    def _classify(response: Mapping[str, Any]) -> list[str]:
+        url = str(response.get("url") or "")
+        response_text = str(response.get("response_text") or "")
+        lowered_url = url.casefold()
+        lowered = response_text[:HTTP_RESPONSE_MAX_BYTES].casefold()
+        detections: set[str] = set()
+        if (
+            re.search(r"/(?:openapi|swagger)(?:[./_-]|$)", lowered_url)
+            or '"openapi"' in lowered
+            or '"swagger"' in lowered
+            or "swagger-ui" in lowered
+        ):
+            detections.add("openapi")
+        if (
+            re.search(r"/(?:graphql|graphiql)(?:[/?#]|$)", lowered_url)
+            or '"__schema"' in lowered
+            or "graphiql" in lowered
+            or "graphql-playground" in lowered
+        ):
+            detections.add("graphql")
+        return sorted(detections)
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        self.validate(context)
+        results: list[CommandResult] = []
+        for response in context.http_responses:
+            payload = {
+                "response_id": response["id"],
+                "asset_id": response["asset_id"],
+                "domain": response["domain"],
+                "url": response["url"],
+                "response_hash": response["response_hash"],
+                "content_truncated": bool(response.get("content_truncated")),
+                "detections": self._classify(response),
+            }
+            results.append(
+                CommandResult(
+                    target=str(response["id"]),
+                    stdout=json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
+                    stderr="",
+                    returncode=0,
+                    duration_ms=0,
+                )
+            )
+        return AdapterExecution(tuple(results))
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        return {"records": _parse_json_lines(execution, tool_id=self.tool_id)}
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        from cairn.server.vulnerability_services import record_collection_task_asset
+
+        created = 0
+        detections = 0
+        for record in parsed.get("records", []):
+            record_collection_task_asset(
+                context.conn,
+                context.task_id,
+                str(context.source["id"]),
+                str(record["asset_id"]),
+            )
+            if not record.get("detections"):
+                continue
+            detections += len(record["detections"])
+            created += int(
+                _record_domain_metadata(
+                    context,
+                    "web_api_discovery",
+                    str(record["domain"]),
+                    {
+                        "response_id": record["response_id"],
+                        "url": record["url"],
+                        "response_hash": record["response_hash"],
+                        "detections": record["detections"],
+                        "offline_only": True,
+                    },
+                    dimension="web",
+                    confidence=0.9,
+                )
+            )
+        return {
+            "responses_inspected": len(parsed.get("records", [])),
+            "api_surfaces_detected": detections,
+            "observations_created": created,
+        }
+
+    def coverage_complete(self, context: AdapterContext, parsed: Any) -> bool:
+        return bool(context.http_responses) and all(
+            not bool(response.get("content_truncated"))
+            for response in context.http_responses
+        )
+
+
 class NucleiPassiveResponseAdapter(DomainAdapter):
     """Run a fixed signed-template allowlist against captured HTTP responses only."""
 
@@ -2325,9 +2710,167 @@ class OsvVulnerabilityIntelligenceAdapter(VulnSourceAdapter):
         }
 
 
+class NvdKevVulnerabilityIntelligenceAdapter(VulnSourceAdapter):
+    """Enrich existing CVE findings from the official NVD and CISA KEV feeds."""
+
+    tool_id = "nvd-kev.vuln-intel.v1"
+    version = "1.0.0"
+    risk_class = "R1"
+    source_type = "nvd_kev_intelligence"
+    dimension = "intelligence"
+    binary = "curl"
+    version_args = ("--version",)
+    timeout_seconds = 30
+    uses_http = True
+    input_schema = {
+        "type": "object",
+        "required": ["vulnerabilities"],
+        "properties": {
+            "vulnerabilities": {"type": "array", "items": {"type": "object"}}
+        },
+        "additionalProperties": False,
+    }
+    output_schema = {
+        "type": "object",
+        "required": ["enrichments"],
+        "properties": {
+            "enrichments": {"type": "array", "items": {"type": "object"}}
+        },
+    }
+
+    def validate(self, context: AdapterContext) -> None:
+        super().validate(context)
+        if not context.vulnerabilities:
+            raise AdapterValidationError(
+                "NVD/KEV enrichment requires an existing Campaign CVE finding"
+            )
+        if len(context.vulnerabilities) > 20:
+            raise AdapterValidationError("NVD/KEV accepts at most 20 CVEs per task")
+        for item in context.vulnerabilities:
+            cve_id = str(item.get("cve_id") or "")
+            if not CVE_ID_PATTERN.fullmatch(cve_id):
+                raise AdapterValidationError("NVD/KEV input contains an invalid CVE ID")
+            if not item.get("finding_ids"):
+                raise AdapterValidationError("NVD/KEV input is not linked to a Finding")
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        header_args = self._curl_header_args(context)
+        common = (
+            self.binary,
+            "--silent",
+            "--show-error",
+            "--fail-with-body",
+            "--location",
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            str(self.timeout_seconds),
+            "--user-agent",
+            USER_AGENT,
+            *header_args,
+        )
+        invocations: list[AdapterInvocation] = []
+        for item in context.vulnerabilities:
+            cve_id = str(item["cve_id"]).upper()
+            invocations.extend(
+                (
+                    AdapterInvocation(
+                        argv=(
+                            *common,
+                            f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={quote(cve_id, safe='-')}",
+                        ),
+                        target=f"nvd:{cve_id}",
+                    ),
+                    AdapterInvocation(
+                        argv=(
+                            *common,
+                            "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+                        ),
+                        target=f"kev:{cve_id}",
+                    ),
+                )
+            )
+        return invocations
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        # The public NVD endpoint has a lower anonymous allowance than a typical
+        # Campaign. This is a stricter adapter cap, never a relaxation.
+        limited_context = replace(
+            context,
+            max_requests_per_second=min(2, context.max_requests_per_second),
+        )
+        return self._execute_materialized(limited_context)
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        grouped: dict[str, dict[str, Any]] = {}
+        for result in execution.results:
+            kind, separator, cve_id = str(result.target or "").partition(":")
+            if not separator or kind not in {"nvd", "kev"}:
+                raise AdapterExecutionError("NVD/KEV invocation provenance is invalid", execution)
+            try:
+                payload = json.loads(result.stdout)
+            except json.JSONDecodeError as exc:
+                raise AdapterExecutionError("NVD/KEV returned invalid JSON", execution) from exc
+            if not isinstance(payload, dict):
+                raise AdapterExecutionError("NVD/KEV response must be an object", execution)
+            item = grouped.setdefault(cve_id, {"cve_id": cve_id})
+            if kind == "nvd":
+                vulnerabilities = payload.get("vulnerabilities")
+                if not isinstance(vulnerabilities, list):
+                    raise AdapterExecutionError("NVD response has an invalid structure", execution)
+                matching = [
+                    candidate.get("cve")
+                    for candidate in vulnerabilities
+                    if isinstance(candidate, dict)
+                    and isinstance(candidate.get("cve"), dict)
+                    and str(candidate["cve"].get("id") or "").upper() == cve_id
+                ]
+                item["nvd"] = matching[0] if matching else None
+                item["nvd_complete"] = True
+            else:
+                vulnerabilities = payload.get("vulnerabilities")
+                if not isinstance(vulnerabilities, list):
+                    raise AdapterExecutionError("CISA KEV response has an invalid structure", execution)
+                item["kev"] = next(
+                    (
+                        candidate
+                        for candidate in vulnerabilities
+                        if isinstance(candidate, dict)
+                        and str(candidate.get("cveID") or "").upper() == cve_id
+                    ),
+                    None,
+                )
+                item["kev_complete"] = True
+        return {"enrichments": [grouped[key] for key in sorted(grouped)]}
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        from cairn.server.vulnerability_services import apply_nvd_kev_intelligence
+
+        return apply_nvd_kev_intelligence(
+            context.conn,
+            campaign_id=context.campaign_id,
+            task_id=context.task_id,
+            source_id=str(context.source["id"]),
+            adapter=self.tool_id,
+            vulnerabilities=list(context.vulnerabilities),
+            enrichments=list(parsed.get("enrichments", [])),
+        )
+
+    def coverage_complete(self, context: AdapterContext, parsed: Any) -> bool:
+        enrichments = parsed.get("enrichments", [])
+        return len(enrichments) == len(context.vulnerabilities) and all(
+            item.get("nvd_complete") is True and item.get("kev_complete") is True
+            for item in enrichments
+        )
+
+
 _ADAPTERS: tuple[VulnSourceAdapter, ...] = (
     CertificateTransparencyAdapter(),
     OsvVulnerabilityIntelligenceAdapter(),
+    NvdKevVulnerabilityIntelligenceAdapter(),
     SubfinderPassiveDnsAdapter(),
     AmassPassiveEnumAdapter(),
     RdapDomainAdapter(),
@@ -2335,6 +2878,8 @@ _ADAPTERS: tuple[VulnSourceAdapter, ...] = (
     DnsxResolveAdapter(),
     HttpxHttpMetadataAdapter(),
     TlsxTlsMetadataAdapter(),
+    GitleaksLocalRepositoryAdapter(),
+    SavedResponseWebApiAdapter(),
     NucleiPassiveResponseAdapter(),
     NaabuPortScanAdapter(),
     KatanaCrawlerAdapter(),

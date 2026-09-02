@@ -68,3 +68,22 @@ def test_configure_maps_disabled_bootstrap_mode_to_false(tmp_path, monkeypatch) 
         ("proj_001", 0),
         ("proj_002", 1),
     ]
+
+
+def test_migration_15_adds_validation_linkage_and_disabled_passive_sources(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "current.db"
+    monkeypatch.setattr(db, "_db_path", None)
+    db.configure(path)
+
+    with db.get_conn() as conn:
+        versions = {
+            row["version"] for row in conn.execute("SELECT version FROM schema_migrations")
+        }
+        task_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(vuln_collection_tasks)")
+        }
+    assert 15 in versions
+    assert {"finding_id", "validation_kind"} <= task_columns

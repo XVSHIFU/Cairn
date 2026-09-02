@@ -18,13 +18,16 @@ from cairn.server.vuln_adapters import (
     CertificateTransparencyAdapter,
     CommandResult,
     DnsxResolveAdapter,
+    GitleaksLocalRepositoryAdapter,
     HttpxHttpMetadataAdapter,
     KatanaCrawlerAdapter,
     NaabuPortScanAdapter,
     NucleiPassiveResponseAdapter,
+    NvdKevVulnerabilityIntelligenceAdapter,
     OsvVulnerabilityIntelligenceAdapter,
     RATE_LIMIT_RESERVATION_WINDOW_SECONDS,
     RdapDomainAdapter,
+    SavedResponseWebApiAdapter,
     SubfinderPassiveDnsAdapter,
     TlsxTlsMetadataAdapter,
     WhoisDomainAdapter,
@@ -36,6 +39,8 @@ def _context(
     *,
     targets: tuple[str, ...] = ("example.com",),
     packages: tuple[dict, ...] = (),
+    vulnerabilities: tuple[dict, ...] = (),
+    http_responses: tuple[dict, ...] = (),
     options: dict | None = None,
 ) -> AdapterContext:
     conn = sqlite3.connect(":memory:")
@@ -57,8 +62,213 @@ def _context(
         source={"id": "source-test", "name": "test-source"},
         targets=targets,
         packages=packages,
+        vulnerabilities=vulnerabilities,
+        http_responses=http_responses,
         options=options or {},
     )
+
+
+def test_saved_response_web_api_adapter_is_offline_and_detects_surfaces(
+    monkeypatch,
+) -> None:
+    response_text = (
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+        '{"openapi":"3.1.0","paths":{}}'
+    )
+    context = _context(
+        http_responses=(
+            {
+                "id": "http_response_001",
+                "asset_id": "asset_001",
+                "task_id": "capture_task_001",
+                "domain": "example.com",
+                "url": "https://example.com/openapi.json",
+                "response_text": response_text,
+                "response_hash": hashlib.sha256(response_text.encode()).hexdigest(),
+                "content_truncated": 0,
+            },
+        )
+    )
+    monkeypatch.setattr(
+        "cairn.server.vuln_adapters.subprocess.run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("offline adapter must not start a subprocess")
+        ),
+    )
+    adapter = SavedResponseWebApiAdapter()
+    execution = adapter.execute(context)
+    parsed = adapter.parse(execution)
+
+    assert parsed["records"][0]["detections"] == ["openapi"]
+    assert parsed["records"][0]["response_id"] == "http_response_001"
+    assert adapter.estimate(context)["network_request_count"] == 0
+    assert adapter.materialize(context) == []
+    assert adapter.uses_http is False
+    assert adapter.uses_network is False
+
+
+def test_nvd_kev_adapter_uses_fixed_official_https_endpoints_and_parses() -> None:
+    context = _context(
+        targets=("CVE-2026-12345",),
+        vulnerabilities=(
+            {"cve_id": "CVE-2026-12345", "finding_ids": ["finding_001"]},
+        ),
+    )
+    adapter = NvdKevVulnerabilityIntelligenceAdapter()
+    invocations = adapter.materialize(context)
+
+    assert len(invocations) == 2
+    assert invocations[0].target == "nvd:CVE-2026-12345"
+    assert invocations[0].argv[-1] == (
+        "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-2026-12345"
+    )
+    assert invocations[1].target == "kev:CVE-2026-12345"
+    assert invocations[1].argv[-1] == (
+        "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+    )
+    assert all("http://" not in argument for item in invocations for argument in item.argv)
+    parsed = adapter.parse(
+        AdapterExecution(
+            (
+                CommandResult(
+                    target="nvd:CVE-2026-12345",
+                    stdout=json.dumps(
+                        {
+                            "vulnerabilities": [
+                                {
+                                    "cve": {
+                                        "id": "CVE-2026-12345",
+                                        "metrics": {
+                                            "cvssMetricV31": [
+                                                {
+                                                    "type": "Primary",
+                                                    "cvssData": {
+                                                        "baseScore": 8.1,
+                                                        "baseSeverity": "HIGH",
+                                                    },
+                                                }
+                                            ]
+                                        },
+                                    }
+                                }
+                            ]
+                        }
+                    ),
+                    stderr="",
+                    returncode=0,
+                    duration_ms=1,
+                ),
+                CommandResult(
+                    target="kev:CVE-2026-12345",
+                    stdout=json.dumps(
+                        {
+                            "vulnerabilities": [
+                                {
+                                    "cveID": "CVE-2026-12345",
+                                    "vulnerabilityName": "Mock KEV entry",
+                                }
+                            ]
+                        }
+                    ),
+                    stderr="",
+                    returncode=0,
+                    duration_ms=1,
+                ),
+            )
+        )
+    )
+    assert parsed["enrichments"][0]["nvd"]["id"] == "CVE-2026-12345"
+    assert parsed["enrichments"][0]["kev"]["vulnerabilityName"] == "Mock KEV entry"
+    assert adapter.coverage_complete(context, parsed) is True
+
+
+def test_gitleaks_adapter_is_local_redacted_and_path_allowlisted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    allowed_root = tmp_path / "authorized"
+    repository = allowed_root / "repository"
+    repository.mkdir(parents=True)
+    binary = tmp_path / "gitleaks"
+    binary.write_bytes(b"pinned-gitleaks-test-binary")
+    monkeypatch.setenv("CAIRN_GITLEAKS_ALLOWED_ROOTS", str(allowed_root))
+    monkeypatch.setattr(
+        "cairn.server.vuln_adapters.GITLEAKS_BINARY_SHA256",
+        hashlib.sha256(binary.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setattr(
+        "cairn.server.vuln_adapters.shutil.which", lambda value: str(binary)
+    )
+    context = _context(
+        targets=(str(repository),),
+    )
+    context = AdapterContext(
+        **{
+            **context.__dict__,
+            "repositories": (
+                {"asset_id": "asset-repository", "path": str(repository)},
+            ),
+        }
+    )
+    adapter = GitleaksLocalRepositoryAdapter()
+    adapter.binary = str(binary)
+    invocation = adapter.materialize(context)[0]
+    assert invocation.argv[-1] == str(repository.resolve())
+    assert "--redact=100" in invocation.argv
+    assert "--follow-symlinks" not in invocation.argv
+    assert "--max-decode-depth" in invocation.argv
+    assert adapter.uses_network is False
+    assert adapter.uses_http is False
+    assert adapter.requires_human_approval is True
+    assert adapter.health()["healthy"] is True
+
+    secret = "this-must-never-be-persisted"
+    monkeypatch.setattr(
+        "cairn.server.vuln_adapters.subprocess.run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv,
+            0,
+            json.dumps(
+                [
+                    {
+                        "RuleID": "generic-api-key",
+                        "Description": "Generic API key",
+                        "File": "config/settings.py",
+                        "StartLine": 7,
+                        "EndLine": 7,
+                        "Commit": "abc123",
+                        "Secret": secret,
+                        "Match": f"token={secret}",
+                    }
+                ]
+            ),
+            "",
+        ),
+    )
+    parsed = adapter.parse(adapter.execute(context))
+    serialized = json.dumps(parsed, sort_keys=True)
+    assert secret not in serialized
+    assert parsed["findings"][0]["file"] == "config/settings.py"
+    assert parsed["findings"][0]["redacted"] is True
+
+
+def test_gitleaks_adapter_rejects_repository_outside_allowed_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    allowed_root = tmp_path / "authorized"
+    outside = tmp_path / "outside"
+    allowed_root.mkdir()
+    outside.mkdir()
+    monkeypatch.setenv("CAIRN_GITLEAKS_ALLOWED_ROOTS", str(allowed_root))
+    context = AdapterContext(
+        **{
+            **_context(targets=(str(outside),)).__dict__,
+            "repositories": (
+                {"asset_id": "asset-repository", "path": str(outside)},
+            ),
+        }
+    )
+    with pytest.raises(AdapterValidationError, match="outside configured"):
+        GitleaksLocalRepositoryAdapter().validate(context)
 
 
 ADAPTER_CASES = (
@@ -281,6 +491,9 @@ def test_adapter_registry_exposes_complete_lifecycle_metadata() -> None:
         "nuclei.passive-response.v1",
         "naabu.port-scan.v1",
         "katana.crawler.v1",
+        "nvd-kev.vuln-intel.v1",
+        "webapi.saved-response.v1",
+        "gitleaks.secrets.v1",
     }
     for tool_id, adapter in ADAPTER_REGISTRY.items():
         assert adapter.tool_id == tool_id
