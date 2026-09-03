@@ -3810,6 +3810,14 @@ def _record_linked_asset_metadata(
     return existing is None
 
 
+def _is_ip_literal(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
 class CloudInventoryArtifactAdapter(VulnSourceAdapter):
     """Normalize a bounded, operator-exported cloud inventory without retaining secrets."""
 
@@ -3898,15 +3906,7 @@ class CloudInventoryArtifactAdapter(VulnSourceAdapter):
             return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
         try:
             ipaddress.ip_address(candidate)
-    return candidate
-
-
-def _is_ip_literal(value: str) -> bool:
-    try:
-        ipaddress.ip_address(value)
-        return True
-    except ValueError:
-        return False
+            return candidate
         except ValueError:
             try:
                 return normalize_domain(candidate)
