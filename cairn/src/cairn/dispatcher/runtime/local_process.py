@@ -7,7 +7,12 @@ import subprocess
 import threading
 from contextlib import suppress
 
-from cairn.dispatcher.runtime.process import ProcessResult
+from cairn.dispatcher.runtime.process import (
+    BoundedTextBuffer,
+    DEFAULT_WORKER_STDERR_LIMIT_BYTES,
+    DEFAULT_WORKER_STDOUT_LIMIT_BYTES,
+    ProcessResult,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -32,6 +37,8 @@ class LocalProcess:
         env: dict[str, str],
         timeout_seconds: int | None = None,
         term_grace_seconds: int = 5,
+        max_stdout_bytes: int = DEFAULT_WORKER_STDOUT_LIMIT_BYTES,
+        max_stderr_bytes: int = DEFAULT_WORKER_STDERR_LIMIT_BYTES,
     ):
         self.command = command
         self.env = env
@@ -39,31 +46,35 @@ class LocalProcess:
         self._timeout_seconds = timeout_seconds
         self._term_grace = max(1.0, float(term_grace_seconds))
         self._process: subprocess.Popen[str] | None = None
-        self._stdout_chunks: list[str] = []
-        self._stderr_chunks: list[str] = []
+        self._stdout = BoundedTextBuffer(max_stdout_bytes)
+        self._stderr = BoundedTextBuffer(max_stderr_bytes)
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._timed_out = False
         self._cancel_reason: str | None = None
         self._kill_lock = threading.Lock()
+        self._output_limit_exceeded = threading.Event()
 
     def start(self) -> None:
-        self._process = subprocess.Popen(
-            self.command,
-            cwd=self._cwd,
-            env=self.env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            start_new_session=True,
-        )
+        process_kwargs = {
+            "cwd": self._cwd,
+            "env": self.env,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+        }
+        if os.name == "posix":
+            process_kwargs["start_new_session"] = True
+        elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+            process_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        self._process = subprocess.Popen(self.command, **process_kwargs)
         self._stdout_thread = threading.Thread(
-            target=self._drain, args=(self._process.stdout, self._stdout_chunks), daemon=True
+            target=self._drain, args=(self._process.stdout, self._stdout), daemon=True
         )
         self._stderr_thread = threading.Thread(
-            target=self._drain, args=(self._process.stderr, self._stderr_chunks), daemon=True
+            target=self._drain, args=(self._process.stderr, self._stderr), daemon=True
         )
         self._stdout_thread.start()
         self._stderr_thread.start()
@@ -85,13 +96,24 @@ class LocalProcess:
         returncode = self._process.returncode
         if returncode is None:
             returncode = 137 if self._timed_out else 1
+        stderr = self._stderr.text()
+        if self._output_limit_exceeded.is_set():
+            stderr = (
+                stderr
+                + "\nCairn stopped the worker because its stdout/stderr byte limit was exceeded."
+            ).lstrip()
+            if returncode == 0:
+                returncode = 1
         return ProcessResult(
             returncode=returncode,
-            stdout="".join(self._stdout_chunks),
-            stderr="".join(self._stderr_chunks),
+            stdout=self._stdout.text(),
+            stderr=stderr,
             timed_out=self._timed_out,
             cancelled=self._cancel_reason is not None,
             cancel_reason=self._cancel_reason,
+            output_limit_exceeded=self._output_limit_exceeded.is_set(),
+            stdout_bytes=self._stdout.byte_count,
+            stderr_bytes=self._stderr.byte_count,
         )
 
     def kill(self) -> None:
@@ -113,21 +135,31 @@ class LocalProcess:
                 return
             except subprocess.TimeoutExpired:
                 pass
-            self._signal_group(process, signal.SIGKILL)
+            if os.name == "posix":
+                self._signal_group(process, signal.SIGKILL)
+            else:
+                with suppress(ProcessLookupError, PermissionError, ValueError):
+                    process.kill()
 
     @staticmethod
     def _signal_group(process: subprocess.Popen[str], sig: int) -> None:
+        if os.name != "posix":
+            with suppress(ProcessLookupError, PermissionError, ValueError):
+                process.terminate()
+            return
         try:
             os.killpg(os.getpgid(process.pid), sig)
         except (ProcessLookupError, PermissionError):
             with suppress(ProcessLookupError, PermissionError, ValueError):
                 process.send_signal(sig)
 
-    @staticmethod
-    def _drain(pipe, sink: list[str]) -> None:
+    def _drain(self, pipe, sink: BoundedTextBuffer) -> None:
         try:
             for chunk in iter(lambda: pipe.read(READ_CHUNK_SIZE), ""):
-                sink.append(chunk)
+                if not sink.append(chunk):
+                    self._output_limit_exceeded.set()
+                    self._terminate()
+                    break
         except (ValueError, OSError):
             pass
         finally:

@@ -787,6 +787,41 @@ CREATE INDEX IF NOT EXISTS idx_vuln_autonomy_usage_daily
 ON vuln_autonomy_usage_events(contract_id, created_at, target);
 """
 
+VULNERABILITY_AUTONOMY_HEALTH_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS vuln_autonomy_health (
+    campaign_id TEXT PRIMARY KEY REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    state TEXT NOT NULL DEFAULT 'active',
+    consecutive_no_progress INTEGER NOT NULL DEFAULT 0,
+    consecutive_repeated_suggestions INTEGER NOT NULL DEFAULT 0,
+    recovery_attempts INTEGER NOT NULL DEFAULT 0,
+    degraded_until TEXT,
+    last_analysis_id TEXT REFERENCES vuln_ai_analyses(id) ON DELETE SET NULL,
+    last_suggestion_digest TEXT,
+    last_progress_json TEXT NOT NULL DEFAULT '{}',
+    reason TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vuln_autonomy_cycles (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    analysis_id TEXT REFERENCES vuln_ai_analyses(id) ON DELETE SET NULL,
+    cycle_kind TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    progress_score INTEGER NOT NULL DEFAULT 0,
+    suggestion_digest TEXT,
+    repeated_suggestions INTEGER NOT NULL DEFAULT 0,
+    consecutive_no_progress INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(analysis_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_autonomy_cycles_campaign
+ON vuln_autonomy_cycles(campaign_id, created_at DESC);
+"""
+
 VULNERABILITY_RESEARCH_REGISTRY_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS vuln_research_manifest_runs (
     id TEXT PRIMARY KEY,
@@ -2285,6 +2320,13 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES "
             "(32, 'vulnerability_oci_registry_manifest_source', "
+            "strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 33 not in applied:
+        conn.executescript(VULNERABILITY_AUTONOMY_HEALTH_SCHEMA)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES "
+            "(33, 'vulnerability_autonomy_health_and_recovery', "
             "strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
         )
 

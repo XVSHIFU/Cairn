@@ -138,6 +138,8 @@ uv run --project cairn cairn dispatch --config dispatch.yaml # 调度器
 
 本地模式通过 `runtime.execution: local` 开启（参见 `dispatch.local.example.yaml`）。调度器启动时检查每个配置的 Worker CLI 是否可执行，并提示它们必须已登录。每个项目在 `local.workspace_root`（默认：调度器当前目录）下获得独立工作目录。**请直接在宿主机上运行调度器，不要放进 Docker**——Agent 将以你的用户权限运行且无沙箱。
 
+漏洞分析 profile 采用更严格边界：本地运行必须关闭任意宿主环境继承，且不允许使用仍可读取宿主文件的本地 Codex driver；生产配置优先使用 `enforce_isolation: true` 的容器模式。Worker 的 stdout/stderr 都有字节硬上限，超限会终止整个进程组并按失败处理。
+
 ### 方式二：Docker Compose（容器模式）
 
 ```bash
@@ -146,6 +148,8 @@ docker compose up --build
 ```
 
 这会启动 `cairn-server:8000`，待其通过健康检查后启动 `cairn-dispatcher`。dispatcher 挂载项目根目录的 `dispatch.yaml`，通过宿主机 docker.sock 连接 Docker。数据持久化到 `./datas/cairn/`。
+
+漏洞分析容器使用只读根文件系统、删除全部 Linux capabilities、`no-new-privileges`、PID/内存/CPU 上限及有界 `/tmp`。已有项目容器不满足同一隔离版本时会拒绝复用，需由运维移除后按当前配置重建。
 
 ### 方式三：手动
 

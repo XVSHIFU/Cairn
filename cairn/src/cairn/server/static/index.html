@@ -721,6 +721,17 @@
             </template>
           </div>
 
+          <article class="rounded-2xl border p-4 shadow-sm" :class="vulnerabilityAutonomyHealth.state === 'active' ? 'border-emerald-100 bg-emerald-50/60' : (vulnerabilityAutonomyHealth.state === 'needs_review' ? 'border-rose-200 bg-rose-50' : 'border-amber-200 bg-amber-50')">
+            <div class="flex flex-col gap-3 sm:flex-row sm:items-center">
+              <div class="min-w-0 flex-1">
+                <div class="flex flex-wrap items-center gap-2"><h3 class="text-sm font-semibold text-slate-800" x-text="t('vulnAutonomyHealthTitle')"></h3><span class="rounded-full border border-current/20 bg-white px-2 py-0.5 text-[10px] font-semibold" x-text="vulnerabilityAutonomyHealth.state"></span></div>
+                <p class="mt-1 text-[11px] text-slate-600" x-text="vulnerabilityAutonomyHealth.reason || t('vulnAutonomyHealthHealthy')"></p>
+                <p class="mt-2 text-[10px] text-slate-500" x-text="t('vulnAutonomyHealthCounts', {noProgress:vulnerabilityAutonomyHealth.consecutive_no_progress || 0, repeated:vulnerabilityAutonomyHealth.consecutive_repeated_suggestions || 0, recovery:vulnerabilityAutonomyHealth.recovery_attempts || 0})"></p>
+              </div>
+              <button x-show="vulnerabilityAutonomyHealth.state === 'needs_review'" @click="vulnerabilityRecoverAutonomy()" class="shrink-0 rounded-lg bg-rose-700 px-3 py-2 text-xs font-medium text-white" x-text="t('vulnAutonomyRecover')"></button>
+            </div>
+          </article>
+
           <template x-for="group in vulnerabilityScopeExceptions" :key="group.id">
             <article class="rounded-2xl border border-amber-200 bg-amber-50 p-4 shadow-sm">
               <div class="flex flex-col gap-3 sm:flex-row sm:items-center">
@@ -2077,6 +2088,7 @@ const CAIRN_I18N = {
     vulnNoMatchingAssets:"No assets match these filters.", vulnAssetPageSummary:"{from}–{to} of {total} assets",
     vulnCollectionTaskCenter:"Collection task center", vulnCollectionTaskCenterHint:"Review queue state and make audited approval decisions.", vulnNoCollectionTasks:"No collection tasks match this status.",
     vulnQueueBacklogAlert:"Collection queue backlog alert", vulnQueueBacklogHealthy:"Collection queue healthy", vulnQueueBacklogSummary:"{queueBacklog} waiting · alert threshold {queueAlertThreshold}", vulnQueueRunning:"running",
+    vulnAutonomyHealthTitle:"Autonomy health", vulnAutonomyHealthHealthy:"The bounded autonomous loop is healthy.", vulnAutonomyHealthCounts:"No-progress {noProgress} · repeated suggestions {repeated} · recovery attempts {recovery}", vulnAutonomyRecover:"Approve recovery", vulnAutonomyRecoveryReason:"Reason for approving autonomous-loop recovery", vulnAutonomyRecovered:"Autonomous analysis has been reset to active.",
     vulnPolicyApproved:"Policy approved", vulnAttempts:"Attempts", vulnApproval:"Approval", vulnCreated:"Created", vulnReject:"Reject", vulnApprove:"Approve",
     vulnReconHypothesesHint:"AI-generated leads remain unconfirmed until evidence validates them.", vulnRecentVulnIntel:"Recent vulnerability intelligence", vulnRecentVulnIntelHint:"Latest dependency and identifier-linked findings.", vulnNoVulnIntel:"No vulnerability intelligence findings yet.",
     vulnAssetDetail:"Asset details", vulnAssetDetailLoading:"Loading asset evidence and coverage...", vulnFirstSeen:"First seen", vulnLastSeen:"Last seen",
@@ -2267,6 +2279,7 @@ const CAIRN_I18N = {
     vulnNoMatchingAssets:"没有资产符合当前筛选条件。", vulnAssetPageSummary:"共 {total} 个资产，当前 {from}–{to}",
     vulnCollectionTaskCenter:"采集任务中心", vulnCollectionTaskCenterHint:"查看队列状态并完成可审计的审批决策。", vulnNoCollectionTasks:"当前状态下没有采集任务。",
     vulnQueueBacklogAlert:"采集队列积压告警", vulnQueueBacklogHealthy:"采集队列健康", vulnQueueBacklogSummary:"待处理 {queueBacklog} 条 · 告警阈值 {queueAlertThreshold}", vulnQueueRunning:"执行中",
+    vulnAutonomyHealthTitle:"自治健康状态", vulnAutonomyHealthHealthy:"有界自治循环运行正常。", vulnAutonomyHealthCounts:"连续无进展 {noProgress} · 重复建议 {repeated} · 恢复尝试 {recovery}", vulnAutonomyRecover:"批准恢复", vulnAutonomyRecoveryReason:"填写批准自治循环恢复的理由", vulnAutonomyRecovered:"自治分析已恢复为活动状态。",
     vulnPolicyApproved:"策略自动批准", vulnAttempts:"尝试次数", vulnApproval:"审批", vulnCreated:"创建时间", vulnReject:"拒绝", vulnApprove:"通过",
     vulnReconHypothesesHint:"AI 生成的线索仍属未确认假设，需要证据验证。", vulnRecentVulnIntel:"最近关联漏洞", vulnRecentVulnIntelHint:"最近发现的依赖漏洞与漏洞编号关联。", vulnNoVulnIntel:"尚无关联漏洞情报。",
     vulnAssetDetail:"资产详情", vulnAssetDetailLoading:"正在加载资产证据与覆盖情况...", vulnFirstSeen:"首次发现", vulnLastSeen:"最近发现",

@@ -888,6 +888,11 @@ codex exec resume "{session}" --dangerously-bypass-approvals-and-sandbox --model
 | `container.image` | 是 | 项目容器镜像 |
 | `container.network_mode` | 是 | 项目容器网络模式 |
 | `container.completed_action` | 是 | 项目 completed 后对容器的处理方式 |
+| `container.enforce_isolation` | 否 | 是否在复用容器前校验 Cairn 隔离标签、只读根、capabilities、no-new-privileges 和资源限制；漏洞 profile 必须为 `true` |
+| `container.read_only` / `cap_drop` / `security_opt` | 否 | 默认启用只读根、`cap_drop: [ALL]` 和 `no-new-privileges:true`；漏洞 profile 禁止新增 capability |
+| `container.pids_limit` / `memory_limit` / `nano_cpus` | 否 | Worker 容器的 PID、内存和 CPU 硬上限 |
+| `container.tmpfs_size_mb` | 否 | 只读容器中 `/tmp` 的有界 tmpfs，带 `nosuid,nodev,noexec` |
+| `container.max_stdout_bytes` / `max_stderr_bytes` | 否 | Worker 流式输出硬上限；超过任一上限立即终止执行 |
 
 `container.completed_action` 可选值：
 
@@ -898,6 +903,7 @@ codex exec resume "{session}" --dangerously-bypass-approvals-and-sandbox --model
 
 - completed project 的容器 cleanup 可以异步并行进行，不要求阻塞主调度循环
 - 如果项目已从 Server 删除，Dispatcher 会把找不到对应项目的 `cairn-dispatch-*` 容器视为 orphan，并执行 stop 清理
+- `enforce_isolation` 开启后，旧容器缺少隔离版本标签或任一硬边界会 fail-closed，不会静默复用
 
 ### `local.*`
 
@@ -907,6 +913,10 @@ codex exec resume "{session}" --dangerously-bypass-approvals-and-sandbox --model
 | --- | --- | --- |
 | `local.workspace_root` | 否 | 每项目工作目录的根；不填则取 dispatcher 启动时的当前目录，每项目分到隔离子目录 `<root>/<project_id>/` 作为 worker 进程的工作目录 |
 | `local.completed_action` | 否 | 项目 completed 后对工作目录的处理：`keep`（默认，保留现场）或 `remove` |
+| `local.inherit_host_environment` | 否 | 是否继承完整宿主环境；漏洞 profile 必须为 `false`，此时只保留 CLI/OS 必需变量和显式 worker env |
+| `local.max_stdout_bytes` / `max_stderr_bytes` | 否 | 本地 Worker 流式输出硬上限；超限终止进程组 |
+
+`runtime.profile: vulnerability` 只允许 `vulnerability_analysis` 任务。其本地模式禁止 Codex driver，因为只读沙箱仍可读取宿主文件；Claude Code 和 Pi 的分析命令关闭工具，并配合最小环境运行。生产漏洞分析应优先使用强制隔离容器。
 
 ### `tasks.*`
 

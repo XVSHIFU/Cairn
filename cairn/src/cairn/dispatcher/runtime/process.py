@@ -12,6 +12,36 @@ from docker.models.containers import Container
 
 LOG = logging.getLogger(__name__)
 EXEC_KILL_JOIN_TIMEOUT_SECONDS = 5.0
+DEFAULT_WORKER_STDOUT_LIMIT_BYTES = 2_000_000
+DEFAULT_WORKER_STDERR_LIMIT_BYTES = 512_000
+
+
+class BoundedTextBuffer:
+    """Retain a UTF-8 prefix while detecting output beyond a hard byte limit."""
+
+    def __init__(self, maximum_bytes: int) -> None:
+        if maximum_bytes < 1:
+            raise ValueError("output limit must be positive")
+        self.maximum_bytes = maximum_bytes
+        self.byte_count = 0
+        self.retained_bytes = 0
+        self.truncated = False
+        self._chunks: list[str] = []
+
+    def append(self, value: str) -> bool:
+        encoded = value.encode("utf-8", errors="replace")
+        self.byte_count += len(encoded)
+        remaining = self.maximum_bytes - self.retained_bytes
+        if remaining > 0:
+            retained = encoded[:remaining].decode("utf-8", errors="ignore")
+            self._chunks.append(retained)
+            self.retained_bytes += len(retained.encode("utf-8"))
+        if len(encoded) > max(0, remaining):
+            self.truncated = True
+        return not self.truncated
+
+    def text(self) -> str:
+        return "".join(self._chunks)
 
 
 @dataclass(slots=True)
@@ -22,6 +52,9 @@ class ProcessResult:
     timed_out: bool = False
     cancelled: bool = False
     cancel_reason: str | None = None
+    output_limit_exceeded: bool = False
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
 
 
 @runtime_checkable
@@ -42,20 +75,29 @@ class ExecProcess(Protocol):
 
 
 class ManagedProcess:
-    def __init__(self, container: Container, command: list[str], env: dict[str, str]):
+    def __init__(
+        self,
+        container: Container,
+        command: list[str],
+        env: dict[str, str],
+        *,
+        max_stdout_bytes: int = DEFAULT_WORKER_STDOUT_LIMIT_BYTES,
+        max_stderr_bytes: int = DEFAULT_WORKER_STDERR_LIMIT_BYTES,
+    ):
         self.command = command
         self.env = env
         self._container = container
         self._api = container.client.api
         self._exec_id: str | None = None
         self._reader: threading.Thread | None = None
-        self._stdout: list[str] = []
-        self._stderr: list[str] = []
+        self._stdout = BoundedTextBuffer(max_stdout_bytes)
+        self._stderr = BoundedTextBuffer(max_stderr_bytes)
         self._returncode: int | None = None
         self._timed_out = False
         self._cancel_reason: str | None = None
         self._read_error: str | None = None
         self._done = threading.Event()
+        self._output_limit_exceeded = threading.Event()
 
     def start(self) -> None:
         exec_info = self._api.exec_create(
@@ -83,15 +125,27 @@ class ManagedProcess:
                 self._returncode = 137
             self._done.set()
         self._done.wait(timeout=0)
-        if self._read_error and not self._stderr:
-            self._stderr.append(self._read_error)
+        stderr = self._stderr.text()
+        if self._read_error and not stderr:
+            stderr = self._read_error
+        if self._output_limit_exceeded.is_set():
+            stderr = (
+                stderr
+                + "\nCairn stopped the worker because its stdout/stderr byte limit was exceeded."
+            ).lstrip()
+        returncode = self._returncode if self._returncode is not None else 1
+        if self._output_limit_exceeded.is_set() and returncode == 0:
+            returncode = 1
         return ProcessResult(
-            returncode=self._returncode if self._returncode is not None else 1,
-            stdout="".join(self._stdout),
-            stderr="".join(self._stderr),
+            returncode=returncode,
+            stdout=self._stdout.text(),
+            stderr=stderr,
             timed_out=self._timed_out,
             cancelled=self._cancel_reason is not None,
             cancel_reason=self._cancel_reason,
+            output_limit_exceeded=self._output_limit_exceeded.is_set(),
+            stdout_bytes=self._stdout.byte_count,
+            stderr_bytes=self._stderr.byte_count,
         )
 
     def kill(self) -> None:
@@ -128,10 +182,15 @@ class ManagedProcess:
             )
             for chunk in stream:
                 stdout, stderr = self._split_chunk(chunk)
+                within_limit = True
                 if stdout:
-                    self._stdout.append(stdout)
+                    within_limit = self._stdout.append(stdout) and within_limit
                 if stderr:
-                    self._stderr.append(stderr)
+                    within_limit = self._stderr.append(stderr) and within_limit
+                if not within_limit:
+                    self._output_limit_exceeded.set()
+                    self.kill()
+                    break
         except DockerException as exc:
             self._read_error = str(exc)
         finally:

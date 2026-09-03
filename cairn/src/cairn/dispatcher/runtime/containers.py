@@ -5,6 +5,7 @@ import logging
 from pathlib import PurePosixPath
 import tarfile
 import threading
+from typing import Any
 
 import docker
 from docker.errors import APIError, DockerException, NotFound
@@ -18,6 +19,8 @@ LOG = logging.getLogger(__name__)
 
 class ContainerManager:
     _PREFIX = "cairn-dispatch-"
+    _ISOLATION_LABEL = "cairn.worker-isolation"
+    _ISOLATION_VERSION = "v1"
 
     def __init__(self, config: ContainerConfig):
         self._config = config
@@ -40,9 +43,11 @@ class ContainerManager:
     def _ensure_running_locked(self, project_id: str, name: str) -> str:
         state = self.inspect_state(name)
         if state == "running":
+            self._verify_isolation(name)
             LOG.debug("container already running project=%s container=%s", project_id, name)
             return name
         if state is not None:
+            self._verify_isolation(name)
             LOG.info("starting existing container project=%s container=%s state=%s", project_id, name, state)
             self._start_existing(name)
             return name
@@ -55,6 +60,22 @@ class ContainerManager:
                 name=name,
                 network_mode=self._config.network_mode,
                 cap_add=self._config.cap_add or None,
+                cap_drop=self._config.cap_drop or None,
+                security_opt=self._config.security_opt or None,
+                read_only=self._config.read_only,
+                pids_limit=self._config.pids_limit,
+                mem_limit=self._config.memory_limit,
+                nano_cpus=self._config.nano_cpus,
+                tmpfs={
+                    "/tmp": (
+                        "rw,nosuid,nodev,noexec,mode=1777,"
+                        f"size={self._config.tmpfs_size_mb}m"
+                    )
+                },
+                labels={
+                    "cairn.managed": "true",
+                    self._ISOLATION_LABEL: self._ISOLATION_VERSION,
+                },
             )
             LOG.info("created container project=%s container=%s", project_id, name)
             return name
@@ -64,8 +85,10 @@ class ContainerManager:
         LOG.info("container name conflict, reusing existing container project=%s container=%s", project_id, name)
         state = self.inspect_state(name)
         if state == "running":
+            self._verify_isolation(name)
             return name
         if state is not None:
+            self._verify_isolation(name)
             LOG.info("starting conflicted existing container project=%s container=%s state=%s", project_id, name, state)
             self._start_existing(name)
             return name
@@ -89,6 +112,43 @@ class ContainerManager:
             raise RuntimeError(f"failed to inspect container {name}: {exc}") from exc
         state = container.attrs.get("State", {}).get("Status")
         return str(state) if state else None
+
+    def _verify_isolation(self, name: str) -> None:
+        if not self._config.enforce_isolation:
+            return
+        container = self._require_container(name)
+        try:
+            container.reload()
+        except DockerException as exc:
+            raise RuntimeError(f"failed to inspect isolation for {name}: {exc}") from exc
+        attrs: dict[str, Any] = container.attrs or {}
+        labels = attrs.get("Config", {}).get("Labels") or {}
+        host = attrs.get("HostConfig") or {}
+        cap_drop = {str(item).upper() for item in host.get("CapDrop") or []}
+        security_opt = {str(item) for item in host.get("SecurityOpt") or []}
+        violations: list[str] = []
+        if labels.get(self._ISOLATION_LABEL) != self._ISOLATION_VERSION:
+            violations.append("isolation label")
+        if host.get("ReadonlyRootfs") is not True:
+            violations.append("read-only root")
+        if "ALL" not in cap_drop:
+            violations.append("cap_drop=ALL")
+        if host.get("CapAdd"):
+            violations.append("added capabilities")
+        if "no-new-privileges:true" not in security_opt:
+            violations.append("no-new-privileges")
+        if int(host.get("PidsLimit") or 0) < 1:
+            violations.append("PID limit")
+        if int(host.get("Memory") or 0) < 1:
+            violations.append("memory limit")
+        if int(host.get("NanoCpus") or 0) < 1:
+            violations.append("CPU limit")
+        if violations:
+            raise RuntimeError(
+                f"existing worker container {name} fails isolation checks: "
+                + ", ".join(violations)
+                + "; remove it and let Cairn recreate it"
+            )
 
     def cleanup_completed(self, project_id: str) -> bool:
         name = self.container_name(project_id)
@@ -192,7 +252,21 @@ class ContainerManager:
                 ]
             )
         argv.extend(command)
-        return ManagedProcess(container, argv, env)
+        process_env = {
+            **env,
+            "HOME": "/tmp",
+            "TMPDIR": "/tmp",
+            "XDG_CACHE_HOME": "/tmp/.cache",
+            "XDG_CONFIG_HOME": "/tmp/.config",
+            "XDG_DATA_HOME": "/tmp/.local/share",
+        }
+        return ManagedProcess(
+            container,
+            argv,
+            process_env,
+            max_stdout_bytes=self._config.max_stdout_bytes,
+            max_stderr_bytes=self._config.max_stderr_bytes,
+        )
 
     def write_text_file(self, container_name: str, path: str, content: str) -> None:
         archive_path, archive = self._text_file_archive(path, content)

@@ -216,11 +216,24 @@ class ContainerConfig(BaseModel):
     network_mode: str
     completed_action: CompletedAction
     cap_add: list[str] = Field(default_factory=list)
+    cap_drop: list[str] = Field(default_factory=lambda: ["ALL"])
+    security_opt: list[str] = Field(default_factory=lambda: ["no-new-privileges:true"])
+    read_only: bool = True
+    pids_limit: int = Field(default=128, ge=16, le=1024)
+    memory_limit: str = Field(default="1g", pattern=r"^[1-9][0-9]*(?:[kKmMgG])?$")
+    nano_cpus: int = Field(default=1_000_000_000, ge=100_000_000, le=8_000_000_000)
+    tmpfs_size_mb: int = Field(default=256, ge=16, le=4096)
+    enforce_isolation: bool = False
+    max_stdout_bytes: int = Field(default=2_000_000, ge=65_536, le=16_000_000)
+    max_stderr_bytes: int = Field(default=512_000, ge=16_384, le=4_000_000)
 
 
 class LocalConfig(BaseModel):
     workspace_root: str | None = None
     completed_action: LocalCompletedAction = "keep"
+    inherit_host_environment: bool = True
+    max_stdout_bytes: int = Field(default=2_000_000, ge=65_536, le=16_000_000)
+    max_stderr_bytes: int = Field(default=512_000, ge=16_384, le=4_000_000)
 
 
 class RuntimeConfig(BaseModel):
@@ -320,9 +333,35 @@ class DispatchConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_execution_mode(self) -> "DispatchConfig":
+        if self.runtime.profile == "vulnerability":
+            invalid_workers = [
+                worker.name
+                for worker in self.workers
+                if any(task != "vulnerability_analysis" for task in worker.task_types)
+            ]
+            if invalid_workers:
+                raise ValueError(
+                    "vulnerability profile workers may only run vulnerability_analysis: "
+                    + ", ".join(invalid_workers)
+                )
         if self.runtime.execution == "container":
             if self.container is None:
                 raise ValueError("container config is required when runtime.execution is container")
+            if self.runtime.profile == "vulnerability":
+                if not self.container.enforce_isolation:
+                    raise ValueError(
+                        "vulnerability container execution requires enforce_isolation=true"
+                    )
+                if (
+                    not self.container.read_only
+                    or "ALL" not in {item.upper() for item in self.container.cap_drop}
+                    or "no-new-privileges:true" not in self.container.security_opt
+                    or self.container.cap_add
+                ):
+                    raise ValueError(
+                        "vulnerability containers require a read-only root, cap_drop ALL, "
+                        "no-new-privileges, and no added capabilities"
+                    )
             for worker in self.workers:
                 required = WORKER_ENV_KEYS[worker.type]
                 missing = [key for key in required if not worker.env.get(key)]
@@ -331,6 +370,22 @@ class DispatchConfig(BaseModel):
         else:  # local: workers reuse the host CLI config, so no LLM env keys are required
             if self.local is None:
                 self.local = LocalConfig()
+            if self.runtime.profile == "vulnerability":
+                if self.local.inherit_host_environment:
+                    raise ValueError(
+                        "vulnerability local execution requires "
+                        "inherit_host_environment=false"
+                    )
+                local_codex = [
+                    worker.name for worker in self.workers if worker.type == "codex"
+                ]
+                if local_codex:
+                    raise ValueError(
+                        "local Codex is not allowed for vulnerability analysis because "
+                        "its read-only sandbox can still inspect host files; use an "
+                        "isolated container: "
+                        + ", ".join(local_codex)
+                    )
         return self
 
     @classmethod

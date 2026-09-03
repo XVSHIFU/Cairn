@@ -9,6 +9,35 @@ from cairn.dispatcher.config import LocalConfig
 from cairn.dispatcher.runtime.local_process import LocalProcess
 
 LOG = logging.getLogger(__name__)
+LOCAL_WORKER_ENV_ALLOWLIST = frozenset(
+    {
+        "ALL_PROXY",
+        "APPDATA",
+        "COMSPEC",
+        "HOME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "LANG",
+        "LC_ALL",
+        "LOCALAPPDATA",
+        "LOGNAME",
+        "NO_PROXY",
+        "PATH",
+        "PATHEXT",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "USER",
+        "USERPROFILE",
+        "WINDIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+    }
+)
 
 
 class LocalBackend:
@@ -46,13 +75,22 @@ class LocalBackend:
         timeout_seconds: int | None = None,
         kill_after_seconds: int = 5,
     ) -> LocalProcess:
-        merged_env = {**os.environ, **(env or {})}
+        host_env = dict(os.environ)
+        if not self._config.inherit_host_environment:
+            host_env = {
+                key: value
+                for key, value in host_env.items()
+                if key.upper() in LOCAL_WORKER_ENV_ALLOWLIST
+            }
+        merged_env = {**host_env, **(env or {})}
         return LocalProcess(
             command,
             cwd=container_name,
             env=merged_env,
             timeout_seconds=timeout_seconds,
             term_grace_seconds=kill_after_seconds,
+            max_stdout_bytes=self._config.max_stdout_bytes,
+            max_stderr_bytes=self._config.max_stderr_bytes,
         )
 
     def write_text_file(self, container_name: str, path: str, content: str) -> None:
