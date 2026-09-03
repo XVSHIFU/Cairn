@@ -740,6 +740,550 @@ CREATE INDEX IF NOT EXISTS idx_vuln_collection_artifacts_task
 ON vuln_collection_artifacts(task_id, stream);
 """
 
+VULNERABILITY_AUTONOMY_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS vuln_campaign_autonomy_contracts (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    mode TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending_approval',
+    scope_version INTEGER NOT NULL,
+    policy_json TEXT NOT NULL,
+    policy_digest TEXT NOT NULL,
+    signature TEXT,
+    signing_key_id TEXT,
+    requested_by TEXT NOT NULL,
+    request_reason TEXT NOT NULL,
+    approved_by TEXT,
+    approval_reason TEXT,
+    approved_at TEXT,
+    valid_from TEXT,
+    valid_until TEXT NOT NULL,
+    revoked_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(campaign_id, version)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vuln_autonomy_contract_active
+ON vuln_campaign_autonomy_contracts(campaign_id)
+WHERE status = 'active' AND revoked_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_vuln_autonomy_contract_history
+ON vuln_campaign_autonomy_contracts(campaign_id, version DESC);
+
+CREATE TABLE IF NOT EXISTS vuln_autonomy_usage_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contract_id TEXT NOT NULL REFERENCES vuln_campaign_autonomy_contracts(id) ON DELETE CASCADE,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES vuln_collection_tasks(id) ON DELETE CASCADE,
+    target TEXT NOT NULL DEFAULT '',
+    reserved_requests INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    UNIQUE(contract_id, task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_autonomy_usage_daily
+ON vuln_autonomy_usage_events(contract_id, created_at, target);
+"""
+
+VULNERABILITY_RESEARCH_REGISTRY_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS vuln_research_manifest_runs (
+    id TEXT PRIMARY KEY,
+    source_root TEXT NOT NULL,
+    manifest_hash TEXT NOT NULL,
+    discovered_count INTEGER NOT NULL,
+    required_count INTEGER NOT NULL,
+    missing_count INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vuln_research_sources (
+    id TEXT PRIMARY KEY,
+    relative_path TEXT NOT NULL UNIQUE,
+    source_kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    family TEXT NOT NULL,
+    integration_target TEXT NOT NULL,
+    trust_state TEXT NOT NULL DEFAULT 'untrusted_data',
+    risk_label TEXT NOT NULL DEFAULT 'analysis_only',
+    source_sha256 TEXT,
+    content_bytes INTEGER,
+    present INTEGER NOT NULL DEFAULT 0,
+    compile_status TEXT NOT NULL DEFAULT 'pending',
+    last_error TEXT,
+    last_scanned_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_research_sources_kind
+ON vuln_research_sources(source_kind, family, present);
+
+CREATE TABLE IF NOT EXISTS vuln_research_playbooks (
+    id TEXT PRIMARY KEY,
+    playbook_id TEXT NOT NULL,
+    family TEXT NOT NULL,
+    title TEXT NOT NULL,
+    version_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    minimum_risk_tier TEXT NOT NULL,
+    document_json TEXT NOT NULL,
+    source_references_json TEXT NOT NULL DEFAULT '[]',
+    reviewed_by TEXT,
+    review_reason TEXT,
+    reviewed_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(playbook_id, version_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_research_playbooks_active
+ON vuln_research_playbooks(playbook_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS vuln_operational_profiles (
+    id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL,
+    version_hash TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    config_json TEXT NOT NULL,
+    source_references_json TEXT NOT NULL DEFAULT '[]',
+    reviewed_by TEXT,
+    review_reason TEXT,
+    reviewed_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(profile_id, version_hash)
+);
+
+CREATE TABLE IF NOT EXISTS vuln_playbook_feedback (
+    id TEXT PRIMARY KEY,
+    playbook_id TEXT NOT NULL,
+    version_hash TEXT NOT NULL,
+    campaign_id TEXT REFERENCES vuln_campaigns(id) ON DELETE SET NULL,
+    finding_id TEXT REFERENCES vuln_findings(id) ON DELETE SET NULL,
+    feedback_kind TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending_review',
+    reviewed_by TEXT,
+    reviewed_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vuln_playbook_usages (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    playbook_record_id TEXT NOT NULL REFERENCES vuln_research_playbooks(id),
+    analysis_id TEXT REFERENCES vuln_ai_analyses(id) ON DELETE SET NULL,
+    hypothesis_id TEXT REFERENCES vuln_hypotheses(id) ON DELETE SET NULL,
+    finding_id TEXT REFERENCES vuln_findings(id) ON DELETE SET NULL,
+    task_id TEXT REFERENCES vuln_collection_tasks(id) ON DELETE SET NULL,
+    usage_kind TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_playbook_usages_campaign
+ON vuln_playbook_usages(campaign_id, created_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vuln_playbook_usages_unique
+ON vuln_playbook_usages(
+    playbook_record_id,
+    COALESCE(analysis_id, ''),
+    COALESCE(hypothesis_id, ''),
+    COALESCE(finding_id, ''),
+    COALESCE(task_id, ''),
+    usage_kind
+);
+
+CREATE TABLE IF NOT EXISTS vuln_research_audit_events (
+    id TEXT PRIMARY KEY,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+"""
+
+VULNERABILITY_EVIDENCE_VAULT_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS vuln_evidence_vault (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    finding_id TEXT NOT NULL REFERENCES vuln_findings(id) ON DELETE CASCADE,
+    evidence_id TEXT NOT NULL UNIQUE REFERENCES vuln_evidence(id) ON DELETE CASCADE,
+    classification TEXT NOT NULL,
+    ciphertext BLOB NOT NULL,
+    nonce BLOB NOT NULL,
+    key_id TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    media_type TEXT NOT NULL DEFAULT 'text/plain',
+    byte_count INTEGER NOT NULL,
+    redacted_summary TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    deleted_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_evidence_vault_campaign
+ON vuln_evidence_vault(campaign_id, finding_id, created_at);
+
+CREATE TABLE IF NOT EXISTS vuln_evidence_access_grants (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    vault_id TEXT NOT NULL REFERENCES vuln_evidence_vault(id) ON DELETE CASCADE,
+    grantee TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at TEXT NOT NULL,
+    max_uses INTEGER NOT NULL DEFAULT 1,
+    use_count INTEGER NOT NULL DEFAULT 0,
+    issued_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT,
+    revoked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_evidence_grants_vault
+ON vuln_evidence_access_grants(vault_id, expires_at, revoked_at);
+
+CREATE TABLE IF NOT EXISTS vuln_evidence_access_events (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    vault_id TEXT NOT NULL REFERENCES vuln_evidence_vault(id) ON DELETE CASCADE,
+    grant_id TEXT REFERENCES vuln_evidence_access_grants(id) ON DELETE SET NULL,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_evidence_access_events_vault
+ON vuln_evidence_access_events(vault_id, created_at);
+"""
+
+VULNERABILITY_COLLECTION_EVIDENCE_VAULT_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS vuln_collection_evidence_vault (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES vuln_collection_tasks(id) ON DELETE CASCADE,
+    artifact_key TEXT NOT NULL,
+    target TEXT,
+    artifact_kind TEXT NOT NULL,
+    classification TEXT NOT NULL DEFAULT 'sensitive',
+    ciphertext BLOB NOT NULL,
+    nonce BLOB NOT NULL,
+    key_id TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    byte_count INTEGER NOT NULL,
+    redacted_summary TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    deleted_at TEXT,
+    UNIQUE(task_id, artifact_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_collection_evidence_vault_campaign
+ON vuln_collection_evidence_vault(campaign_id, task_id, created_at);
+"""
+
+VULNERABILITY_COLLECTION_EVIDENCE_ACCESS_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS vuln_collection_evidence_access_grants (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    vault_id TEXT NOT NULL REFERENCES vuln_collection_evidence_vault(id) ON DELETE CASCADE,
+    grantee TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at TEXT NOT NULL,
+    max_uses INTEGER NOT NULL DEFAULT 1,
+    use_count INTEGER NOT NULL DEFAULT 0,
+    issued_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT,
+    revoked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_collection_evidence_grants_vault
+ON vuln_collection_evidence_access_grants(vault_id, expires_at, revoked_at);
+
+CREATE TABLE IF NOT EXISTS vuln_collection_evidence_access_events (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    vault_id TEXT NOT NULL REFERENCES vuln_collection_evidence_vault(id) ON DELETE CASCADE,
+    grant_id TEXT REFERENCES vuln_collection_evidence_access_grants(id) ON DELETE SET NULL,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_collection_evidence_access_events_vault
+ON vuln_collection_evidence_access_events(vault_id, created_at);
+"""
+
+VULNERABILITY_SCOPE_LINEAGE_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS vuln_scope_exception_groups (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    autonomy_contract_id TEXT REFERENCES vuln_campaign_autonomy_contracts(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'pending_approval',
+    requested_by TEXT NOT NULL DEFAULT 'system:scope-discovery',
+    decision_reason TEXT,
+    decided_by TEXT,
+    decided_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vuln_scope_exception_pending
+ON vuln_scope_exception_groups(campaign_id)
+WHERE status = 'pending_approval';
+
+CREATE INDEX IF NOT EXISTS idx_vuln_scope_exception_history
+ON vuln_scope_exception_groups(campaign_id, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS vuln_scope_lineage (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    asset_id TEXT NOT NULL REFERENCES vuln_assets(id) ON DELETE CASCADE,
+    parent_asset_id TEXT REFERENCES vuln_assets(id) ON DELETE SET NULL,
+    parent_identifier TEXT,
+    discovery_kind TEXT NOT NULL,
+    source_id TEXT REFERENCES vuln_sources(id) ON DELETE SET NULL,
+    task_id TEXT REFERENCES vuln_collection_tasks(id) ON DELETE SET NULL,
+    analysis_id TEXT REFERENCES vuln_ai_analyses(id) ON DELETE SET NULL,
+    evidence_hash TEXT,
+    autonomy_contract_id TEXT REFERENCES vuln_campaign_autonomy_contracts(id) ON DELETE SET NULL,
+    exception_group_id TEXT REFERENCES vuln_scope_exception_groups(id) ON DELETE SET NULL,
+    decision TEXT NOT NULL,
+    matched_rule TEXT,
+    rationale TEXT NOT NULL,
+    lineage_fingerprint TEXT NOT NULL,
+    occurrence_count INTEGER NOT NULL DEFAULT 1,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    reviewed_by TEXT,
+    reviewed_at TEXT,
+    UNIQUE(campaign_id, lineage_fingerprint)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_scope_lineage_asset
+ON vuln_scope_lineage(campaign_id, asset_id, decision, last_seen_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_scope_lineage_exception
+ON vuln_scope_lineage(exception_group_id, decision, first_seen_at);
+"""
+
+VULNERABILITY_TASK_WORKSPACE_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS vuln_task_workspaces (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES vuln_collection_tasks(id) ON DELETE CASCADE,
+    purpose TEXT NOT NULL,
+    path_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    file_count INTEGER NOT NULL DEFAULT 0,
+    byte_count INTEGER NOT NULL DEFAULT 0,
+    promoted_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    cleaned_at TEXT,
+    error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_task_workspaces_task
+ON vuln_task_workspaces(campaign_id, task_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS vuln_task_workspace_artifacts (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES vuln_task_workspaces(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES vuln_collection_tasks(id) ON DELETE CASCADE,
+    relative_path_hash TEXT NOT NULL,
+    artifact_kind TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    byte_count INTEGER NOT NULL,
+    source_reference TEXT,
+    source_promoted INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    UNIQUE(workspace_id, relative_path_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_task_workspace_artifacts_task
+ON vuln_task_workspace_artifacts(task_id, workspace_id);
+"""
+
+VULNERABILITY_REPORT_PROFILE_SCHEMA = """\
+CREATE INDEX IF NOT EXISTS idx_vuln_reports_profile
+ON vuln_reports(campaign_id, profile, created_at DESC);
+"""
+
+VULNERABILITY_SBOM_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS vuln_sboms (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES vuln_collection_tasks(id) ON DELETE CASCADE,
+    source_id TEXT REFERENCES vuln_sources(id) ON DELETE SET NULL,
+    repository_asset_id TEXT NOT NULL REFERENCES vuln_assets(id) ON DELETE CASCADE,
+    source_target TEXT NOT NULL,
+    format TEXT NOT NULL DEFAULT 'cyclonedx-json',
+    document_hash TEXT NOT NULL,
+    component_count INTEGER NOT NULL DEFAULT 0,
+    parsed_component_count INTEGER NOT NULL DEFAULT 0,
+    coverage_complete INTEGER NOT NULL DEFAULT 0,
+    vault_ref TEXT REFERENCES vuln_collection_evidence_vault(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(task_id, repository_asset_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_sboms_campaign_repository
+ON vuln_sboms(campaign_id, repository_asset_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS vuln_sbom_components (
+    id TEXT PRIMARY KEY,
+    sbom_id TEXT NOT NULL REFERENCES vuln_sboms(id) ON DELETE CASCADE,
+    asset_id TEXT REFERENCES vuln_assets(id) ON DELETE SET NULL,
+    purl TEXT,
+    ecosystem TEXT,
+    name TEXT NOT NULL,
+    version TEXT,
+    component_type TEXT NOT NULL,
+    licenses_json TEXT NOT NULL DEFAULT '[]',
+    hashes_json TEXT NOT NULL DEFAULT '{}',
+    component_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(sbom_id, component_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_sbom_components_asset
+ON vuln_sbom_components(asset_id, sbom_id);
+"""
+
+VULNERABILITY_VERIFICATION_RECIPE_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS vuln_verification_recipes (
+    id TEXT PRIMARY KEY,
+    recipe_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    vulnerability_family TEXT NOT NULL,
+    risk_tier TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    definition_json TEXT NOT NULL,
+    definition_hash TEXT NOT NULL,
+    tool_or_template_hash TEXT,
+    created_by TEXT NOT NULL,
+    reviewed_by TEXT,
+    review_reason TEXT,
+    reviewed_at TEXT,
+    retired_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(recipe_id, version),
+    UNIQUE(recipe_id, definition_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_verification_recipes_status
+ON vuln_verification_recipes(status, risk_tier, vulnerability_family);
+
+CREATE TABLE IF NOT EXISTS vuln_verification_plans (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    autonomy_contract_id TEXT NOT NULL REFERENCES vuln_campaign_autonomy_contracts(id),
+    recipe_record_id TEXT NOT NULL REFERENCES vuln_verification_recipes(id),
+    finding_id TEXT REFERENCES vuln_findings(id) ON DELETE SET NULL,
+    hypothesis_id TEXT REFERENCES vuln_hypotheses(id) ON DELETE SET NULL,
+    analysis_id TEXT REFERENCES vuln_ai_analyses(id) ON DELETE SET NULL,
+    target_asset_id TEXT NOT NULL REFERENCES vuln_assets(id) ON DELETE CASCADE,
+    target TEXT NOT NULL,
+    bindings_json TEXT NOT NULL DEFAULT '{}',
+    evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+    impact_statement TEXT NOT NULL,
+    risk_tier TEXT NOT NULL,
+    approval_kind TEXT NOT NULL DEFAULT 'human',
+    status TEXT NOT NULL DEFAULT 'pending_approval',
+    requested_by TEXT NOT NULL,
+    approved_by TEXT,
+    approval_reason TEXT,
+    approved_at TEXT,
+    plan_hash TEXT NOT NULL,
+    max_requests INTEGER NOT NULL,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(campaign_id, plan_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_verification_plans_queue
+ON vuln_verification_plans(campaign_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS vuln_verification_runs (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    plan_id TEXT NOT NULL REFERENCES vuln_verification_plans(id) ON DELETE CASCADE,
+    worker TEXT NOT NULL,
+    status TEXT NOT NULL,
+    requests_used INTEGER NOT NULL DEFAULT 0,
+    request_summary_json TEXT NOT NULL DEFAULT '[]',
+    response_summary_json TEXT NOT NULL DEFAULT '[]',
+    oracle_result_json TEXT NOT NULL DEFAULT '{}',
+    cleanup_status TEXT NOT NULL DEFAULT 'not_required',
+    before_state_hash TEXT,
+    after_state_hash TEXT,
+    error TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_verification_runs_plan
+ON vuln_verification_runs(plan_id, started_at);
+
+CREATE TABLE IF NOT EXISTS vuln_oob_tokens (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    plan_id TEXT NOT NULL REFERENCES vuln_verification_plans(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    callback_host TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'issued',
+    expires_at TEXT NOT NULL,
+    callback_summary_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    observed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_oob_tokens_plan
+ON vuln_oob_tokens(plan_id, status, expires_at);
+
+CREATE TABLE IF NOT EXISTS vuln_verification_budget_reservations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    autonomy_contract_id TEXT NOT NULL REFERENCES vuln_campaign_autonomy_contracts(id) ON DELETE CASCADE,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    plan_id TEXT NOT NULL UNIQUE REFERENCES vuln_verification_plans(id) ON DELETE CASCADE,
+    target TEXT NOT NULL,
+    reserved_requests INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_verification_budget_daily
+ON vuln_verification_budget_reservations(autonomy_contract_id, created_at, target);
+
+CREATE TABLE IF NOT EXISTS vuln_verification_http_rate_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    plan_id TEXT NOT NULL REFERENCES vuln_verification_plans(id) ON DELETE CASCADE,
+    observed_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_verification_http_rate_window
+ON vuln_verification_http_rate_events(campaign_id, observed_at);
+"""
+
 
 def configure(path: Path) -> None:
     global _db_path
@@ -1352,6 +1896,311 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         )
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (17, 'vulnerability_queue_governance', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 18 not in applied:
+        conn.executescript(VULNERABILITY_AUTONOMY_SCHEMA)
+        task_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_collection_tasks)")
+        }
+        if "autonomy_contract_id" not in task_columns:
+            conn.execute(
+                "ALTER TABLE vuln_collection_tasks ADD COLUMN autonomy_contract_id TEXT "
+                "REFERENCES vuln_campaign_autonomy_contracts(id) ON DELETE SET NULL"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vuln_collection_tasks_contract "
+            "ON vuln_collection_tasks(autonomy_contract_id, status, created_at)"
+        )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (18, 'vulnerability_campaign_autonomy_contracts', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 19 not in applied:
+        conn.executescript(VULNERABILITY_RESEARCH_REGISTRY_SCHEMA)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (19, 'vulnerability_research_playbook_registry', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 20 not in applied:
+        evidence_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_evidence)")
+        }
+        for column, ddl in (
+            ("vault_ref", "ALTER TABLE vuln_evidence ADD COLUMN vault_ref TEXT"),
+            (
+                "classification",
+                "ALTER TABLE vuln_evidence ADD COLUMN classification TEXT NOT NULL DEFAULT 'internal'",
+            ),
+            ("expires_at", "ALTER TABLE vuln_evidence ADD COLUMN expires_at TEXT"),
+        ):
+            if column not in evidence_columns:
+                conn.execute(ddl)
+        conn.executescript(VULNERABILITY_EVIDENCE_VAULT_SCHEMA)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (20, 'vulnerability_encrypted_evidence_vault', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 21 not in applied:
+        finding_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_findings)")
+        }
+        if "verification_plan_id" not in finding_columns:
+            conn.execute(
+                "ALTER TABLE vuln_findings ADD COLUMN verification_plan_id TEXT"
+            )
+        conn.executescript(VULNERABILITY_VERIFICATION_RECIPE_SCHEMA)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vuln_findings_verification_plan "
+            "ON vuln_findings(verification_plan_id)"
+        )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (21, 'vulnerability_verification_recipe_framework', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 22 not in applied:
+        conn.execute(
+            """
+            INSERT INTO vuln_sources
+                (id, campaign_id, name, source_type, status, enabled,
+                 freshness_seconds, config_json, created_at, updated_at)
+            SELECT 'source-r1-fofa-' || campaign.id,
+                   campaign.id, 'FOFA scoped asset search', 'fofa_asset_search',
+                   'idle', 0, 21600,
+                   '{"adapter":"fofa.asset-search.v1","credential_ref":"","page_size":100,"default_disabled":true}',
+                   strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                   strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            FROM vuln_campaigns AS campaign
+            WHERE NOT EXISTS (
+                SELECT 1 FROM vuln_sources AS source
+                WHERE source.campaign_id = campaign.id
+                  AND source.source_type = 'fofa_asset_search'
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (22, 'vulnerability_fofa_scoped_asset_search', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 23 not in applied:
+        conn.executescript(VULNERABILITY_COLLECTION_EVIDENCE_VAULT_SCHEMA)
+        for source_id_prefix, name, source_type, adapter, freshness_seconds in (
+            (
+                "source-r0-browser-archive-",
+                "Browser saved evidence analysis",
+                "browser_archive_analysis",
+                "browser.archive-analyze.v1",
+                21600,
+            ),
+            (
+                "source-r3-browser-session-",
+                "Playwright controlled evidence session",
+                "browser_evidence_session",
+                "browser.evidence-session.v1",
+                86400,
+            ),
+        ):
+            conn.execute(
+                """
+                INSERT INTO vuln_sources
+                    (id, campaign_id, name, source_type, status, enabled,
+                     freshness_seconds, config_json, created_at, updated_at)
+                SELECT ? || campaign.id, campaign.id, ?, ?, 'idle', 0, ?, ?,
+                       strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                       strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                FROM vuln_campaigns AS campaign
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM vuln_sources AS source
+                    WHERE source.campaign_id = campaign.id
+                      AND source.source_type = ?
+                )
+                """,
+                (
+                    source_id_prefix,
+                    name,
+                    source_type,
+                    freshness_seconds,
+                    json.dumps(
+                        (
+                            {
+                                "adapter": adapter,
+                                "default_disabled": True,
+                                "periodic_enabled": False,
+                                "targets": [],
+                                "depth": 1,
+                                "max_pages": 5,
+                                "max_requests": 20,
+                                "session_timeout_seconds": 60,
+                            }
+                            if source_type == "browser_evidence_session"
+                            else {"adapter": adapter, "default_disabled": True}
+                        ),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    source_type,
+                ),
+            )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (23, 'vulnerability_playwright_evidence_adapters', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 24 not in applied:
+        conn.executescript(VULNERABILITY_COLLECTION_EVIDENCE_ACCESS_SCHEMA)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (24, 'vulnerability_collection_evidence_access', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 25 not in applied:
+        conn.executescript(VULNERABILITY_SCOPE_LINEAGE_SCHEMA)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (25, 'vulnerability_scope_lineage_and_exceptions', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 26 not in applied:
+        conn.executescript(VULNERABILITY_TASK_WORKSPACE_SCHEMA)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (26, 'vulnerability_task_workspace_lifecycle', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 27 not in applied:
+        report_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_reports)")
+        }
+        for column, ddl in (
+            (
+                "profile",
+                "ALTER TABLE vuln_reports ADD COLUMN profile TEXT NOT NULL DEFAULT 'generic'",
+            ),
+            (
+                "profile_version",
+                "ALTER TABLE vuln_reports ADD COLUMN profile_version TEXT NOT NULL DEFAULT '1'",
+            ),
+            (
+                "evidence_mode",
+                "ALTER TABLE vuln_reports ADD COLUMN evidence_mode TEXT NOT NULL DEFAULT 'redacted'",
+            ),
+            (
+                "context_json",
+                "ALTER TABLE vuln_reports ADD COLUMN context_json TEXT NOT NULL DEFAULT '{}'",
+            ),
+        ):
+            if column not in report_columns:
+                conn.execute(ddl)
+        conn.executescript(VULNERABILITY_REPORT_PROFILE_SCHEMA)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (27, 'vulnerability_report_profiles', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 28 not in applied:
+        conn.executescript(VULNERABILITY_SBOM_SCHEMA)
+        conn.execute(
+            """
+            INSERT INTO vuln_sources
+                (id, campaign_id, name, source_type, status, enabled,
+                 freshness_seconds, config_json, created_at, updated_at)
+            SELECT 'source-r1-syft-' || campaign.id,
+                   campaign.id, 'Syft authorized local SBOM', 'syft_local_sbom',
+                   'idle', 0, 86400,
+                   '{"adapter":"syft.local-sbom.v1","default_disabled":true}',
+                   strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                   strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            FROM vuln_campaigns AS campaign
+            WHERE NOT EXISTS (
+                SELECT 1 FROM vuln_sources AS source
+                WHERE source.campaign_id = campaign.id
+                  AND source.source_type = 'syft_local_sbom'
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (28, 'vulnerability_local_sbom_inventory', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 29 not in applied:
+        conn.execute(
+            """
+            INSERT INTO vuln_sources
+                (id, campaign_id, name, source_type, status, enabled,
+                 freshness_seconds, config_json, created_at, updated_at)
+            SELECT 'source-r0-trivy-' || campaign.id,
+                   campaign.id, 'Trivy offline SBOM vulnerability analysis',
+                   'trivy_sbom_vulnerability', 'idle', 0, 86400,
+                   '{"adapter":"trivy.sbom-vuln.v1","database_snapshot":"2026-09-03","database_sha256":"13f48e8b37a9067a620a2bb641eca947619c9ff642384188d4d8e8f419221189","default_disabled":true,"offline_only":true}',
+                   strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                   strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            FROM vuln_campaigns AS campaign
+            WHERE NOT EXISTS (
+                SELECT 1 FROM vuln_sources AS source
+                WHERE source.campaign_id = campaign.id
+                  AND source.source_type = 'trivy_sbom_vulnerability'
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (29, 'vulnerability_offline_sbom_vulnerability_analysis', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 30 not in applied:
+        sbom_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vuln_sboms)")
+        }
+        if "subject_asset_id" not in sbom_columns:
+            conn.execute(
+                "ALTER TABLE vuln_sboms ADD COLUMN subject_asset_id TEXT "
+                "REFERENCES vuln_assets(id) ON DELETE CASCADE"
+            )
+        if "subject_type" not in sbom_columns:
+            conn.execute(
+                "ALTER TABLE vuln_sboms ADD COLUMN subject_type TEXT NOT NULL "
+                "DEFAULT 'repository'"
+            )
+        conn.execute(
+            "UPDATE vuln_sboms SET subject_asset_id = repository_asset_id "
+            "WHERE subject_asset_id IS NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vuln_sboms_campaign_subject "
+            "ON vuln_sboms(campaign_id, subject_asset_id, created_at DESC)"
+        )
+        for prefix, name, source_type, config in (
+            (
+                "source-r1-syft-container-",
+                "Syft authorized container archive SBOM",
+                "syft_container_archive_sbom",
+                {
+                    "adapter": "syft.container-archive-sbom.v1",
+                    "default_disabled": True,
+                    "offline_only": True,
+                },
+            ),
+            (
+                "source-r0-trivy-container-",
+                "Trivy offline container SBOM analysis",
+                "trivy_container_sbom_vulnerability",
+                {
+                    "adapter": "trivy.container-sbom-vuln.v1",
+                    "database_snapshot": "2026-09-03",
+                    "database_sha256": "13f48e8b37a9067a620a2bb641eca947619c9ff642384188d4d8e8f419221189",
+                    "default_disabled": True,
+                    "offline_only": True,
+                },
+            ),
+        ):
+            conn.execute(
+                """
+                INSERT INTO vuln_sources
+                    (id, campaign_id, name, source_type, status, enabled,
+                     freshness_seconds, config_json, created_at, updated_at)
+                SELECT ? || campaign.id, campaign.id, ?, ?, 'idle', 0, 86400, ?,
+                       strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                       strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                FROM vuln_campaigns AS campaign
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM vuln_sources AS source
+                    WHERE source.campaign_id = campaign.id
+                      AND source.source_type = ?
+                )
+                """,
+                (
+                    prefix,
+                    name,
+                    source_type,
+                    json.dumps(config, sort_keys=True, separators=(",", ":")),
+                    source_type,
+                ),
+            )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES "
+            "(30, 'vulnerability_container_archive_sbom', "
+            "strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
         )
 
 

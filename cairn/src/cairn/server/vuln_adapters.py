@@ -1,20 +1,29 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import importlib.metadata
 import ipaddress
 import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
+import stat
 import subprocess
-import tempfile
+import sys
+import tarfile
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
+from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Mapping
-from urllib.parse import quote, urlsplit, urlunsplit
+from typing import Any, Callable, Mapping
+from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
+
+from cairn.server.vulnerability_workspaces import managed_task_workspace
 
 
 USER_AGENT = "Cairn/0.2 authorized-passive-research"
@@ -61,6 +70,49 @@ GITLEAKS_PACKAGE_VERSION = "8.26.0-1+b1"
 GITLEAKS_PACKAGE_SHA256 = "b228ade47a811ffc94d258bd84b1c257458b4e81e37c55201c9d912c0e01bfdb"
 GITLEAKS_BINARY_SHA256 = "9f44b29dac56e2c43fc54735e7847f4e959b5ed157fdb890266b39e80328725b"
 GITLEAKS_CONFIG_SHA256 = "97930f7ef782a6cca176f6b71e6a1fae8a2fb12a665bb35078b1bce81e52e7cc"
+SYFT_PACKAGE_VERSION = "1.49.0+ds-0kali1"
+SYFT_PACKAGE_SHA256 = "10d84d0f96f10577259efb3ea36a51c4ed5904f3c007dd147264ffbab23fae09"
+SYFT_BINARY_SHA256 = "198b45660ac0f4cd8a4a2d48c6695b9b55c154115bdeaf0a2dc03c1500e56653"
+SYFT_MAX_OUTPUT_BYTES = 5 * 1024 * 1024
+SYFT_MAX_COMPONENTS = 10_000
+SYFT_MAX_TREE_ENTRIES = 100_000
+SYFT_MAX_TREE_BYTES = 5 * 1024 * 1024 * 1024
+SYFT_MAX_ARCHIVE_BYTES = 10 * 1024 * 1024 * 1024
+SYFT_MAX_ARCHIVE_ENTRIES = 100_000
+SYFT_MAX_ARCHIVE_EXPANDED_BYTES = 20 * 1024 * 1024 * 1024
+TRIVY_PACKAGE_VERSION = "0.66.0-0kali1"
+TRIVY_PACKAGE_SHA256 = "e462c332d23e12ae6f33d5e966eb641061e9a8103b25f05356f3521d82d943ed"
+TRIVY_BINARY_SHA256 = "1a45dfa3ab217194fc7dae5e0d58f96da4789d14fb9a6588b0351cefdc2820a8"
+TRIVY_DB_SNAPSHOT = "2026-09-03"
+TRIVY_DB_UPDATED_AT = "2026-09-03T01:14:45.115995799Z"
+TRIVY_DB_SHA256 = "13f48e8b37a9067a620a2bb641eca947619c9ff642384188d4d8e8f419221189"
+TRIVY_DB_METADATA_SHA256 = "4dc1c3cac248f81aa8be6801d556065406842fb0f77341b0664948aa45c5d03b"
+TRIVY_MAX_OUTPUT_BYTES = 5 * 1024 * 1024
+TRIVY_MAX_VULNERABILITIES = 10_000
+FOFA_CREDENTIALS_ENV = "CAIRN_FOFA_CREDENTIALS"
+FOFA_API_ENDPOINT = "https://fofa.info/api/v1/search/next"
+FOFA_FIELDS = (
+    "host",
+    "ip",
+    "port",
+    "protocol",
+    "domain",
+    "title",
+    "server",
+    "product",
+    "version",
+    "lastupdatetime",
+    "country",
+    "city",
+    "asn",
+)
+FOFA_SECRET_PATTERN = re.compile(r"^[A-Za-z0-9._~-]{8,256}$")
+FOFA_CREDENTIAL_REF_PATTERN = re.compile(r"^[A-Za-z0-9._~-]{1,128}$")
+ADAPTER_PROCESS_FACTORY = subprocess.Popen
+PROCESS_CANCELLATION_POLL_SECONDS = 0.25
+PROCESS_TERMINATION_GRACE_SECONDS = 2.0
+_TRIVY_DB_VERIFICATION_LOCK = threading.Lock()
+_TRIVY_DB_VERIFICATION_CACHE: dict[str, tuple[object, ...]] = {}
 
 
 def _configured_user_binary(name: str, environment_name: str) -> str:
@@ -83,9 +135,21 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _sha256_normalized_text_file(path: Path) -> str:
+    """Hash an audited text policy independent of checkout line endings.
+
+    Git can materialize tracked text as CRLF on Windows, while the audited
+    release digest is calculated from the canonical LF form.  Only text
+    policies/templates use this helper; executable and database artifacts
+    remain byte-for-byte pinned with ``_sha256_file``.
+    """
+
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
 def _audited_gitleaks_config_path() -> Path:
     path = Path(__file__).with_name("policies") / "gitleaks-r1.toml"
-    if not path.is_file() or _sha256_file(path) != GITLEAKS_CONFIG_SHA256:
+    if not path.is_file() or _sha256_normalized_text_file(path) != GITLEAKS_CONFIG_SHA256:
         raise AdapterValidationError("Gitleaks policy is missing or its hash has drifted")
     return path
 
@@ -115,6 +179,330 @@ def authorized_local_repository(value: str) -> Path:
     return candidate
 
 
+def authorized_local_supply_chain_target(value: str) -> Path:
+    """Resolve an exact local directory under the dedicated SBOM allow-roots."""
+
+    configured = os.getenv("CAIRN_SUPPLY_CHAIN_ALLOWED_ROOTS", "")
+    if not configured.strip():
+        raise AdapterValidationError("CAIRN_SUPPLY_CHAIN_ALLOWED_ROOTS is not configured")
+    candidate = Path(value).expanduser().resolve(strict=True)
+    if not candidate.is_dir():
+        raise AdapterValidationError("Syft target must be an existing local directory")
+    for raw_root in configured.split(os.pathsep):
+        if not raw_root.strip():
+            continue
+        root = Path(raw_root).expanduser().resolve(strict=True)
+        if root == Path(root.anchor) or root == Path.home().resolve():
+            raise AdapterValidationError(
+                "Syft allowed roots may not be filesystem or home roots"
+            )
+        try:
+            candidate.relative_to(root)
+            return candidate
+        except ValueError:
+            continue
+    raise AdapterValidationError("Repository path is outside configured Syft roots")
+
+
+def authorized_local_supply_chain_archive(value: str) -> Path:
+    """Resolve one exact local container archive under SBOM allow-roots."""
+
+    configured = os.getenv("CAIRN_SUPPLY_CHAIN_ALLOWED_ROOTS", "")
+    if not configured.strip():
+        raise AdapterValidationError("CAIRN_SUPPLY_CHAIN_ALLOWED_ROOTS is not configured")
+    requested = Path(value).expanduser()
+    try:
+        requested_metadata = requested.lstat()
+        candidate = requested.resolve(strict=True)
+    except OSError as exc:
+        raise AdapterValidationError(
+            "Container image target must be an existing regular local archive"
+        ) from exc
+    if stat.S_ISLNK(requested_metadata.st_mode) or not candidate.is_file():
+        raise AdapterValidationError("Container image target must be a regular local archive")
+    metadata = candidate.stat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > SYFT_MAX_ARCHIVE_BYTES:
+        raise AdapterValidationError("Container image archive exceeds the 10 GiB limit")
+    for raw_root in configured.split(os.pathsep):
+        if not raw_root.strip():
+            continue
+        root = Path(raw_root).expanduser().resolve(strict=True)
+        if root == Path(root.anchor) or root == Path.home().resolve():
+            raise AdapterValidationError(
+                "Syft allowed roots may not be filesystem or home roots"
+            )
+        try:
+            candidate.relative_to(root)
+            return candidate
+        except ValueError:
+            continue
+    raise AdapterValidationError("Container image archive is outside configured Syft roots")
+
+
+def _container_archive_format(path: Path) -> str:
+    """Classify a bounded Docker/OCI archive without extracting any member."""
+
+    names: set[str] = set()
+    expanded_bytes = 0
+    try:
+        with tarfile.open(path, mode="r:") as archive:
+            member_count = 0
+            for member in archive:
+                member_count += 1
+                if member_count > SYFT_MAX_ARCHIVE_ENTRIES:
+                    raise AdapterValidationError(
+                        "Container image archive exceeds the 100000 entry limit"
+                    )
+                member_path = Path(member.name)
+                if (
+                    member_path.is_absolute()
+                    or ".." in member_path.parts
+                    or member.issym()
+                    or member.islnk()
+                    or not (member.isfile() or member.isdir())
+                ):
+                    raise AdapterValidationError(
+                        "Container image archive contains an unsafe outer member"
+                    )
+                expanded_bytes += max(0, int(member.size))
+                if expanded_bytes > SYFT_MAX_ARCHIVE_EXPANDED_BYTES:
+                    raise AdapterValidationError(
+                        "Container image archive exceeds the expanded-size limit"
+                    )
+                names.add(member.name.removeprefix("./"))
+    except (tarfile.TarError, OSError) as exc:
+        raise AdapterValidationError("Container image target is not a valid tar archive") from exc
+    if "manifest.json" in names:
+        return "docker-archive"
+    if {"oci-layout", "index.json"} <= names:
+        return "oci-archive"
+    raise AdapterValidationError("Container archive is neither Docker archive nor OCI archive")
+
+
+def _validate_supply_chain_tree(root: Path) -> None:
+    """Bound local traversal and reject special files or escaping symlinks."""
+
+    entry_count = 0
+    byte_count = 0
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in [*dirnames, *filenames]:
+            entry_count += 1
+            if entry_count > SYFT_MAX_TREE_ENTRIES:
+                raise AdapterValidationError("Syft target exceeds the file-count limit")
+            entry = Path(directory) / name
+            try:
+                metadata = entry.lstat()
+            except OSError as exc:
+                raise AdapterValidationError(
+                    "Syft target contains an unreadable filesystem entry"
+                ) from exc
+            if stat.S_ISLNK(metadata.st_mode):
+                try:
+                    resolved = entry.resolve(strict=True)
+                    resolved.relative_to(root)
+                except (OSError, ValueError) as exc:
+                    raise AdapterValidationError(
+                        "Syft target contains a symlink escaping the approved repository"
+                    ) from exc
+                continue
+            if stat.S_ISREG(metadata.st_mode):
+                byte_count += metadata.st_size
+                if byte_count > SYFT_MAX_TREE_BYTES:
+                    raise AdapterValidationError("Syft target exceeds the byte-size limit")
+            elif not stat.S_ISDIR(metadata.st_mode):
+                raise AdapterValidationError(
+                    "Syft target contains an unsupported special filesystem entry"
+                )
+
+
+def _audited_trivy_database() -> tuple[Path, Path, Path]:
+    """Resolve one immutable Trivy DB snapshot and fail closed on drift."""
+
+    configured = os.getenv("CAIRN_TRIVY_DB_ROOT", "").strip()
+    root = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".local" / "share" / "cairn" / "trivy-db" / TRIVY_DB_SNAPSHOT
+    )
+    if not root.is_absolute() or root.is_symlink():
+        raise AdapterValidationError("Trivy database root must be an absolute non-symlink path")
+    try:
+        resolved_root = root.resolve(strict=True)
+    except OSError as exc:
+        raise AdapterUnavailableError("Audited Trivy database snapshot is unavailable") from exc
+    database = resolved_root / "db" / "trivy.db"
+    metadata = resolved_root / "db" / "metadata.json"
+    identities: list[tuple[int, int, int, int]] = []
+    for path, _expected_hash, label in (
+        (database, TRIVY_DB_SHA256, "database"),
+        (metadata, TRIVY_DB_METADATA_SHA256, "metadata"),
+    ):
+        if not path.is_file() or path.is_symlink():
+            raise AdapterUnavailableError(f"Audited Trivy {label} file is unavailable")
+        item = path.stat()
+        identities.append((item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns))
+    cache_value: tuple[object, ...] = (
+        *identities,
+        TRIVY_DB_SHA256,
+        TRIVY_DB_METADATA_SHA256,
+        TRIVY_DB_UPDATED_AT,
+    )
+    cache_key = str(resolved_root)
+    with _TRIVY_DB_VERIFICATION_LOCK:
+        cached = _TRIVY_DB_VERIFICATION_CACHE.get(cache_key) == cache_value
+    if not cached:
+        for path, expected_hash, label in (
+            (database, TRIVY_DB_SHA256, "database"),
+            (metadata, TRIVY_DB_METADATA_SHA256, "metadata"),
+        ):
+            if _sha256_file(path) != expected_hash:
+                raise AdapterValidationError(f"Audited Trivy {label} hash has drifted")
+    try:
+        value = json.loads(metadata.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AdapterValidationError("Trivy database metadata is invalid") from exc
+    if not isinstance(value, Mapping) or value.get("Version") != 2:
+        raise AdapterValidationError("Trivy database schema version is not audited")
+    if str(value.get("UpdatedAt") or "") != TRIVY_DB_UPDATED_AT:
+        raise AdapterValidationError("Trivy database timestamp has drifted")
+    if not cached:
+        with _TRIVY_DB_VERIFICATION_LOCK:
+            _TRIVY_DB_VERIFICATION_CACHE[cache_key] = cache_value
+    return resolved_root, database, metadata
+
+
+def _fofa_api_key(credential_ref: str) -> str:
+    """Resolve one server-side FOFA credential without persisting the value."""
+
+    reference = credential_ref.strip()
+    if not reference or "\r" in reference or "\n" in reference:
+        raise AdapterValidationError("FOFA source requires a valid credential_ref")
+    raw = os.getenv(FOFA_CREDENTIALS_ENV, "").strip()
+    if not raw:
+        raise AdapterUnavailableError(f"{FOFA_CREDENTIALS_ENV} is not configured")
+    try:
+        credentials = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise AdapterUnavailableError(
+            f"{FOFA_CREDENTIALS_ENV} must be a JSON object"
+        ) from exc
+    if not isinstance(credentials, dict) or reference not in credentials:
+        raise AdapterUnavailableError("FOFA credential reference was not found")
+    entry = credentials[reference]
+    key = entry.get("key") if isinstance(entry, dict) else entry
+    if not isinstance(key, str) or not FOFA_SECRET_PATTERN.fullmatch(key):
+        raise AdapterUnavailableError("FOFA credential is malformed")
+    return key
+
+
+def validate_fofa_source_config(
+    value: Mapping[str, Any], *, require_credential_ref: bool
+) -> dict[str, Any]:
+    """Return persistable FOFA settings while rejecting all credential material."""
+
+    if not isinstance(value, Mapping):
+        raise AdapterValidationError("FOFA source configuration must be an object")
+    allowed = {"adapter", "credential_ref", "page_size", "default_disabled"}
+    unknown = set(value) - allowed
+    if unknown:
+        raise AdapterValidationError(
+            f"FOFA source configuration contains forbidden fields: {', '.join(sorted(unknown))}"
+        )
+    adapter = str(value.get("adapter") or "fofa.asset-search.v1")
+    if adapter != "fofa.asset-search.v1":
+        raise AdapterValidationError("FOFA source adapter is immutable")
+    credential_ref = str(value.get("credential_ref") or "").strip()
+    if credential_ref and not FOFA_CREDENTIAL_REF_PATTERN.fullmatch(credential_ref):
+        raise AdapterValidationError("FOFA credential_ref is malformed")
+    if require_credential_ref and not credential_ref:
+        raise AdapterValidationError(
+            "FOFA source must reference a server-side credential before it is enabled"
+        )
+    page_size_raw = value.get("page_size", 100)
+    if isinstance(page_size_raw, bool):
+        raise AdapterValidationError("FOFA page_size must be an integer")
+    try:
+        page_size = int(page_size_raw)
+    except (TypeError, ValueError) as exc:
+        raise AdapterValidationError("FOFA page_size must be an integer") from exc
+    if page_size < 1 or page_size > 1000:
+        raise AdapterValidationError("FOFA page_size must be between 1 and 1000")
+    return {
+        "adapter": adapter,
+        "credential_ref": credential_ref,
+        "page_size": page_size,
+        "default_disabled": bool(value.get("default_disabled", True)),
+    }
+
+
+def validate_browser_evidence_source_config(
+    value: Mapping[str, Any], *, require_periodic_targets: bool = False
+) -> dict[str, Any]:
+    """Validate persistable browser controls; credentials and cookies are forbidden."""
+
+    if not isinstance(value, Mapping):
+        raise AdapterValidationError("Browser source configuration must be an object")
+    allowed = {
+        "adapter",
+        "default_disabled",
+        "periodic_enabled",
+        "targets",
+        "depth",
+        "max_pages",
+        "max_requests",
+        "session_timeout_seconds",
+    }
+    unknown = set(value) - allowed
+    if unknown:
+        raise AdapterValidationError(
+            "Browser source configuration contains forbidden fields: "
+            + ", ".join(sorted(unknown))
+        )
+    adapter = str(value.get("adapter") or "browser.evidence-session.v1")
+    if adapter != "browser.evidence-session.v1":
+        raise AdapterValidationError("Browser source adapter is immutable")
+    periodic_enabled = bool(value.get("periodic_enabled", False))
+    targets_value = value.get("targets", [])
+    if not isinstance(targets_value, list) or len(targets_value) > 10:
+        raise AdapterValidationError("Browser source accepts at most 10 exact URL targets")
+    targets = []
+    for target in targets_value:
+        if not isinstance(target, str):
+            raise AdapterValidationError("Browser source targets must be URL strings")
+        targets.append(normalize_web_target(target))
+    targets = list(dict.fromkeys(targets))
+    if (periodic_enabled or require_periodic_targets) and not targets:
+        raise AdapterValidationError(
+            "Periodic browser collection requires at least one exact URL target"
+        )
+    controls: dict[str, int] = {}
+    for key, default, low, high in (
+        ("depth", 1, 1, 2),
+        ("max_pages", 5, 1, 10),
+        ("max_requests", 20, 1, 50),
+        ("session_timeout_seconds", 60, 5, 60),
+    ):
+        item = value.get(key, default)
+        if isinstance(item, bool):
+            raise AdapterValidationError(f"Browser {key} must be an integer")
+        try:
+            item = int(item)
+        except (TypeError, ValueError) as exc:
+            raise AdapterValidationError(f"Browser {key} must be an integer") from exc
+        if not low <= item <= high:
+            raise AdapterValidationError(
+                f"Browser {key} must be between {low} and {high}"
+            )
+        controls[key] = item
+    return {
+        "adapter": adapter,
+        "default_disabled": bool(value.get("default_disabled", True)),
+        "periodic_enabled": periodic_enabled,
+        "targets": targets,
+        **controls,
+    }
+
+
 class AdapterError(RuntimeError):
     """Base error for controlled collection adapter failures."""
 
@@ -131,6 +519,10 @@ class AdapterExecutionError(AdapterError):
     def __init__(self, message: str, execution: AdapterExecution | None = None):
         super().__init__(message)
         self.execution = execution
+
+
+class AdapterCancellationError(AdapterExecutionError):
+    """A durable task or Campaign revocation interrupted the tool process."""
 
 
 @dataclass(frozen=True)
@@ -166,11 +558,14 @@ class AdapterContext:
     http_responses: tuple[Mapping[str, Any], ...] = ()
     vulnerabilities: tuple[Mapping[str, Any], ...] = ()
     repositories: tuple[Mapping[str, Any], ...] = ()
+    container_archives: tuple[Mapping[str, Any], ...] = ()
+    sboms: tuple[Mapping[str, Any], ...] = ()
     cursor: Mapping[str, Any] = field(default_factory=dict)
     request_header: str = "X-Cairn-Research"
     max_requests_per_second: int = 30
     proxy_url: str | None = None
     options: Mapping[str, Any] = field(default_factory=dict)
+    cancellation_probe: Callable[[], str | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -190,12 +585,28 @@ class CommandResult:
 
 
 @dataclass(frozen=True)
+class SensitiveArtifact:
+    key: str
+    target: str | None
+    artifact_kind: str
+    media_type: str
+    content: bytes
+
+    @property
+    def content_hash(self) -> str:
+        return hashlib.sha256(self.content).hexdigest()
+
+
+@dataclass(frozen=True)
 class AdapterExecution:
     results: tuple[CommandResult, ...]
+    sensitive_artifacts: tuple[SensitiveArtifact, ...] = ()
 
     @property
     def output_size(self) -> int:
-        return sum(len(result.stdout.encode("utf-8")) for result in self.results)
+        return sum(len(result.stdout.encode("utf-8")) for result in self.results) + sum(
+            len(artifact.content) for artifact in self.sensitive_artifacts
+        )
 
     @property
     def output_hash(self) -> str:
@@ -204,6 +615,11 @@ class AdapterExecution:
             digest.update((result.target or "").encode("utf-8"))
             digest.update(b"\0")
             digest.update(result.stdout.encode("utf-8"))
+            digest.update(b"\0")
+        for artifact in self.sensitive_artifacts:
+            digest.update(artifact.key.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(artifact.content_hash.encode("ascii"))
             digest.update(b"\0")
         return digest.hexdigest()
 
@@ -321,6 +737,7 @@ class VulnSourceAdapter(ABC):
     timeout_seconds: int = 30
     uses_http: bool = False
     uses_network: bool = False
+    internally_rate_limited: bool = False
     accept_complete_json_on_timeout: bool = False
     expected_tool_version: str | None = None
     release_sha256: str | None = None
@@ -493,6 +910,140 @@ class VulnSourceAdapter(ABC):
         self.validate(context)
         return self._execute_invocations(context, self.materialize(context))
 
+    @staticmethod
+    def _terminate_process_group(process: Any) -> tuple[str, str]:
+        """Terminate the allowlisted process and descendants, then drain pipes."""
+
+        try:
+            if os.name == "posix" and getattr(process, "pid", None):
+                os.killpg(int(process.pid), signal.SIGTERM)
+            else:
+                process.terminate()
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            stdout, stderr = process.communicate(
+                timeout=PROCESS_TERMINATION_GRACE_SECONDS
+            )
+        except subprocess.TimeoutExpired:
+            try:
+                if os.name == "posix" and getattr(process, "pid", None):
+                    os.killpg(int(process.pid), signal.SIGKILL)
+                else:
+                    process.kill()
+            except (OSError, ProcessLookupError):
+                pass
+            stdout, stderr = process.communicate()
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        return stdout or "", stderr or ""
+
+    def _execute_cancellable_invocation(
+        self,
+        context: AdapterContext,
+        invocation: AdapterInvocation,
+        previous_results: list[CommandResult],
+    ) -> tuple[CommandResult, bool]:
+        started = time.monotonic()
+        try:
+            process = ADAPTER_PROCESS_FACTORY(
+                list(invocation.argv),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=False,
+                stdin=(
+                    subprocess.PIPE
+                    if invocation.stdin is not None
+                    else subprocess.DEVNULL
+                ),
+                start_new_session=os.name == "posix",
+            )
+        except OSError as exc:
+            raise AdapterUnavailableError(
+                f"Unable to execute allowlisted binary {self.binary}: {type(exc).__name__}"
+            ) from exc
+
+        deadline = started + self.timeout_seconds
+        pending_input = invocation.stdin
+        while True:
+            try:
+                cancellation_reason = (
+                    context.cancellation_probe()
+                    if context.cancellation_probe is not None
+                    else None
+                )
+            except Exception as exc:
+                cancellation_reason = (
+                    "Execution authority probe failed closed: "
+                    f"{type(exc).__name__}"
+                )
+            if cancellation_reason:
+                stdout, stderr = self._terminate_process_group(process)
+                result = CommandResult(
+                    target=invocation.target,
+                    stdout=stdout,
+                    stderr=stderr,
+                    returncode=(
+                        int(process.returncode)
+                        if process.returncode is not None
+                        else -15
+                    ),
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                )
+                raise AdapterCancellationError(
+                    f"{self.tool_id} cancelled: {cancellation_reason}",
+                    AdapterExecution(tuple([*previous_results, result])),
+                )
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stdout, stderr = self._terminate_process_group(process)
+                result = CommandResult(
+                    target=invocation.target,
+                    stdout=stdout,
+                    stderr=stderr,
+                    returncode=-1,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                )
+                execution = AdapterExecution(tuple([*previous_results, result]))
+                if self.accept_complete_json_on_timeout and stdout.strip():
+                    try:
+                        payloads = [
+                            json.loads(line)
+                            for line in stdout.splitlines()
+                            if line.strip()
+                        ]
+                    except json.JSONDecodeError:
+                        payloads = []
+                    if payloads and all(
+                        isinstance(payload, dict) for payload in payloads
+                    ):
+                        return result, True
+                raise AdapterExecutionError(
+                    f"{self.tool_id} timed out after {self.timeout_seconds}s",
+                    execution,
+                )
+            try:
+                stdout, stderr = process.communicate(
+                    input=pending_input,
+                    timeout=min(PROCESS_CANCELLATION_POLL_SECONDS, remaining),
+                )
+                return (
+                    CommandResult(
+                        target=invocation.target,
+                        stdout=stdout or "",
+                        stderr=stderr or "",
+                        returncode=int(process.returncode or 0),
+                        duration_ms=round((time.monotonic() - started) * 1000),
+                    ),
+                    False,
+                )
+            except subprocess.TimeoutExpired:
+                pending_input = None
+
     def _execute_invocations(
         self,
         context: AdapterContext,
@@ -500,8 +1051,20 @@ class VulnSourceAdapter(ABC):
     ) -> AdapterExecution:
         results: list[CommandResult] = []
         for invocation in invocations:
-            if self.uses_http or self.uses_network:
+            if (self.uses_http or self.uses_network) and not self.internally_rate_limited:
                 acquire_campaign_http_rate_limit(context)
+            if context.cancellation_probe is not None:
+                result, accepted_timeout = self._execute_cancellable_invocation(
+                    context, invocation, results
+                )
+                results.append(result)
+                if result.returncode != 0 and not accepted_timeout:
+                    execution = AdapterExecution(tuple(results))
+                    raise AdapterExecutionError(
+                        f"{self.tool_id} exited with code {result.returncode}",
+                        execution,
+                    )
+                continue
             started = time.monotonic()
             try:
                 run_kwargs: dict[str, Any] = {
@@ -627,7 +1190,7 @@ class DomainDiscoveryAdapter(DomainAdapter):
         from cairn.server.vulnerability_services import (
             check_scope,
             record_collection_task_asset,
-            upsert_asset,
+            upsert_discovered_asset,
         )
 
         created = 0
@@ -635,9 +1198,10 @@ class DomainDiscoveryAdapter(DomainAdapter):
         source_name = str(context.source["name"])
         for hostname in parsed.get("domains", []):
             scope = check_scope(context.conn, context.campaign_id, hostname, active=False)
-            if not scope.allowed:
+            if scope.reason == "target matches an explicit exclusion":
                 continue
-            asset, was_created = upsert_asset(
+            parent_identifier = context.targets[0] if context.targets else None
+            asset, was_created, lineage = upsert_discovered_asset(
                 context.conn,
                 context.campaign_id,
                 AssetInput(
@@ -645,7 +1209,13 @@ class DomainDiscoveryAdapter(DomainAdapter):
                     identifier=hostname,
                     source_name=source_name,
                 ),
+                discovery_kind="domain_discovery",
+                parent_identifier=parent_identifier,
+                source_id=str(context.source["id"]),
+                task_id=context.task_id,
             )
+            if asset is None or lineage is None:
+                continue
             record_collection_task_asset(
                 context.conn,
                 context.task_id,
@@ -655,6 +1225,373 @@ class DomainDiscoveryAdapter(DomainAdapter):
             created += int(was_created)
             updated += int(not was_created)
         return {"assets_created": created, "assets_updated": updated}
+
+
+class FofaAssetSearchAdapter(VulnSourceAdapter):
+    """Query FOFA for exact authorized domain/IP seeds through one bounded page."""
+
+    tool_id = "fofa.asset-search.v1"
+    version = "1.0.0"
+    risk_class = "R1"
+    source_type = "fofa_asset_search"
+    dimension = "external"
+    binary = "curl"
+    version_args = ("--version",)
+    timeout_seconds = 30
+    uses_http = True
+    requires_human_approval = True
+    input_schema = {
+        "type": "object",
+        "required": ["search_targets"],
+        "properties": {
+            "search_targets": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 10,
+            }
+        },
+        "additionalProperties": False,
+    }
+    output_schema = {
+        "type": "object",
+        "required": ["records"],
+        "properties": {
+            "records": {"type": "array", "items": {"type": "object"}},
+            "next_by_target": {"type": "object"},
+        },
+    }
+
+    def normalize_task_target(self, value: str) -> str:
+        text = value.strip()
+        try:
+            return str(ipaddress.ip_address(text))
+        except ValueError:
+            return normalize_domain(text)
+
+    def _config(self, context: AdapterContext) -> tuple[str, int]:
+        source_keys = set(context.source.keys()) if hasattr(context.source, "keys") else set()
+        raw_config = context.source["config_json"] if "config_json" in source_keys else "{}"
+        try:
+            config = json.loads(str(raw_config or "{}"))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise AdapterValidationError("FOFA source configuration is invalid") from exc
+        normalized = validate_fofa_source_config(
+            config, require_credential_ref=True
+        )
+        return str(normalized["credential_ref"]), int(normalized["page_size"])
+
+    def validate(self, context: AdapterContext) -> None:
+        super().validate(context)
+        if not context.targets:
+            raise AdapterValidationError("FOFA requires at least one exact search target")
+        if len(context.targets) > 10:
+            raise AdapterValidationError("FOFA accepts at most 10 exact search targets")
+        for target in context.targets:
+            self.normalize_task_target(target)
+        credential_ref, _ = self._config(context)
+        _fofa_api_key(credential_ref)
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        credential_ref, page_size = self._config(context)
+        api_key = _fofa_api_key(credential_ref)
+        previous = context.cursor.get("next_by_target")
+        previous = previous if isinstance(previous, dict) else {}
+        invocations: list[AdapterInvocation] = []
+        for target in context.targets:
+            normalized = self.normalize_task_target(target)
+            try:
+                ipaddress.ip_address(normalized)
+                query = f'ip="{normalized}"'
+            except ValueError:
+                query = f'domain="{normalized}"'
+            query_b64 = base64.b64encode(query.encode("utf-8")).decode("ascii")
+            next_token = previous.get(normalized)
+            next_args: tuple[str, ...] = ()
+            if isinstance(next_token, str) and next_token and len(next_token) <= 4096:
+                next_args = ("--data-urlencode", f"next={next_token}")
+            invocations.append(
+                AdapterInvocation(
+                    argv=(
+                        self.binary,
+                        "--silent",
+                        "--show-error",
+                        "--fail-with-body",
+                        "--max-time",
+                        str(self.timeout_seconds),
+                        "--user-agent",
+                        USER_AGENT,
+                        *self._curl_header_args(context),
+                        "--get",
+                        "--data-urlencode",
+                        f"qbase64={query_b64}",
+                        "--data",
+                        f"fields={','.join(FOFA_FIELDS)}",
+                        "--data",
+                        f"size={page_size}",
+                        "--data",
+                        "full=false",
+                        *next_args,
+                        "--config",
+                        "-",
+                        FOFA_API_ENDPOINT,
+                    ),
+                    target=normalized,
+                    # Keep the credential out of argv, task plans, process
+                    # listings, logs, and persisted execution metadata.
+                    stdin=f'data-urlencode = "key={api_key}"\n',
+                )
+            )
+        return invocations
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        return self._execute_materialized(context)
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        records: list[dict[str, Any]] = []
+        next_by_target: dict[str, str] = {}
+        for result in execution.results:
+            try:
+                payload = json.loads(result.stdout)
+            except json.JSONDecodeError as exc:
+                raise AdapterExecutionError("FOFA returned invalid JSON", execution) from exc
+            if not isinstance(payload, dict):
+                raise AdapterExecutionError("FOFA response must be a JSON object", execution)
+            if payload.get("error") is True:
+                raise AdapterExecutionError("FOFA rejected the bounded search request", execution)
+            result_rows = payload.get("results")
+            if not isinstance(result_rows, list):
+                raise AdapterExecutionError("FOFA response is missing a results array", execution)
+            if len(result_rows) > 1000:
+                raise AdapterExecutionError("FOFA response exceeded the configured page bound", execution)
+            for row in result_rows:
+                if not isinstance(row, list):
+                    continue
+                record = {
+                    field_name: row[index] if index < len(row) else None
+                    for index, field_name in enumerate(FOFA_FIELDS)
+                }
+                record["query_target"] = result.target
+                records.append(record)
+            next_token = payload.get("next")
+            if (
+                result.target
+                and isinstance(next_token, str)
+                and next_token
+                and len(next_token) <= 4096
+                and "\r" not in next_token
+                and "\n" not in next_token
+            ):
+                next_by_target[result.target] = next_token
+        return {
+            "records": records,
+            "next_by_target": next_by_target,
+            "_coverage_complete": not next_by_target,
+        }
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        from cairn.server.services import utcnow
+        from cairn.server.vulnerability_models import AssetInput
+        from cairn.server.vulnerability_services import (
+            check_scope,
+            next_vulnerability_id,
+            normalize_target,
+            record_collection_task_asset,
+            recalculate_asset_scores,
+            upsert_discovered_asset,
+        )
+
+        counts = {
+            "assets_created": 0,
+            "assets_updated": 0,
+            "observations_created": 0,
+            "observations_updated": 0,
+            "relations_created": 0,
+            "quarantined_results": 0,
+        }
+        source_name = str(context.source["name"])
+        now = utcnow()
+        for record in parsed.get("records", []):
+            if not isinstance(record, dict):
+                continue
+            candidates: list[tuple[str, str]] = []
+            raw_domain = str(record.get("domain") or "").strip()
+            if raw_domain:
+                try:
+                    candidates.append(("domain", normalize_domain(raw_domain)))
+                except AdapterValidationError:
+                    pass
+            raw_ip = str(record.get("ip") or "").strip()
+            if raw_ip:
+                try:
+                    candidates.append(("ip", str(ipaddress.ip_address(raw_ip))))
+                except ValueError:
+                    pass
+            raw_host = str(record.get("host") or "").strip()
+            if raw_host.startswith(("http://", "https://")):
+                try:
+                    candidates.append(("url", normalize_web_target(raw_host)))
+                except AdapterValidationError:
+                    pass
+
+            assets: dict[str, str] = {}
+            for asset_type, identifier in dict.fromkeys(candidates):
+                scope = check_scope(
+                    context.conn, context.campaign_id, identifier, active=False
+                )
+                if not scope.allowed:
+                    continue
+                technology = [
+                    str(value).strip()
+                    for value in (record.get("product"), record.get("server"))
+                    if str(value or "").strip()
+                ]
+                version = str(record.get("version") or "").strip()
+                if version and technology:
+                    technology[0] = f"{technology[0]} {version}"[:256]
+                asset, created, lineage = upsert_discovered_asset(
+                    context.conn,
+                    context.campaign_id,
+                    AssetInput(
+                        asset_type=asset_type,
+                        identifier=identifier,
+                        technology=list(dict.fromkeys(technology))[:20],
+                        source_name=source_name,
+                    ),
+                    discovery_kind="fofa_asset_discovery",
+                    parent_identifier=str(record.get("query_target") or "") or None,
+                    source_id=str(context.source["id"]),
+                    task_id=context.task_id,
+                )
+                if asset is None or lineage is None:
+                    continue
+                assets[asset_type] = asset.id
+                record_collection_task_asset(
+                    context.conn,
+                    context.task_id,
+                    str(context.source["id"]),
+                    asset.id,
+                )
+                counts["assets_created" if created else "assets_updated"] += 1
+
+                evidence_payload = {
+                    "record_type": "fofa_asset_search",
+                    "query_target": record.get("query_target"),
+                    "host": record.get("host"),
+                    "ip": record.get("ip"),
+                    "port": record.get("port"),
+                    "protocol": record.get("protocol"),
+                    "domain": record.get("domain"),
+                    "title": record.get("title"),
+                    "server": record.get("server"),
+                    "product": record.get("product"),
+                    "version": record.get("version"),
+                    "last_updated_at": record.get("lastupdatetime"),
+                    "country": record.get("country"),
+                    "city": record.get("city"),
+                    "asn": record.get("asn"),
+                }
+                digest = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "campaign_id": context.campaign_id,
+                            "source_id": str(context.source["id"]),
+                            "asset_id": asset.id,
+                            "data": evidence_payload,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                existed = context.conn.execute(
+                    "SELECT 1 FROM vuln_observations WHERE campaign_id = ? AND evidence_hash = ?",
+                    (context.campaign_id, digest),
+                ).fetchone()
+                observation_id = next_vulnerability_id(
+                    context.conn, "observation", "observation"
+                )
+                context.conn.execute(
+                    """
+                    INSERT INTO vuln_observations
+                        (id, campaign_id, asset_id, source_id, dimension, data_json,
+                         evidence_hash, confidence, status, raw_reference,
+                         first_seen_at, last_seen_at)
+                    VALUES (?, ?, ?, ?, 'external', ?, ?, 0.8, 'current', ?, ?, ?)
+                    ON CONFLICT(campaign_id, evidence_hash)
+                    DO UPDATE SET last_seen_at = excluded.last_seen_at
+                    """,
+                    (
+                        observation_id,
+                        context.campaign_id,
+                        asset.id,
+                        context.source["id"],
+                        json.dumps(evidence_payload, ensure_ascii=False),
+                        digest,
+                        f"collection-task:{context.task_id}",
+                        now,
+                        now,
+                    ),
+                )
+                counts[
+                    "observations_created" if existed is None else "observations_updated"
+                ] += 1
+                recalculate_asset_scores(context.conn, context.campaign_id, [asset.id])
+
+            if not assets:
+                counts["quarantined_results"] += 1
+                continue
+            if assets.get("domain") and assets.get("ip"):
+                existing_relation = context.conn.execute(
+                    """
+                    SELECT id FROM vuln_asset_relations
+                    WHERE campaign_id = ? AND source_asset_id = ?
+                      AND target_asset_id = ? AND relation_type = 'resolves_to'
+                    """,
+                    (context.campaign_id, assets["domain"], assets["ip"]),
+                ).fetchone()
+                if existing_relation is None:
+                    relation_id = next_vulnerability_id(
+                        context.conn, "asset_relation", "relation"
+                    )
+                    context.conn.execute(
+                        """
+                        INSERT INTO vuln_asset_relations
+                            (id, campaign_id, source_asset_id, target_asset_id,
+                             relation_type, confidence, visible, review_state,
+                             first_seen_at, last_seen_at)
+                        VALUES (?, ?, ?, ?, 'resolves_to', 0.8, 1,
+                                'auto_visible', ?, ?)
+                        """,
+                        (
+                            relation_id,
+                            context.campaign_id,
+                            assets["domain"],
+                            assets["ip"],
+                            now,
+                            now,
+                        ),
+                    )
+                    counts["relations_created"] += 1
+                else:
+                    context.conn.execute(
+                        "UPDATE vuln_asset_relations SET last_seen_at = ? WHERE id = ?",
+                        (now, existing_relation["id"]),
+                    )
+        return counts
+
+    def coverage_complete(self, context: AdapterContext, parsed: Any) -> bool:
+        return bool(parsed.get("_coverage_complete", False))
+
+    def next_cursor(
+        self,
+        context: AdapterContext,
+        parsed: Any,
+        execution: AdapterExecution,
+    ) -> dict[str, Any]:
+        return {
+            "next_by_target": dict(parsed.get("next_by_target") or {}),
+            "output_hash": execution.output_hash,
+        }
 
 
 class CertificateTransparencyAdapter(DomainDiscoveryAdapter):
@@ -1267,7 +2204,10 @@ class DnsxResolveAdapter(DomainAdapter):
 
     def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
         from cairn.server.vulnerability_models import AssetInput
-        from cairn.server.vulnerability_services import record_collection_task_asset, upsert_asset
+        from cairn.server.vulnerability_services import (
+            record_collection_task_asset,
+            upsert_discovered_asset,
+        )
 
         observations = 0
         assets_created = 0
@@ -1286,7 +2226,7 @@ class DnsxResolveAdapter(DomainAdapter):
                     ipaddress.ip_address(address)
                 except ValueError:
                     continue
-                asset, created = upsert_asset(
+                asset, created, _lineage = upsert_discovered_asset(
                     context.conn,
                     context.campaign_id,
                     AssetInput(
@@ -1294,7 +2234,13 @@ class DnsxResolveAdapter(DomainAdapter):
                         identifier=address,
                         source_name=str(context.source["name"]),
                     ),
+                    discovery_kind="dns_resolves",
+                    parent_identifier=record["domain"],
+                    source_id=str(context.source["id"]),
+                    task_id=context.task_id,
                 )
+                if asset is None:
+                    continue
                 record_collection_task_asset(
                     context.conn,
                     context.task_id,
@@ -1677,7 +2623,9 @@ def _audited_nuclei_template_paths() -> tuple[Path, ...]:
             raise AdapterUnavailableError(
                 f"Audited Nuclei template is unavailable: {relative_path}"
             ) from exc
-        actual_hash = hashlib.sha256(content).hexdigest()
+        # Nuclei templates are audited text.  Canonicalize checkout CRLF so
+        # the pinned release digest remains valid on Windows as well as Kali.
+        actual_hash = hashlib.sha256(content.replace(b"\r\n", b"\n")).hexdigest()
         if not expected_hash or actual_hash != expected_hash:
             raise AdapterValidationError(
                 f"Nuclei template hash mismatch: {relative_path}"
@@ -1701,6 +2649,428 @@ def _audited_nuclei_template_paths() -> tuple[Path, ...]:
             )
         paths.append(path)
     return tuple(paths)
+
+
+def _connection_database_path(conn: sqlite3.Connection) -> str | None:
+    rows = conn.execute("PRAGMA database_list").fetchall()
+    for row in rows:
+        name = row[1] if not isinstance(row, sqlite3.Row) else row["name"]
+        file_name = row[2] if not isinstance(row, sqlite3.Row) else row["file"]
+        if name == "main" and file_name and file_name != ":memory:":
+            return str(Path(str(file_name)).resolve())
+    return None
+
+
+class BrowserEvidenceSessionAdapter(ActiveNetworkTargetAdapter):
+    """Collect bounded same-origin browser evidence in an ephemeral context."""
+
+    tool_id = "browser.evidence-session.v1"
+    version = "1.0.0"
+    risk_class = "R3"
+    source_type = "browser_evidence_session"
+    dimension = "web"
+    binary = sys.executable
+    version_args = ("-m", "cairn.server.playwright_capture", "--version")
+    timeout_seconds = 90
+    uses_http = True
+    uses_network = True
+    internally_rate_limited = True
+    requires_human_approval = True
+    input_schema = ActiveNetworkTargetAdapter.input_schema
+    output_schema = {
+        "type": "object",
+        "required": ["sessions"],
+        "properties": {
+            "sessions": {"type": "array", "items": {"type": "object"}}
+        },
+    }
+
+    def normalize_task_target(self, value: str) -> str:
+        return normalize_web_target(value)
+
+    def validate(self, context: AdapterContext) -> None:
+        super().validate(context)
+        for key, default, low, high in (
+            ("depth", 1, 1, 2),
+            ("max_pages", 5, 1, 10),
+            ("max_requests", 20, 1, 50),
+            ("session_timeout_seconds", 60, 5, 60),
+        ):
+            value = context.options.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                raise AdapterValidationError(
+                    f"Browser {key} must be between {low} and {high}"
+                )
+        if _connection_database_path(context.conn) is None:
+            raise AdapterValidationError(
+                "Browser evidence collection requires a durable collection database"
+            )
+
+    def estimate(self, context: AdapterContext) -> dict[str, Any]:
+        return {
+            "command_count": len(context.targets),
+            "timeout_seconds": self.timeout_seconds,
+            "risk_class": self.risk_class,
+            "network_request_count": len(context.targets)
+            * int(context.options.get("max_requests", 20)),
+            "max_pages": int(context.options.get("max_pages", 5)),
+            "same_origin_only": True,
+            "allowed_methods": ["GET", "HEAD"],
+            "persistent_profile": False,
+        }
+
+    def health(self) -> dict[str, Any]:
+        runner = Path(__file__).with_name("playwright_capture.py")
+        if not runner.is_file():
+            return {
+                "healthy": False,
+                "tool_id": self.tool_id,
+                "version": None,
+                "error": "Cairn Playwright runner is missing",
+            }
+        try:
+            package_version = importlib.metadata.version("playwright")
+            completed = subprocess.run(
+                [
+                    self.binary,
+                    "-m",
+                    "cairn.server.playwright_capture",
+                    "--probe",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+                shell=False,
+                stdin=subprocess.DEVNULL,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(completed.stderr.strip() or "runtime probe failed")
+            probe = json.loads(completed.stdout)
+            executable = Path(str(probe["browser_executable"]))
+        except Exception as exc:
+            return {
+                "healthy": False,
+                "tool_id": self.tool_id,
+                "version": None,
+                "error": f"Playwright runtime probe failed: {type(exc).__name__}",
+            }
+        if not executable.is_file():
+            return {
+                "healthy": False,
+                "tool_id": self.tool_id,
+                "version": package_version,
+                "error": "Playwright Chromium is not installed",
+            }
+        return {
+            "healthy": True,
+            "tool_id": self.tool_id,
+            "version": package_version,
+            "browser_version": str(probe.get("browser_version") or "")[:128],
+            "expected_version": ">=1.48,<2",
+            "runner_sha256": _sha256_file(runner),
+            "browser_executable_sha256": _sha256_file(executable),
+            "browser_engine": "chromium",
+            "persistent_profile": False,
+            "error": None,
+        }
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        headers = self.get_headers(context)
+        header_name, header_value = next(iter(headers.items()))
+        database_path = _connection_database_path(context.conn)
+        return [
+            AdapterInvocation(
+                argv=(
+                    self.binary,
+                    "-m",
+                    "cairn.server.playwright_capture",
+                    "--run",
+                ),
+                target=normalize_web_target(target),
+                stdin=json.dumps(
+                    {
+                        "target": normalize_web_target(target),
+                        "campaign_id": context.campaign_id,
+                        "task_id": context.task_id,
+                        "request_header": header_name,
+                        "request_header_value": header_value,
+                        "max_requests_per_second": max(
+                            1, context.max_requests_per_second
+                        ),
+                        "max_requests": int(context.options.get("max_requests", 20)),
+                        "max_pages": int(context.options.get("max_pages", 5)),
+                        "depth": int(context.options.get("depth", 1)),
+                        "timeout_seconds": int(
+                            context.options.get("session_timeout_seconds", 60)
+                        ),
+                        "database_path": database_path or "",
+                        "proxy_url": context.proxy_url or "",
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            )
+            for target in context.targets
+        ]
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        self.validate(context)
+        execution = self._execute_invocations(context, self.materialize(context))
+        sanitized: list[CommandResult] = []
+        artifacts: list[SensitiveArtifact] = []
+        for result in execution.results:
+            try:
+                payload = json.loads(result.stdout)
+            except json.JSONDecodeError as exc:
+                raise AdapterExecutionError(
+                    "Playwright runner returned invalid JSON", execution
+                ) from exc
+            if not isinstance(payload, dict):
+                raise AdapterExecutionError(
+                    "Playwright runner output must be an object", execution
+                )
+            pages = payload.get("pages")
+            if not isinstance(pages, list):
+                raise AdapterExecutionError(
+                    "Playwright runner output is missing pages", execution
+                )
+            for index, page in enumerate(pages):
+                if not isinstance(page, dict):
+                    continue
+                encoded = page.pop("screenshot_base64", None)
+                if not encoded:
+                    continue
+                try:
+                    content = base64.b64decode(str(encoded), validate=True)
+                except (ValueError, TypeError) as exc:
+                    raise AdapterExecutionError(
+                        "Playwright screenshot is not valid base64"
+                    ) from exc
+                if not content or len(content) > 1_048_576:
+                    raise AdapterExecutionError(
+                        "Playwright screenshot exceeds the 1 MiB evidence limit"
+                    )
+                expected_hash = str(page.get("screenshot_sha256") or "")
+                actual_hash = hashlib.sha256(content).hexdigest()
+                if expected_hash != actual_hash:
+                    raise AdapterExecutionError("Playwright screenshot hash mismatch")
+                key = f"{result.target or 'target'}#screenshot-{index}"
+                page["screenshot_artifact_key"] = key
+                artifacts.append(
+                    SensitiveArtifact(
+                        key=key,
+                        target=result.target,
+                        artifact_kind="browser_screenshot",
+                        media_type="image/jpeg",
+                        content=content,
+                    )
+                )
+            sanitized.append(
+                CommandResult(
+                    target=result.target,
+                    stdout=json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
+                    stderr=result.stderr,
+                    returncode=result.returncode,
+                    duration_ms=result.duration_ms,
+                )
+            )
+        return AdapterExecution(tuple(sanitized), tuple(artifacts))
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        sessions = _parse_json_lines(execution, tool_id=self.tool_id)
+        for session in sessions:
+            target = normalize_web_target(str(session.get("target") or ""))
+            max_requests = int(session.get("request_budget") or 0)
+            request_count = int(session.get("request_count") or 0)
+            if not 1 <= max_requests <= 50 or not 0 <= request_count <= max_requests:
+                raise AdapterExecutionError(
+                    "Playwright runner exceeded its immutable request budget", execution
+                )
+            if session.get("same_origin_only") is not True or session.get(
+                "persistent_profile"
+            ) is not False:
+                raise AdapterExecutionError(
+                    "Playwright runner did not attest its isolation policy", execution
+                )
+            if session.get("allowed_methods") != ["GET", "HEAD"]:
+                raise AdapterExecutionError(
+                    "Playwright runner returned an unsafe method policy", execution
+                )
+            for record in [
+                *list(session.get("pages") or []),
+                *list(session.get("responses") or []),
+            ]:
+                record_url = record.get("final_url") or record.get("url")
+                if record_url and _same_origin_archived_url(target, str(record_url)) is None:
+                    raise AdapterExecutionError(
+                        "Playwright runner returned cross-origin evidence", execution
+                    )
+            for page in session.get("pages") or []:
+                for linked_url in [
+                    *list(page.get("links") or []),
+                    *list(page.get("scripts") or []),
+                    *[
+                        form.get("action")
+                        for form in list(page.get("forms") or [])
+                        if isinstance(form, dict)
+                    ],
+                ]:
+                    if linked_url and _same_origin_archived_url(
+                        target, str(linked_url)
+                    ) is None:
+                        raise AdapterExecutionError(
+                            "Playwright runner returned cross-origin page metadata",
+                            execution,
+                        )
+            for response in session.get("responses") or []:
+                if str(response.get("method") or "").upper() not in {"GET", "HEAD"}:
+                    raise AdapterExecutionError(
+                        "Playwright runner returned a state-changing request", execution
+                    )
+        return {"sessions": sessions}
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        from cairn.server.services import utcnow
+        from cairn.server.vulnerability_services import (
+            next_vulnerability_id,
+            normalize_target,
+        )
+
+        artifact_refs = parsed.get("_sensitive_artifact_refs", {})
+        observations = 0
+        response_count = 0
+        screenshot_count = 0
+        for session in parsed.get("sessions", []):
+            target = normalize_web_target(str(session["target"]))
+            host = normalize_network_host(str(urlsplit(target).hostname or ""))
+            pages = []
+            for page in session.get("pages", []):
+                page_copy = dict(page)
+                key = page_copy.pop("screenshot_artifact_key", None)
+                if key and key in artifact_refs:
+                    page_copy["screenshot_evidence_ref"] = artifact_refs[key]
+                    screenshot_count += 1
+                pages.append(page_copy)
+            data = {
+                "target": target,
+                "pages": pages,
+                "responses": [
+                    {
+                        key: response.get(key)
+                        for key in (
+                            "url",
+                            "method",
+                            "resource_type",
+                            "status_code",
+                            "body_sha256",
+                            "body_truncated",
+                        )
+                    }
+                    for response in session.get("responses", [])
+                ],
+                "blocked_requests": session.get("blocked_requests", []),
+                "request_count": session.get("request_count"),
+                "request_budget": session.get("request_budget"),
+                "rate_limit": session.get("rate_limit"),
+                "same_origin_only": True,
+                "allowed_methods": ["GET", "HEAD"],
+                "websockets_blocked": True,
+                "service_workers_blocked": True,
+                "persistent_profile": False,
+                "network_path": session.get("network_path"),
+            }
+            observations += int(
+                _record_domain_metadata(
+                    context,
+                    "browser_evidence_session",
+                    host,
+                    data,
+                    dimension="web",
+                )
+            )
+            asset = context.conn.execute(
+                "SELECT id FROM vuln_assets WHERE campaign_id = ? "
+                "AND asset_type IN ('domain', 'ip', 'ipv4', 'ipv6') "
+                "AND normalized_identifier = ? ORDER BY id LIMIT 1",
+                (context.campaign_id, normalize_target(host)),
+            ).fetchone()
+            if asset is None:
+                continue
+            for response in session.get("responses", []):
+                response_headers = response.get("response_headers") or {}
+                raw_header = "\r\n".join(
+                    [
+                        f"HTTP/1.1 {int(response.get('status_code') or 0)} Captured",
+                        *(
+                            f"{str(name)[:256]}: {str(value)[:4096]}"
+                            for name, value in list(response_headers.items())[:100]
+                        ),
+                        "",
+                        "",
+                    ]
+                )
+                request_headers = response.get("request_headers") or {}
+                request, response_text, truncated, response_bytes, response_hash = (
+                    _http_response_envelope(
+                        {
+                            "method": response.get("method") or "GET",
+                            "raw_header": raw_header,
+                            "body": response.get("body_text") or "",
+                            "status_code": response.get("status_code"),
+                        },
+                        str(response["url"]),
+                        request_headers,
+                    )
+                )
+                response_id = next_vulnerability_id(
+                    context.conn, "http_response", "http_response"
+                )
+                context.conn.execute(
+                    """
+                    INSERT INTO vuln_http_responses
+                        (id, campaign_id, task_id, source_id, asset_id, url, method,
+                         status_code, request_text, response_text, response_hash,
+                         response_bytes, content_truncated, redacted, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                    ON CONFLICT(task_id, url) DO UPDATE SET
+                        method = excluded.method,
+                        status_code = excluded.status_code,
+                        request_text = excluded.request_text,
+                        response_text = excluded.response_text,
+                        response_hash = excluded.response_hash,
+                        response_bytes = excluded.response_bytes,
+                        content_truncated = excluded.content_truncated,
+                        redacted = 1
+                    """,
+                    (
+                        response_id,
+                        context.campaign_id,
+                        context.task_id,
+                        context.source["id"],
+                        asset["id"],
+                        str(response["url"])[:4096],
+                        str(response.get("method") or "GET")[:16],
+                        response.get("status_code"),
+                        request,
+                        response_text,
+                        response_hash,
+                        response_bytes,
+                        int(truncated or bool(response.get("body_truncated"))),
+                        utcnow(),
+                    ),
+                )
+                response_count += 1
+        return {
+            "observations_created": observations,
+            "http_responses_captured": response_count,
+            "screenshots_captured": screenshot_count,
+        }
+
+    def coverage_complete(self, context: AdapterContext, parsed: Any) -> bool:
+        # A bounded browser session is evidence of what was visited, never proof
+        # that the full web surface was enumerated.
+        return False
 
 
 class NaabuPortScanAdapter(ActiveNetworkTargetAdapter):
@@ -2137,6 +3507,1471 @@ class GitleaksLocalRepositoryAdapter(VulnSourceAdapter):
         )
 
 
+def _cyclonedx_license_values(component: Mapping[str, Any]) -> list[str]:
+    values: list[str] = []
+    raw_licenses = component.get("licenses")
+    if not isinstance(raw_licenses, list):
+        return values
+    for item in raw_licenses[:100]:
+        if not isinstance(item, Mapping):
+            continue
+        expression = item.get("expression")
+        if isinstance(expression, str) and expression.strip():
+            values.append(expression.strip()[:512])
+            continue
+        license_value = item.get("license")
+        if not isinstance(license_value, Mapping):
+            continue
+        value = license_value.get("id") or license_value.get("name")
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip()[:512])
+    return list(dict.fromkeys(values))
+
+
+def _cyclonedx_hash_values(component: Mapping[str, Any]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    raw_hashes = component.get("hashes")
+    if not isinstance(raw_hashes, list):
+        return values
+    for item in raw_hashes[:50]:
+        if not isinstance(item, Mapping):
+            continue
+        algorithm = str(item.get("alg") or "").strip().upper()[:32]
+        content = str(item.get("content") or "").strip().lower()[:256]
+        if algorithm and content and re.fullmatch(r"[0-9a-f]+", content):
+            values[algorithm] = content
+    return dict(sorted(values.items()))
+
+
+_PURL_OSV_ECOSYSTEMS = {
+    "cargo": "crates.io",
+    "composer": "Packagist",
+    "gem": "RubyGems",
+    "github": "GitHub Actions",
+    "golang": "Go",
+    "hex": "Hex",
+    "maven": "Maven",
+    "npm": "npm",
+    "nuget": "NuGet",
+    "pub": "Pub",
+    "pypi": "PyPI",
+    "swift": "SwiftURL",
+}
+
+
+def _purl_dependency_identity(purl: str | None) -> dict[str, str] | None:
+    if not purl or not purl.startswith("pkg:"):
+        return None
+    body = purl[4:].split("#", 1)[0].split("?", 1)[0]
+    if "/" not in body or "@" not in body:
+        return None
+    package_type, remainder = body.split("/", 1)
+    path, version = remainder.rsplit("@", 1)
+    ecosystem = _PURL_OSV_ECOSYSTEMS.get(package_type.casefold())
+    if not ecosystem:
+        return None
+    decoded_path = unquote(path).strip("/")
+    decoded_version = unquote(version).strip()
+    if not decoded_path or not decoded_version:
+        return None
+    if package_type.casefold() == "maven" and "/" in decoded_path:
+        namespace, name = decoded_path.rsplit("/", 1)
+        decoded_path = f"{namespace.replace('/', '.')}:{name}"
+    return {
+        "ecosystem": ecosystem,
+        "name": decoded_path[:1024],
+        "version": decoded_version[:512],
+        "identifier": f"{ecosystem}:{decoded_path}@{decoded_version}"[:2048],
+    }
+
+
+class SyftLocalSbomAdapter(VulnSourceAdapter):
+    """Generate a bounded CycloneDX inventory inside a no-network namespace."""
+
+    tool_id = "syft.local-sbom.v1"
+    version = "1.0.0"
+    risk_class = "R1"
+    source_type = "syft_local_sbom"
+    dimension = "supply_chain"
+    binary = _configured_user_binary("syft", "CAIRN_SYFT_BINARY")
+    expected_tool_version = SYFT_PACKAGE_VERSION
+    release_sha256 = SYFT_PACKAGE_SHA256
+    requires_human_approval = True
+    uses_http = False
+    uses_network = False
+    timeout_seconds = 60
+    input_schema = {
+        "type": "object",
+        "required": ["repositories"],
+        "properties": {
+            "repositories": {"type": "array", "items": {"type": "object"}}
+        },
+        "additionalProperties": False,
+    }
+    output_schema = {
+        "type": "object",
+        "required": ["documents"],
+        "properties": {"documents": {"type": "array", "items": {"type": "object"}},},
+    }
+
+    def validate(self, context: AdapterContext) -> None:
+        super().validate(context)
+        if not context.repositories:
+            raise AdapterValidationError("Syft requires an authorized local repository asset")
+        if len(context.repositories) > 5:
+            raise AdapterValidationError("Syft accepts at most five repositories per task")
+        for repository in context.repositories:
+            path = authorized_local_supply_chain_target(
+                str(repository.get("path") or "")
+            )
+            if path != Path(str(repository.get("path") or "")).expanduser().resolve():
+                raise AdapterValidationError("Repository path did not resolve deterministically")
+            if not repository.get("asset_id"):
+                raise AdapterValidationError("Repository input is not linked to an asset")
+            _validate_supply_chain_tree(path)
+
+    def health(self) -> dict[str, Any]:
+        executable = shutil.which(self.binary)
+        namespace_tool = shutil.which("unshare")
+        if executable is None or namespace_tool is None:
+            missing = self.binary if executable is None else "unshare"
+            return {
+                "healthy": False,
+                "tool_id": self.tool_id,
+                "version": None,
+                "error": f"Executable not found: {missing}",
+            }
+        try:
+            binary_hash = _sha256_file(Path(executable))
+        except OSError as exc:
+            return {
+                "healthy": False,
+                "tool_id": self.tool_id,
+                "version": None,
+                "error": f"Syft executable cannot be hashed: {type(exc).__name__}",
+            }
+        if binary_hash != SYFT_BINARY_SHA256:
+            return {
+                "healthy": False,
+                "tool_id": self.tool_id,
+                "version": self.expected_tool_version,
+                "error": "Syft executable hash does not match the audited Kali package",
+            }
+        return {
+            "healthy": True,
+            "tool_id": self.tool_id,
+            "version": self.expected_tool_version,
+            "expected_version": self.expected_tool_version,
+            "release_sha256": self.release_sha256,
+            "binary_sha256": binary_hash,
+            "network_namespace": "disabled",
+            "offline_only": True,
+            "error": None,
+        }
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        namespace_tool = shutil.which("unshare") or "unshare"
+        return [
+            AdapterInvocation(
+                argv=(
+                    namespace_tool,
+                    "--user",
+                    "--map-current-user",
+                    "--net",
+                    "--",
+                    self.binary,
+                    "scan",
+                    f"dir:{authorized_local_supply_chain_target(str(repository['path']))}",
+                    "--base-path",
+                    str(authorized_local_supply_chain_target(str(repository["path"]))),
+                    "--parallelism",
+                    "1",
+                    "--quiet",
+                    "--output",
+                    "cyclonedx-json@1.6",
+                ),
+                target=str(
+                    authorized_local_supply_chain_target(str(repository["path"]))
+                ),
+            )
+            for repository in context.repositories
+        ]
+
+    @staticmethod
+    def _redacted_execution(execution: AdapterExecution) -> AdapterExecution:
+        """Preserve deterministic diagnostics without exposing local filesystem data."""
+
+        return AdapterExecution(
+            tuple(
+                replace(
+                    result,
+                    stdout=(
+                        "[SYFT RAW OUTPUT REDACTED] "
+                        f"sha256={hashlib.sha256(result.stdout.encode('utf-8')).hexdigest()} "
+                        f"bytes={len(result.stdout.encode('utf-8'))}"
+                        if result.stdout
+                        else ""
+                    ),
+                    stderr=(
+                        "[SYFT STDERR REDACTED] "
+                        f"sha256={hashlib.sha256(result.stderr.encode('utf-8')).hexdigest()} "
+                        f"bytes={len(result.stderr.encode('utf-8'))}"
+                        if result.stderr
+                        else ""
+                    ),
+                )
+                for result in execution.results
+            )
+        )
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        try:
+            execution = self._execute_materialized(context)
+        except AdapterExecutionError as exc:
+            sanitized = (
+                self._redacted_execution(exc.execution)
+                if exc.execution is not None
+                else None
+            )
+            raise AdapterExecutionError(str(exc), sanitized) from exc
+        redacted_failure = self._redacted_execution(execution)
+        repositories = {
+            str(authorized_local_supply_chain_target(str(item["path"]))): str(
+                item["asset_id"]
+            )
+            for item in context.repositories
+        }
+        artifacts: list[SensitiveArtifact] = []
+        sanitized_results: list[CommandResult] = []
+        for result in execution.results:
+            raw = result.stdout.encode("utf-8")
+            if not raw:
+                raise AdapterExecutionError(
+                    "Syft produced no CycloneDX document", redacted_failure
+                )
+            if len(raw) > SYFT_MAX_OUTPUT_BYTES:
+                raise AdapterExecutionError(
+                    "Syft CycloneDX document exceeds the 5 MiB evidence limit",
+                    redacted_failure,
+                )
+            asset_id = repositories.get(str(result.target or ""))
+            if not asset_id:
+                raise AdapterExecutionError(
+                    "Syft output target is not linked to an approved repository",
+                    redacted_failure,
+                )
+            try:
+                payload = json.loads(result.stdout)
+            except json.JSONDecodeError as exc:
+                raise AdapterExecutionError(
+                    "Syft returned invalid CycloneDX JSON", redacted_failure
+                ) from exc
+            if not isinstance(payload, Mapping) or not isinstance(
+                payload.get("components"), list
+            ):
+                raise AdapterExecutionError(
+                    "Syft output is not a CycloneDX component document",
+                    redacted_failure,
+                )
+            if len(payload["components"]) > SYFT_MAX_COMPONENTS:
+                raise AdapterExecutionError(
+                    "Syft component count exceeds the 10000 component limit",
+                    redacted_failure,
+                )
+            safe_components = []
+            for component in payload["components"]:
+                if not isinstance(component, Mapping):
+                    safe_components.append(None)
+                    continue
+                safe_components.append(
+                    {
+                        "type": component.get("type"),
+                        "name": component.get("name"),
+                        "version": component.get("version"),
+                        "purl": component.get("purl"),
+                        "licenses": component.get("licenses"),
+                        "hashes": component.get("hashes"),
+                    }
+                )
+            sanitized_results.append(
+                replace(
+                    result,
+                    stdout=json.dumps(
+                        {
+                            "bomFormat": "CycloneDX",
+                            "components": safe_components,
+                            "_raw_document_hash": hashlib.sha256(raw).hexdigest(),
+                            "_component_count": len(payload["components"]),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    stderr=(
+                        "[SYFT STDERR REDACTED] "
+                        f"sha256={hashlib.sha256(result.stderr.encode('utf-8')).hexdigest()} "
+                        f"bytes={len(result.stderr.encode('utf-8'))}"
+                        if result.stderr
+                        else ""
+                    ),
+                )
+            )
+            artifacts.append(
+                SensitiveArtifact(
+                    key=f"sbom:{asset_id}",
+                    target=result.target,
+                    artifact_kind="cyclonedx_sbom",
+                    media_type="application/vnd.cyclonedx+json",
+                    content=raw,
+                )
+            )
+        return AdapterExecution(
+            results=tuple(sanitized_results),
+            sensitive_artifacts=tuple(artifacts),
+        )
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        documents: list[dict[str, Any]] = []
+        for result in execution.results:
+            try:
+                payload = json.loads(result.stdout)
+            except json.JSONDecodeError as exc:
+                raise AdapterExecutionError(
+                    "Syft returned invalid CycloneDX JSON", execution
+                ) from exc
+            if not isinstance(payload, Mapping) or not isinstance(
+                payload.get("components"), list
+            ):
+                raise AdapterExecutionError(
+                    "Syft output is not a CycloneDX component document", execution
+                )
+            raw_components = payload["components"]
+            if len(raw_components) > SYFT_MAX_COMPONENTS:
+                raise AdapterExecutionError(
+                    "Syft component count exceeds the 10000 component limit",
+                    execution,
+                )
+            components: list[dict[str, Any]] = []
+            coverage_complete = True
+            for item in raw_components:
+                if not isinstance(item, Mapping):
+                    coverage_complete = False
+                    continue
+                purl = str(item.get("purl") or "").strip()[:2048] or None
+                name = str(item.get("name") or purl or "").strip()[:1024]
+                if not name:
+                    coverage_complete = False
+                    continue
+                component = {
+                    "purl": purl,
+                    "name": name,
+                    "version": str(item.get("version") or "").strip()[:512] or None,
+                    "component_type": str(item.get("type") or "library").strip()[:64],
+                    "licenses": _cyclonedx_license_values(item),
+                    "hashes": _cyclonedx_hash_values(item),
+                    "dependency": _purl_dependency_identity(purl),
+                }
+                component["component_hash"] = hashlib.sha256(
+                    json.dumps(
+                        component,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                components.append(component)
+            documents.append(
+                {
+                    "target": str(result.target or ""),
+                    "artifact_key": "",
+                    "document_hash": str(
+                        payload.get("_raw_document_hash")
+                        or hashlib.sha256(result.stdout.encode("utf-8")).hexdigest()
+                    ),
+                    "component_count": int(
+                        payload.get("_component_count") or len(raw_components)
+                    ),
+                    "coverage_complete": coverage_complete
+                    and len(components) == len(raw_components),
+                    "components": components,
+                }
+            )
+        return {"documents": documents}
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        from cairn.server.vulnerability_services import reconcile_syft_sbom
+
+        documents = list(parsed.get("documents", []))
+        refs = parsed.get("_sensitive_artifact_refs", {})
+        refs = refs if isinstance(refs, Mapping) else {}
+        repository_ids = {
+            str(authorized_local_supply_chain_target(str(item["path"]))): str(
+                item["asset_id"]
+            )
+            for item in context.repositories
+        }
+        for document in documents:
+            asset_id = repository_ids.get(str(document.get("target") or ""), "")
+            document["artifact_key"] = f"sbom:{asset_id}"
+            document["vault_ref"] = refs.get(document["artifact_key"])
+        return reconcile_syft_sbom(
+            context.conn,
+            campaign_id=context.campaign_id,
+            task_id=context.task_id,
+            source_id=str(context.source["id"]),
+            adapter=self.tool_id,
+            source_name=str(
+                context.source["name"]
+                if "name" in context.source.keys()
+                else "Syft authorized local SBOM"
+            ),
+            repositories=list(context.repositories),
+            documents=documents,
+        )
+
+    def coverage_complete(self, context: AdapterContext, parsed: Any) -> bool:
+        documents = parsed.get("documents", [])
+        return bool(documents) and all(
+            bool(item.get("coverage_complete")) for item in documents
+        )
+
+
+class SyftContainerArchiveSbomAdapter(SyftLocalSbomAdapter):
+    """Generate a CycloneDX inventory from an authorized local image archive."""
+
+    tool_id = "syft.container-archive-sbom.v1"
+    version = "1.0.0"
+    risk_class = "R1"
+    source_type = "syft_container_archive_sbom"
+    dimension = "supply_chain"
+    requires_human_approval = True
+    input_schema = {
+        "type": "object",
+        "required": ["container_archives"],
+        "properties": {
+            "container_archives": {
+                "type": "array",
+                "items": {"type": "object"},
+                "maxItems": 2,
+            }
+        },
+        "additionalProperties": False,
+    }
+
+    def normalize_task_target(self, value: str) -> str:
+        return str(authorized_local_supply_chain_archive(value))
+
+    def validate(self, context: AdapterContext) -> None:
+        VulnSourceAdapter.validate(self, context)
+        if not context.container_archives:
+            raise AdapterValidationError(
+                "Syft requires an authorized local container image archive"
+            )
+        if len(context.container_archives) > 2:
+            raise AdapterValidationError(
+                "Syft accepts at most two container archives per task"
+            )
+        for subject in context.container_archives:
+            path = authorized_local_supply_chain_archive(str(subject.get("path") or ""))
+            if path != Path(str(subject.get("path") or "")).expanduser().resolve():
+                raise AdapterValidationError(
+                    "Container archive path did not resolve deterministically"
+                )
+            if not subject.get("asset_id"):
+                raise AdapterValidationError(
+                    "Container archive input is not linked to an asset"
+                )
+            archive_format = _container_archive_format(path)
+            declared = str(subject.get("archive_format") or "")
+            if declared and declared != archive_format:
+                raise AdapterValidationError("Container archive format changed after policy validation")
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        namespace_tool = shutil.which("unshare") or "unshare"
+        invocations: list[AdapterInvocation] = []
+        for subject in context.container_archives:
+            path = authorized_local_supply_chain_archive(str(subject["path"]))
+            archive_format = _container_archive_format(path)
+            invocations.append(
+                AdapterInvocation(
+                    argv=(
+                        namespace_tool,
+                        "--user",
+                        "--map-current-user",
+                        "--net",
+                        "--",
+                        self.binary,
+                        "scan",
+                        f"{archive_format}:{path}",
+                        "--parallelism",
+                        "1",
+                        "--quiet",
+                        "--output",
+                        "cyclonedx-json@1.6",
+                    ),
+                    target=str(path),
+                )
+            )
+        return invocations
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        self.validate(context)
+        subjects = {
+            str(authorized_local_supply_chain_archive(str(item["path"]))): str(
+                item["asset_id"]
+            )
+            for item in context.container_archives
+        }
+        try:
+            execution = self._execute_invocations(context, self.materialize(context))
+        except AdapterExecutionError as exc:
+            sanitized = (
+                self._redacted_execution(exc.execution)
+                if exc.execution is not None
+                else None
+            )
+            raise AdapterExecutionError(str(exc), sanitized) from exc
+        redacted_failure = self._redacted_execution(execution)
+        artifacts: list[SensitiveArtifact] = []
+        sanitized_results: list[CommandResult] = []
+        for result in execution.results:
+            raw = result.stdout.encode("utf-8")
+            if not raw:
+                raise AdapterExecutionError(
+                    "Syft produced no CycloneDX document", redacted_failure
+                )
+            if len(raw) > SYFT_MAX_OUTPUT_BYTES:
+                raise AdapterExecutionError(
+                    "Syft CycloneDX document exceeds the 5 MiB evidence limit",
+                    redacted_failure,
+                )
+            asset_id = subjects.get(str(result.target or ""))
+            if not asset_id:
+                raise AdapterExecutionError(
+                    "Syft output target is not linked to an approved container image",
+                    redacted_failure,
+                )
+            try:
+                payload = json.loads(result.stdout)
+            except json.JSONDecodeError as exc:
+                raise AdapterExecutionError(
+                    "Syft returned invalid CycloneDX JSON", redacted_failure
+                ) from exc
+            if not isinstance(payload, Mapping) or not isinstance(
+                payload.get("components"), list
+            ):
+                raise AdapterExecutionError(
+                    "Syft output is not a CycloneDX component document",
+                    redacted_failure,
+                )
+            if len(payload["components"]) > SYFT_MAX_COMPONENTS:
+                raise AdapterExecutionError(
+                    "Syft component count exceeds the 10000 component limit",
+                    redacted_failure,
+                )
+            safe_components = []
+            for component in payload["components"]:
+                if not isinstance(component, Mapping):
+                    safe_components.append(None)
+                    continue
+                safe_components.append(
+                    {
+                        "type": component.get("type"),
+                        "name": component.get("name"),
+                        "version": component.get("version"),
+                        "purl": component.get("purl"),
+                        "licenses": component.get("licenses"),
+                        "hashes": component.get("hashes"),
+                    }
+                )
+            sanitized_results.append(
+                replace(
+                    result,
+                    stdout=json.dumps(
+                        {
+                            "bomFormat": "CycloneDX",
+                            "components": safe_components,
+                            "_raw_document_hash": hashlib.sha256(raw).hexdigest(),
+                            "_component_count": len(payload["components"]),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    stderr=(
+                        "[SYFT STDERR REDACTED] "
+                        f"sha256={hashlib.sha256(result.stderr.encode('utf-8')).hexdigest()} "
+                        f"bytes={len(result.stderr.encode('utf-8'))}"
+                        if result.stderr
+                        else ""
+                    ),
+                )
+            )
+            artifacts.append(
+                SensitiveArtifact(
+                    key=f"sbom:{asset_id}",
+                    target=result.target,
+                    artifact_kind="cyclonedx_sbom",
+                    media_type="application/vnd.cyclonedx+json",
+                    content=raw,
+                )
+            )
+        return AdapterExecution(
+            results=tuple(sanitized_results),
+            sensitive_artifacts=tuple(artifacts),
+        )
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        from cairn.server.vulnerability_services import reconcile_syft_sbom
+
+        documents = list(parsed.get("documents", []))
+        refs = parsed.get("_sensitive_artifact_refs", {})
+        refs = refs if isinstance(refs, Mapping) else {}
+        subject_ids = {
+            str(authorized_local_supply_chain_archive(str(item["path"]))): str(
+                item["asset_id"]
+            )
+            for item in context.container_archives
+        }
+        subjects = []
+        for item in context.container_archives:
+            subjects.append(
+                {**item, "asset_type": str(item.get("asset_type") or "container_image")}
+            )
+        for document in documents:
+            asset_id = subject_ids.get(str(document.get("target") or ""), "")
+            document["artifact_key"] = f"sbom:{asset_id}"
+            document["vault_ref"] = refs.get(document["artifact_key"])
+        return reconcile_syft_sbom(
+            context.conn,
+            campaign_id=context.campaign_id,
+            task_id=context.task_id,
+            source_id=str(context.source["id"]),
+            adapter=self.tool_id,
+            source_name=str(
+                context.source["name"]
+                if "name" in context.source.keys()
+                else "Syft authorized container archive SBOM"
+            ),
+            repositories=subjects,
+            documents=documents,
+        )
+
+
+class TrivySbomVulnerabilityAdapter(VulnSourceAdapter):
+    """Match saved encrypted SBOM evidence against an audited offline DB."""
+
+    tool_id = "trivy.sbom-vuln.v1"
+    version = "1.0.0"
+    risk_class = "R0"
+    source_type = "trivy_sbom_vulnerability"
+    dimension = "supply_chain"
+    binary = _configured_user_binary("trivy", "CAIRN_TRIVY_BINARY")
+    expected_tool_version = TRIVY_PACKAGE_VERSION
+    release_sha256 = TRIVY_PACKAGE_SHA256
+    requires_human_approval = True
+    uses_http = False
+    uses_network = False
+    timeout_seconds = 90
+    input_schema = {
+        "type": "object",
+        "required": ["repositories", "sboms"],
+        "properties": {
+            "repositories": {"type": "array", "items": {"type": "object"}},
+            "sboms": {"type": "array", "items": {"type": "object"}, "maxItems": 5},
+        },
+        "additionalProperties": False,
+    }
+    output_schema = {
+        "type": "object",
+        "required": ["documents", "coverage_complete"],
+        "properties": {
+            "documents": {"type": "array", "items": {"type": "object"}},
+            "coverage_complete": {"type": "boolean"},
+        },
+    }
+
+    def _subjects(self, context: AdapterContext) -> tuple[Mapping[str, Any], ...]:
+        return context.repositories
+
+    def validate(self, context: AdapterContext) -> None:
+        super().validate(context)
+        subjects = self._subjects(context)
+        if not subjects or not context.sboms:
+            raise AdapterValidationError(
+                "Trivy requires a saved SBOM for an approved supply-chain subject"
+            )
+        if len(context.sboms) > 5 or len(context.sboms) != len(subjects):
+            raise AdapterValidationError(
+                "Trivy accepts one saved SBOM per approved supply-chain subject"
+            )
+        subject_ids = {str(item.get("asset_id") or "") for item in subjects}
+        for sbom in context.sboms:
+            if str(sbom.get("subject_asset_id") or sbom.get("repository_asset_id") or "") not in subject_ids:
+                raise AdapterValidationError(
+                    "Saved SBOM is not linked to the approved supply-chain subject"
+                )
+            content = sbom.get("content")
+            if not isinstance(content, bytes) or not content:
+                raise AdapterValidationError("Saved SBOM content is unavailable")
+            if len(content) > SYFT_MAX_OUTPUT_BYTES:
+                raise AdapterValidationError("Saved SBOM exceeds the 5 MiB input limit")
+            if hashlib.sha256(content).hexdigest() != str(sbom.get("document_hash") or ""):
+                raise AdapterValidationError("Saved SBOM content hash mismatch")
+            try:
+                document = json.loads(content)
+            except json.JSONDecodeError as exc:
+                raise AdapterValidationError("Saved SBOM is not valid JSON") from exc
+            if not isinstance(document, Mapping) or document.get("bomFormat") != "CycloneDX":
+                raise AdapterValidationError("Saved SBOM is not a CycloneDX document")
+            if str(document.get("specVersion") or "") not in {"1.3", "1.4", "1.5", "1.6"}:
+                raise AdapterValidationError("Saved SBOM uses an unsupported CycloneDX version")
+            if not isinstance(document.get("components"), list):
+                raise AdapterValidationError("Saved SBOM has no component inventory")
+
+    def estimate(self, context: AdapterContext) -> dict[str, Any]:
+        return {
+            "command_count": len(context.sboms),
+            "timeout_seconds": self.timeout_seconds,
+            "risk_class": self.risk_class,
+            "network_request_count": 0,
+            "offline_only": True,
+            "database_snapshot": TRIVY_DB_SNAPSHOT,
+        }
+
+    def health(self) -> dict[str, Any]:
+        executable = shutil.which(self.binary)
+        namespace_tool = shutil.which("unshare")
+        if executable is None or namespace_tool is None:
+            missing = self.binary if executable is None else "unshare"
+            return {"healthy": False, "tool_id": self.tool_id, "version": None,
+                    "error": f"Executable not found: {missing}"}
+        try:
+            binary_hash = _sha256_file(Path(executable))
+            root, _database, _metadata = _audited_trivy_database()
+        except (OSError, AdapterError) as exc:
+            return {"healthy": False, "tool_id": self.tool_id,
+                    "version": self.expected_tool_version, "error": str(exc)}
+        if binary_hash != TRIVY_BINARY_SHA256:
+            return {"healthy": False, "tool_id": self.tool_id,
+                    "version": self.expected_tool_version,
+                    "error": "Trivy executable hash does not match the audited Kali package"}
+        return {
+            "healthy": True,
+            "tool_id": self.tool_id,
+            "version": self.expected_tool_version,
+            "expected_version": self.expected_tool_version,
+            "release_sha256": self.release_sha256,
+            "binary_sha256": binary_hash,
+            "database_root_hash": hashlib.sha256(str(root).encode("utf-8")).hexdigest(),
+            "database_snapshot": TRIVY_DB_SNAPSHOT,
+            "database_sha256": TRIVY_DB_SHA256,
+            "database_metadata_sha256": TRIVY_DB_METADATA_SHA256,
+            "database_updated_at": TRIVY_DB_UPDATED_AT,
+            "network_namespace": "disabled",
+            "offline_only": True,
+            "error": None,
+        }
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        database_root, _database, _metadata = _audited_trivy_database()
+        namespace_tool = shutil.which("unshare")
+        if namespace_tool is None:
+            raise AdapterUnavailableError("Trivy requires a Linux user network namespace")
+        invocations: list[AdapterInvocation] = []
+        for sbom in context.sboms:
+            file_path = str(sbom.get("file_path") or "")
+            if not file_path:
+                raise AdapterValidationError("Trivy SBOM file was not materialized")
+            invocations.append(
+                AdapterInvocation(
+                    argv=(
+                        namespace_tool, "--user", "--map-current-user", "--net", "--",
+                        self.binary, "sbom", "--cache-dir", str(database_root),
+                        "--skip-db-update", "--skip-java-db-update",
+                        "--skip-vex-repo-update", "--offline-scan",
+                        "--disable-telemetry", "--skip-version-check",
+                        "--scanners", "vuln", "--detection-priority", "precise",
+                        "--format", "json", file_path,
+                    ),
+                    target=str(sbom["id"]),
+                )
+            )
+        return invocations
+
+    @staticmethod
+    def _sanitize_output(payload: Mapping[str, Any], sbom_id: str) -> dict[str, Any]:
+        findings: list[dict[str, Any]] = []
+        results = payload.get("Results")
+        if not isinstance(results, list):
+            raise AdapterExecutionError("Trivy output has no Results array")
+        for result in results:
+            if not isinstance(result, Mapping):
+                continue
+            vulnerabilities = result.get("Vulnerabilities") or []
+            if not isinstance(vulnerabilities, list):
+                raise AdapterExecutionError("Trivy vulnerability result is malformed")
+            for vulnerability in vulnerabilities:
+                if not isinstance(vulnerability, Mapping):
+                    continue
+                if len(findings) >= TRIVY_MAX_VULNERABILITIES:
+                    raise AdapterExecutionError("Trivy vulnerability count exceeds the 10000 limit")
+                package_identifier = vulnerability.get("PkgIdentifier")
+                package_identifier = package_identifier if isinstance(package_identifier, Mapping) else {}
+                cvss_score: float | None = None
+                cvss_vector: str | None = None
+                cvss = vulnerability.get("CVSS")
+                if isinstance(cvss, Mapping):
+                    for authority in cvss.values():
+                        if not isinstance(authority, Mapping):
+                            continue
+                        for key in ("V40Score", "V3Score", "V2Score"):
+                            try:
+                                candidate = float(authority[key])
+                            except (KeyError, TypeError, ValueError):
+                                continue
+                            if cvss_score is None or candidate > cvss_score:
+                                cvss_score = candidate
+                                cvss_vector = str(authority.get(key.replace("Score", "Vector")) or "")[:256] or None
+                references = vulnerability.get("References")
+                references = references if isinstance(references, list) else []
+                findings.append({
+                    "vulnerability_id": str(vulnerability.get("VulnerabilityID") or "")[:256],
+                    "purl": str(package_identifier.get("PURL") or "")[:2048],
+                    "package_name": str(vulnerability.get("PkgName") or "")[:1024],
+                    "installed_version": str(vulnerability.get("InstalledVersion") or "")[:512],
+                    "fixed_version": str(vulnerability.get("FixedVersion") or "")[:512] or None,
+                    "status": str(vulnerability.get("Status") or "")[:128] or None,
+                    "severity": str(vulnerability.get("Severity") or "unknown").lower()[:32],
+                    "title": str(vulnerability.get("Title") or "")[:1000] or None,
+                    "description": str(vulnerability.get("Description") or "")[:8000] or None,
+                    "primary_url": str(vulnerability.get("PrimaryURL") or "")[:4096] or None,
+                    "references": [str(item)[:4096] for item in references[:20] if isinstance(item, str)],
+                    "cvss_score": cvss_score,
+                    "cvss_vector": cvss_vector,
+                })
+        return {
+            "sbom_id": sbom_id,
+            "findings": findings,
+            "coverage_complete": True,
+            "database": {"snapshot": TRIVY_DB_SNAPSHOT, "sha256": TRIVY_DB_SHA256,
+                         "metadata_sha256": TRIVY_DB_METADATA_SHA256,
+                         "updated_at": TRIVY_DB_UPDATED_AT},
+        }
+
+    @staticmethod
+    def _redacted_execution(execution: AdapterExecution) -> AdapterExecution:
+        """Retain diagnostic hashes without persisting local paths or raw output."""
+
+        return AdapterExecution(tuple(
+            replace(
+                result,
+                stdout=(
+                    "[TRIVY RAW OUTPUT REDACTED] "
+                    f"sha256={hashlib.sha256(result.stdout.encode('utf-8')).hexdigest()} "
+                    f"bytes={len(result.stdout.encode('utf-8'))}"
+                    if result.stdout else ""
+                ),
+                stderr=(
+                    "[TRIVY STDERR REDACTED] "
+                    f"sha256={hashlib.sha256(result.stderr.encode('utf-8')).hexdigest()} "
+                    f"bytes={len(result.stderr.encode('utf-8'))}"
+                    if result.stderr else ""
+                ),
+            )
+            for result in execution.results
+        ))
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        self.validate(context)
+        with managed_task_workspace(context.conn, campaign_id=context.campaign_id,
+                                    task_id=context.task_id, purpose="trivy-offline-sbom") as workspace:
+            materialized: list[Mapping[str, Any]] = []
+            for index, sbom in enumerate(context.sboms):
+                path = workspace.write_bytes(
+                    f"sbom-{index:03d}.cdx.json", bytes(sbom["content"]),
+                    artifact_kind="trivy_offline_sbom_input",
+                    source_reference=f"collection-evidence:{sbom['vault_ref']}",
+                    source_promoted=True,
+                )
+                materialized.append({**sbom, "file_path": str(path)})
+            execution_context = replace(context, sboms=tuple(materialized))
+            try:
+                raw_execution = self._execute_invocations(
+                    execution_context, self.materialize(execution_context)
+                )
+            except AdapterExecutionError as exc:
+                sanitized = (
+                    self._redacted_execution(exc.execution)
+                    if exc.execution is not None else None
+                )
+                raise AdapterExecutionError(str(exc), sanitized) from exc
+            sanitized_results: list[CommandResult] = []
+            for result in raw_execution.results:
+                raw = result.stdout.encode("utf-8")
+                if not raw:
+                    raise AdapterExecutionError(
+                        "Trivy produced no JSON output",
+                        self._redacted_execution(raw_execution),
+                    )
+                if len(raw) > TRIVY_MAX_OUTPUT_BYTES:
+                    raise AdapterExecutionError(
+                        "Trivy JSON output exceeds the 5 MiB limit",
+                        self._redacted_execution(raw_execution),
+                    )
+                try:
+                    payload = json.loads(result.stdout)
+                except json.JSONDecodeError as exc:
+                    raise AdapterExecutionError(
+                        "Trivy returned invalid JSON",
+                        self._redacted_execution(raw_execution),
+                    ) from exc
+                if not isinstance(payload, Mapping):
+                    raise AdapterExecutionError(
+                        "Trivy returned a non-object JSON document",
+                        self._redacted_execution(raw_execution),
+                    )
+                try:
+                    sanitized_payload = self._sanitize_output(
+                        payload, str(result.target or "")
+                    )
+                except AdapterExecutionError as exc:
+                    raise AdapterExecutionError(
+                        str(exc), self._redacted_execution(raw_execution)
+                    ) from exc
+                sanitized_results.append(replace(
+                    result,
+                    stdout=json.dumps(sanitized_payload,
+                                      ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    stderr=(
+                        "[TRIVY STDERR REDACTED] "
+                        f"sha256={hashlib.sha256(result.stderr.encode('utf-8')).hexdigest()} "
+                        f"bytes={len(result.stderr.encode('utf-8'))}"
+                        if result.stderr else ""
+                    ),
+                ))
+            return AdapterExecution(tuple(sanitized_results))
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        documents: list[dict[str, Any]] = []
+        for result in execution.results:
+            try:
+                payload = json.loads(result.stdout)
+            except json.JSONDecodeError as exc:
+                raise AdapterExecutionError("Sanitized Trivy output is invalid", execution) from exc
+            if not isinstance(payload, dict) or not isinstance(payload.get("findings"), list):
+                raise AdapterExecutionError("Sanitized Trivy output is malformed", execution)
+            documents.append(payload)
+        return {"documents": documents, "coverage_complete": bool(documents) and all(
+            item.get("coverage_complete") is True for item in documents)}
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        from cairn.server.vulnerability_services import reconcile_trivy_findings
+
+        return reconcile_trivy_findings(
+            context.conn, campaign_id=context.campaign_id, task_id=context.task_id,
+            source_id=str(context.source["id"]), adapter=self.tool_id,
+            repositories=list(self._subjects(context)), sboms=list(context.sboms),
+            documents=list(parsed.get("documents", [])),
+            coverage_complete=self.coverage_complete(context, parsed),
+        )
+
+    def coverage_complete(self, context: AdapterContext, parsed: Any) -> bool:
+        return bool(context.sboms) and parsed.get("coverage_complete") is True
+
+
+class TrivyContainerSbomVulnerabilityAdapter(TrivySbomVulnerabilityAdapter):
+    """Apply the fixed offline vulnerability DB to saved container SBOMs."""
+
+    tool_id = "trivy.container-sbom-vuln.v1"
+    version = "1.0.0"
+    source_type = "trivy_container_sbom_vulnerability"
+    input_schema = {
+        "type": "object",
+        "required": ["container_archives", "sboms"],
+        "properties": {
+            "container_archives": {
+                "type": "array",
+                "items": {"type": "object"},
+                "maxItems": 2,
+            },
+            "sboms": {"type": "array", "items": {"type": "object"}, "maxItems": 2},
+        },
+        "additionalProperties": False,
+    }
+
+    def _subjects(self, context: AdapterContext) -> tuple[Mapping[str, Any], ...]:
+        return context.container_archives
+
+
+class _ArchivedHTMLParser(HTMLParser):
+    """Extract bounded structural metadata without evaluating untrusted markup."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.title_parts: list[str] = []
+        self.links: list[str] = []
+        self.scripts: list[str] = []
+        self.forms: list[dict[str, Any]] = []
+        self._in_title = False
+        self._current_form: dict[str, Any] | None = None
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        values = {name.casefold(): value or "" for name, value in attrs}
+        lowered = tag.casefold()
+        if lowered == "title":
+            self._in_title = True
+        elif lowered in {"a", "link"} and values.get("href") and len(self.links) < 200:
+            self.links.append(values["href"][:4096])
+        elif lowered == "script" and values.get("src") and len(self.scripts) < 100:
+            self.scripts.append(values["src"][:4096])
+        elif lowered == "form" and len(self.forms) < 50:
+            self._current_form = {
+                "action": values.get("action", "")[:4096],
+                "method": (values.get("method") or "get").upper()[:16],
+                "fields": [],
+            }
+            self.forms.append(self._current_form)
+        elif lowered in {"input", "select", "textarea", "button"} and self._current_form:
+            fields = self._current_form["fields"]
+            if len(fields) < 100:
+                fields.append(
+                    {
+                        "name": values.get("name", "")[:256],
+                        "type": (values.get("type") or lowered)[:64],
+                    }
+                )
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.casefold()
+        if lowered == "title":
+            self._in_title = False
+        elif lowered == "form":
+            self._current_form = None
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title and sum(len(item) for item in self.title_parts) < 1000:
+            self.title_parts.append(data)
+
+
+def _http_message_body(value: str) -> str:
+    normalized = value.replace("\r\n", "\n")
+    return normalized.split("\n\n", 1)[1] if "\n\n" in normalized else ""
+
+
+def _http_message_headers(value: str) -> dict[str, str]:
+    normalized = value.replace("\r\n", "\n")
+    head = normalized.split("\n\n", 1)[0]
+    headers: dict[str, str] = {}
+    for line in head.splitlines()[1:101]:
+        if ":" not in line:
+            continue
+        name, header_value = line.split(":", 1)
+        lowered = name.strip().casefold()
+        if lowered and lowered not in headers:
+            headers[lowered] = header_value.strip()[:4096]
+    return headers
+
+
+def _same_origin_archived_url(base_url: str, candidate: str) -> str | None:
+    try:
+        resolved = urljoin(base_url, candidate.strip())
+        base = urlsplit(base_url)
+        parsed = urlsplit(resolved)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return None
+        base_port = base.port or (443 if base.scheme == "https" else 80)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if (
+            parsed.scheme != base.scheme
+            or parsed.hostname.casefold().rstrip(".")
+            != str(base.hostname).casefold().rstrip(".")
+            or port != base_port
+        ):
+            return None
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.query, ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _archived_url_candidates(base_url: str, body: str) -> tuple[set[str], int]:
+    candidates: set[str] = set()
+    rejected = 0
+    for match in re.finditer(
+        r"(?P<quote>['\"])(?P<path>(?:https?://|//|/)(?!/\*)[^'\"\s<>]{1,2048})(?P=quote)",
+        body[:HTTP_RESPONSE_MAX_BYTES],
+        re.IGNORECASE,
+    ):
+        resolved = _same_origin_archived_url(base_url, match.group("path"))
+        if resolved is None:
+            rejected += 1
+        else:
+            candidates.add(resolved)
+    return candidates, rejected
+
+
+def _analyze_archived_har(base_url: str, body: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(body)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    log = payload.get("log")
+    if not isinstance(log, Mapping) or not isinstance(log.get("entries"), list):
+        return None
+    entries: list[dict[str, Any]] = []
+    endpoints: set[str] = set()
+    scripts: set[str] = set()
+    rejected = 0
+
+    def nonnegative_int(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    for item in list(log["entries"])[:200]:
+        if not isinstance(item, Mapping):
+            continue
+        request = item.get("request")
+        response = item.get("response")
+        if not isinstance(request, Mapping) or not isinstance(response, Mapping):
+            continue
+        raw_url = str(request.get("url") or "")
+        resolved = _same_origin_archived_url(base_url, raw_url)
+        if resolved is None:
+            rejected += 1
+            continue
+        method = str(request.get("method") or "GET").upper()[:16]
+        content = response.get("content")
+        content = content if isinstance(content, Mapping) else {}
+        mime_type = str(content.get("mimeType") or "")[:256]
+        request_headers = request.get("headers")
+        response_headers = response.get("headers")
+
+        def header_names(value: Any) -> list[str]:
+            if not isinstance(value, list):
+                return []
+            return sorted(
+                {
+                    str(header.get("name") or "").strip().casefold()[:256]
+                    for header in value[:100]
+                    if isinstance(header, Mapping) and header.get("name")
+                }
+            )
+
+        post_data = request.get("postData")
+        post_text = (
+            str(post_data.get("text") or "")
+            if isinstance(post_data, Mapping)
+            else ""
+        )
+        entry = {
+            "url": resolved,
+            "method": method,
+            "status_code": nonnegative_int(response.get("status")),
+            "mime_type": mime_type,
+            "response_bytes": nonnegative_int(content.get("size")),
+            "request_header_names": header_names(request_headers),
+            "response_header_names": header_names(response_headers),
+            "request_body_sha256": (
+                hashlib.sha256(post_text.encode("utf-8")).hexdigest()
+                if post_text
+                else None
+            ),
+        }
+        entries.append(entry)
+        endpoints.add(resolved)
+        path = urlsplit(resolved).path.casefold()
+        if "javascript" in mime_type.casefold() or path.endswith((".js", ".mjs")):
+            scripts.add(resolved)
+    return {
+        "entries": entries,
+        "endpoint_candidates": endpoints,
+        "scripts": scripts,
+        "cross_origin_reference_count": rejected,
+    }
+
+
+class BrowserArchiveAnalyzeAdapter(DomainAdapter):
+    """Analyze saved HTML/JS/HTTP evidence without starting a browser or network."""
+
+    tool_id = "browser.archive-analyze.v1"
+    version = "1.0.0"
+    risk_class = "R0"
+    source_type = "browser_archive_analysis"
+    dimension = "web"
+    binary = "builtin:python-html-parser"
+    uses_http = False
+    uses_network = False
+    requires_human_approval = True
+    input_schema = {
+        "type": "object",
+        "required": ["domains", "http_responses"],
+        "properties": {
+            "domains": {"type": "array", "items": {"type": "string"}},
+            "http_responses": {"type": "array", "items": {"type": "object"}},
+        },
+        "additionalProperties": False,
+    }
+    output_schema = {
+        "type": "object",
+        "required": ["records"],
+        "properties": {"records": {"type": "array", "items": {"type": "object"}}},
+    }
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "healthy": True,
+            "tool_id": self.tool_id,
+            "version": self.version,
+            "expected_version": self.version,
+            "offline_only": True,
+            "error": None,
+        }
+
+    def validate(self, context: AdapterContext) -> None:
+        super().validate(context)
+        if not context.http_responses:
+            raise AdapterValidationError(
+                "Browser archive analysis requires captured HTTP responses"
+            )
+        if len(context.http_responses) > 20:
+            raise AdapterValidationError(
+                "Browser archive analysis accepts at most 20 responses per task"
+            )
+        allowed = {normalize_domain(target) for target in context.targets}
+        for response in context.http_responses:
+            response_domain = normalize_domain(str(response.get("domain") or ""))
+            if response_domain not in allowed:
+                raise AdapterValidationError(
+                    "Captured HTTP response does not match the archive task target"
+                )
+            if not all(
+                response.get(key)
+                for key in ("id", "asset_id", "task_id", "url", "response_hash")
+            ):
+                raise AdapterValidationError(
+                    "Captured HTTP response provenance is incomplete"
+                )
+            try:
+                response_url = urlsplit(str(response["url"]))
+                response_host = normalize_domain(str(response_url.hostname or ""))
+                response_url.port
+            except (TypeError, ValueError) as exc:
+                raise AdapterValidationError(
+                    "Captured HTTP response URL is invalid"
+                ) from exc
+            if (
+                response_url.scheme not in {"http", "https"}
+                or response_url.username is not None
+                or response_url.password is not None
+                or response_host != response_domain
+            ):
+                raise AdapterValidationError(
+                    "Captured HTTP response URL does not match its asset provenance"
+                )
+            response_text = str(response.get("response_text") or "")
+            if len(response_text.encode("utf-8")) > HTTP_RESPONSE_MAX_BYTES:
+                raise AdapterValidationError("Captured HTTP response exceeds the offline limit")
+            if hashlib.sha256(response_text.encode("utf-8")).hexdigest() != str(
+                response["response_hash"]
+            ):
+                raise AdapterValidationError("Captured HTTP response hash mismatch")
+
+    def estimate(self, context: AdapterContext) -> dict[str, Any]:
+        return {
+            "command_count": 0,
+            "timeout_seconds": 0,
+            "risk_class": self.risk_class,
+            "network_request_count": 0,
+            "offline_only": True,
+            "response_count": len(context.http_responses),
+        }
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        return []
+
+    @staticmethod
+    def _analyze(response: Mapping[str, Any]) -> dict[str, Any]:
+        url = str(response["url"])
+        response_text = str(response.get("response_text") or "")
+        body = _http_message_body(response_text)
+        headers = _http_message_headers(response_text)
+        content_type = str(headers.get("content-type") or "")[:256]
+        har = _analyze_archived_har(url, body)
+        is_javascript = (
+            "javascript" in content_type.casefold()
+            or urlsplit(url).path.casefold().endswith((".js", ".mjs"))
+        )
+        parser = _ArchivedHTMLParser()
+        same_origin_links: list[str] = []
+        same_origin_scripts: list[str] = []
+        forms: list[dict[str, Any]] = []
+        endpoint_candidates: set[str] = set()
+        cross_origin_reference_count = 0
+        title: str | None = None
+        har_entries: list[dict[str, Any]] = []
+        if har is not None:
+            analysis_kind = "har"
+            endpoint_candidates.update(har["endpoint_candidates"])
+            same_origin_scripts = sorted(har["scripts"])[:100]
+            cross_origin_reference_count = int(har["cross_origin_reference_count"])
+            har_entries = list(har["entries"])
+        elif is_javascript:
+            analysis_kind = "javascript"
+            discovered, rejected = _archived_url_candidates(url, body)
+            endpoint_candidates.update(discovered)
+            cross_origin_reference_count = rejected
+            for match in re.finditer(
+                r"(?m)(?:^|\s)//[#@]\s*sourceMappingURL\s*=\s*(\S+)",
+                body[:HTTP_RESPONSE_MAX_BYTES],
+            ):
+                resolved = _same_origin_archived_url(url, match.group(1))
+                if resolved is None:
+                    cross_origin_reference_count += 1
+                else:
+                    same_origin_scripts.append(resolved)
+        else:
+            analysis_kind = "html"
+            try:
+                parser.feed(body[:HTTP_RESPONSE_MAX_BYTES])
+                parser.close()
+            except Exception as exc:
+                raise AdapterExecutionError(
+                    f"Stored markup could not be parsed: {type(exc).__name__}"
+                ) from exc
+            same_origin_links = sorted(
+                {
+                    resolved
+                    for value in parser.links
+                    if (resolved := _same_origin_archived_url(url, value)) is not None
+                }
+            )[:200]
+            same_origin_scripts = sorted(
+                {
+                    resolved
+                    for value in parser.scripts
+                    if (resolved := _same_origin_archived_url(url, value)) is not None
+                }
+            )[:100]
+            cross_origin_reference_count += (
+                len(parser.links) - len(same_origin_links)
+                + len(parser.scripts) - len(same_origin_scripts)
+            )
+            endpoint_candidates.update(same_origin_links)
+            endpoint_candidates.update(same_origin_scripts)
+            discovered, rejected = _archived_url_candidates(url, body)
+            endpoint_candidates.update(discovered)
+            cross_origin_reference_count += rejected
+            for form in parser.forms:
+                action = _same_origin_archived_url(url, str(form.get("action") or ""))
+                if action is None:
+                    cross_origin_reference_count += 1
+                    continue
+                forms.append(
+                    {
+                        "action": action,
+                        "method": str(form.get("method") or "GET")[:16],
+                        "fields": list(form.get("fields") or [])[:100],
+                    }
+                )
+            title = " ".join("".join(parser.title_parts).split())[:1000] or None
+        return {
+            "response_id": response["id"],
+            "asset_id": response["asset_id"],
+            "domain": normalize_domain(str(response["domain"])),
+            "url": url[:4096],
+            "response_hash": response["response_hash"],
+            "content_truncated": bool(response.get("content_truncated")),
+            "analysis_kind": analysis_kind,
+            "content_type": content_type,
+            "title": title,
+            "links": same_origin_links,
+            "scripts": sorted(set(same_origin_scripts))[:100],
+            "forms": forms,
+            "endpoint_candidates": sorted(endpoint_candidates)[:300],
+            "har_entries": har_entries,
+            "cross_origin_reference_count": cross_origin_reference_count,
+            "body_bytes": len(body.encode("utf-8")),
+            "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            "offline_only": True,
+        }
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        self.validate(context)
+        return AdapterExecution(
+            tuple(
+                CommandResult(
+                    target=str(response["id"]),
+                    stdout=json.dumps(
+                        self._analyze(response), ensure_ascii=False, sort_keys=True
+                    )
+                    + "\n",
+                    stderr="",
+                    returncode=0,
+                    duration_ms=0,
+                )
+                for response in context.http_responses
+            )
+        )
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        return {"records": _parse_json_lines(execution, tool_id=self.tool_id)}
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        from cairn.server.vulnerability_services import record_collection_task_asset
+
+        created = 0
+        endpoints = 0
+        forms = 0
+        javascript_responses = 0
+        har_entries = 0
+        for record in parsed.get("records", []):
+            record_collection_task_asset(
+                context.conn,
+                context.task_id,
+                str(context.source["id"]),
+                str(record["asset_id"]),
+            )
+            endpoints += len(record.get("endpoint_candidates", []))
+            forms += len(record.get("forms", []))
+            javascript_responses += int(record.get("analysis_kind") == "javascript")
+            har_entries += len(record.get("har_entries", []))
+            created += int(
+                _record_domain_metadata(
+                    context,
+                    "browser_archive_analysis",
+                    str(record["domain"]),
+                    record,
+                    dimension="web",
+                    confidence=0.9,
+                )
+            )
+        return {
+            "responses_inspected": len(parsed.get("records", [])),
+            "endpoints_detected": endpoints,
+            "forms_detected": forms,
+            "javascript_responses_analyzed": javascript_responses,
+            "har_entries_analyzed": har_entries,
+            "observations_created": created,
+        }
+
+    def coverage_complete(self, context: AdapterContext, parsed: Any) -> bool:
+        # A complete saved file is not proof that the application surface was
+        # completely captured.  This adapter therefore never authorizes a
+        # negative/removal conclusion by itself.
+        return False
+
+
 class SavedResponseWebApiAdapter(DomainAdapter):
     """Identify API surfaces in already captured HTTP responses without networking."""
 
@@ -2508,7 +5343,12 @@ class NucleiPassiveResponseAdapter(DomainAdapter):
 
     def execute(self, context: AdapterContext) -> AdapterExecution:
         self.validate(context)
-        with tempfile.TemporaryDirectory(prefix="cairn-nuclei-passive-") as directory:
+        with managed_task_workspace(
+            context.conn,
+            campaign_id=context.campaign_id,
+            task_id=context.task_id,
+            purpose="nuclei-passive-response",
+        ) as workspace:
             materialized: list[Mapping[str, Any]] = []
             for index, response in enumerate(context.http_responses):
                 request_text = str(response.get("request_text") or "").rstrip()
@@ -2521,8 +5361,13 @@ class NucleiPassiveResponseAdapter(DomainAdapter):
                     + "\r\n\r\n"
                     + response_text.lstrip("\r\n")
                 )
-                path = Path(directory) / f"response-{index:03d}.txt"
-                path.write_text(capture, encoding="utf-8")
+                path = workspace.write_text(
+                    f"response-{index:03d}.txt",
+                    capture,
+                    artifact_kind="nuclei_passive_input",
+                    source_reference=f"http-response:{response['id']}",
+                    source_promoted=True,
+                )
                 materialized.append({**response, "file_path": str(path)})
             execution_context = replace(
                 context, http_responses=tuple(materialized)
@@ -2868,7 +5713,9 @@ class NvdKevVulnerabilityIntelligenceAdapter(VulnSourceAdapter):
 
 
 _ADAPTERS: tuple[VulnSourceAdapter, ...] = (
+    BrowserArchiveAnalyzeAdapter(),
     CertificateTransparencyAdapter(),
+    FofaAssetSearchAdapter(),
     OsvVulnerabilityIntelligenceAdapter(),
     NvdKevVulnerabilityIntelligenceAdapter(),
     SubfinderPassiveDnsAdapter(),
@@ -2879,10 +5726,15 @@ _ADAPTERS: tuple[VulnSourceAdapter, ...] = (
     HttpxHttpMetadataAdapter(),
     TlsxTlsMetadataAdapter(),
     GitleaksLocalRepositoryAdapter(),
+    SyftLocalSbomAdapter(),
+    SyftContainerArchiveSbomAdapter(),
+    TrivySbomVulnerabilityAdapter(),
+    TrivyContainerSbomVulnerabilityAdapter(),
     SavedResponseWebApiAdapter(),
     NucleiPassiveResponseAdapter(),
     NaabuPortScanAdapter(),
     KatanaCrawlerAdapter(),
+    BrowserEvidenceSessionAdapter(),
 )
 
 ADAPTER_REGISTRY: dict[str, VulnSourceAdapter] = {

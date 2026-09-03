@@ -67,13 +67,17 @@ class DispatcherLoop:
         self._settings_checked = False
         self._startup_healthchecks_checked = False
 
-    def close(self) -> None:
+    def close(self, *, cancel_running: bool = True) -> None:
         if self.futures:
             LOG.info(
-                "dispatcher shutting down waiting_for_tasks=%s running_projects=%s",
+                "dispatcher shutting down running_tasks=%s running_projects=%s cancel_running=%s",
                 len(self.futures),
                 sorted({task.project_id for task in self.futures.values()}),
+                cancel_running,
             )
+        if cancel_running:
+            for task in self.futures.values():
+                task.cancellation.cancel("dispatcher_shutdown")
         self.executor.shutdown(wait=True)
         self.cleanup_executor.shutdown(wait=True)
         self.container_manager.close()
@@ -109,7 +113,10 @@ class DispatcherLoop:
                     break
                 time.sleep(self.config.runtime.interval)
         finally:
-            self.close()
+            # A one-shot run intentionally drains the work it just dispatched.
+            # A long-running dispatcher shutdown instead revokes every attached
+            # worker process before joining its executor.
+            self.close(cancel_running=not once)
 
     def run_startup_healthchecks_only(self) -> None:
         try:

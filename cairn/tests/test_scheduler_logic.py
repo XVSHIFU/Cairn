@@ -257,6 +257,43 @@ def test_cancel_inactive_tasks_marks_stopped_and_deleted_projects() -> None:
     assert deleted.reason == "deleted"
 
 
+def test_dispatcher_close_cancels_running_workers_before_waiting() -> None:
+    loop = _loop()
+    cancellation = TaskCancellation()
+    loop.futures = {
+        Future(): RunningTask(
+            "vulnerability-project",
+            "vulnerability_analysis",
+            "claude-worker",
+            cancellation,
+        )
+    }
+    shutdown_calls: list[bool] = []
+    close_calls: list[str] = []
+
+    class Executor:
+        def shutdown(self, *, wait: bool) -> None:
+            shutdown_calls.append(wait)
+
+    class Closable:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            close_calls.append(self.name)
+
+    loop.executor = Executor()
+    loop.cleanup_executor = Executor()
+    loop.container_manager = Closable("backend")
+    loop.client = Closable("client")
+
+    loop.close()
+
+    assert cancellation.reason == "dispatcher_shutdown"
+    assert shutdown_calls == [True, True]
+    assert close_calls == ["backend", "client"]
+
+
 def test_initialize_reason_checkpoint_only_for_active_projects_with_open_intents() -> None:
     loop = _loop()
     active = _summary("active", "active")
