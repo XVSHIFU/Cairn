@@ -6,6 +6,7 @@ import importlib.metadata
 import ipaddress
 import json
 import os
+import plistlib
 import re
 import shutil
 import signal
@@ -16,6 +17,7 @@ import sys
 import tarfile
 import threading
 import time
+import zipfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from html.parser import HTMLParser
@@ -108,6 +110,13 @@ FOFA_FIELDS = (
 )
 FOFA_SECRET_PATTERN = re.compile(r"^[A-Za-z0-9._~-]{8,256}$")
 FOFA_CREDENTIAL_REF_PATTERN = re.compile(r"^[A-Za-z0-9._~-]{1,128}$")
+REGISTRY_CREDENTIALS_ENV = "CAIRN_REGISTRY_CREDENTIALS"
+REGISTRY_IMAGE_PATTERN = re.compile(
+    r"^(?P<registry>[A-Za-z0-9.-]+(?::[0-9]{1,5})?)/"
+    r"(?P<repository>[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*)"
+    r"(?:(?::(?P<tag>[A-Za-z0-9_][A-Za-z0-9._-]{0,127}))|"
+    r"(?:@(?P<digest>sha256:[0-9a-fA-F]{64})))$"
+)
 ADAPTER_PROCESS_FACTORY = subprocess.Popen
 PROCESS_CANCELLATION_POLL_SECONDS = 0.25
 PROCESS_TERMINATION_GRACE_SECONDS = 2.0
@@ -155,19 +164,25 @@ def _audited_gitleaks_config_path() -> Path:
 
 
 def authorized_local_repository(value: str) -> Path:
-    configured = os.getenv("CAIRN_GITLEAKS_ALLOWED_ROOTS", "")
+    configured = os.getenv("CAIRN_REPOSITORY_ALLOWED_ROOTS", "") or os.getenv(
+        "CAIRN_GITLEAKS_ALLOWED_ROOTS", ""
+    )
     if not configured.strip():
-        raise AdapterValidationError("CAIRN_GITLEAKS_ALLOWED_ROOTS is not configured")
+        raise AdapterValidationError(
+            "CAIRN_REPOSITORY_ALLOWED_ROOTS or CAIRN_GITLEAKS_ALLOWED_ROOTS is not configured"
+        )
     candidate = Path(value).expanduser().resolve(strict=True)
     if not candidate.is_dir():
-        raise AdapterValidationError("Gitleaks target must be an existing local directory")
+        raise AdapterValidationError("Repository target must be an existing local directory")
     allowed = False
     for raw_root in configured.split(os.pathsep):
         if not raw_root.strip():
             continue
         root = Path(raw_root).expanduser().resolve(strict=True)
         if root == Path(root.anchor) or root == Path.home().resolve():
-            raise AdapterValidationError("Gitleaks allowed roots may not be filesystem or home roots")
+            raise AdapterValidationError(
+                "Repository allowed roots may not be filesystem or home roots"
+            )
         try:
             candidate.relative_to(root)
             allowed = True
@@ -175,8 +190,43 @@ def authorized_local_repository(value: str) -> Path:
         except ValueError:
             continue
     if not allowed:
-        raise AdapterValidationError("Repository path is outside configured Gitleaks roots")
+        raise AdapterValidationError("Repository path is outside configured repository roots")
     return candidate
+
+
+def authorized_local_artifact(value: str, *, maximum_bytes: int) -> Path:
+    """Resolve one exact regular file under the dedicated evidence allow-roots."""
+
+    configured = os.getenv("CAIRN_ARTIFACT_ALLOWED_ROOTS", "")
+    if not configured.strip():
+        raise AdapterValidationError("CAIRN_ARTIFACT_ALLOWED_ROOTS is not configured")
+    unresolved = Path(value).expanduser()
+    if unresolved.is_symlink():
+        raise AdapterValidationError("Artifact target may not be a symbolic link")
+    candidate = unresolved.resolve(strict=True)
+    if not candidate.is_file():
+        raise AdapterValidationError("Artifact target must be an existing regular file")
+    try:
+        mode = candidate.stat().st_mode
+        size = candidate.stat().st_size
+    except OSError as exc:
+        raise AdapterValidationError("Artifact metadata could not be read") from exc
+    if not stat.S_ISREG(mode) or size > maximum_bytes:
+        raise AdapterValidationError("Artifact target exceeds its file-size boundary")
+    for raw_root in configured.split(os.pathsep):
+        if not raw_root.strip():
+            continue
+        root = Path(raw_root).expanduser().resolve(strict=True)
+        if root == Path(root.anchor) or root == Path.home().resolve():
+            raise AdapterValidationError(
+                "Artifact allowed roots may not be filesystem or home roots"
+            )
+        try:
+            candidate.relative_to(root)
+            return candidate
+        except ValueError:
+            continue
+    raise AdapterValidationError("Artifact path is outside configured artifact roots")
 
 
 def authorized_local_supply_chain_target(value: str) -> Path:
@@ -395,6 +445,80 @@ def _fofa_api_key(credential_ref: str) -> str:
     return key
 
 
+def normalize_registry_image(value: str) -> str:
+    candidate = value.strip()
+    if candidate.startswith("docker://"):
+        candidate = candidate[9:]
+    match = REGISTRY_IMAGE_PATTERN.fullmatch(candidate)
+    if match is None:
+        raise AdapterValidationError(
+            "Registry image must include an exact registry, repository, and tag or digest"
+        )
+    registry = str(match.group("registry")).casefold()
+    host = registry.rsplit(":", 1)[0]
+    if ":" in registry and int(registry.rsplit(":", 1)[1]) > 65535:
+        raise AdapterValidationError("Registry image port is invalid")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if host == "localhost" or not re.fullmatch(
+            r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+            host,
+        ):
+            raise AdapterValidationError("Registry image host is invalid")
+    repository = str(match.group("repository")).casefold()
+    reference = match.group("tag") or str(match.group("digest")).casefold()
+    separator = "@" if match.group("digest") else ":"
+    return f"{registry}/{repository}{separator}{reference}"
+
+
+def _registry_bearer_token(credential_ref: str) -> str | None:
+    reference = credential_ref.strip()
+    if not reference:
+        return None
+    if not FOFA_CREDENTIAL_REF_PATTERN.fullmatch(reference):
+        raise AdapterValidationError("Registry credential_ref is malformed")
+    raw = os.getenv(REGISTRY_CREDENTIALS_ENV, "").strip()
+    if not raw:
+        raise AdapterUnavailableError(f"{REGISTRY_CREDENTIALS_ENV} is not configured")
+    try:
+        credentials = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise AdapterUnavailableError(
+            f"{REGISTRY_CREDENTIALS_ENV} must be a JSON object"
+        ) from exc
+    if not isinstance(credentials, Mapping):
+        raise AdapterUnavailableError(
+            f"{REGISTRY_CREDENTIALS_ENV} must be a JSON object"
+        )
+    token = credentials.get(reference)
+    if not isinstance(token, str) or not (8 <= len(token) <= 4096):
+        raise AdapterUnavailableError("Registry credential reference is unavailable")
+    if "\r" in token or "\n" in token or "\x00" in token:
+        raise AdapterUnavailableError("Registry bearer token is malformed")
+    return token
+
+
+def validate_registry_source_config(value: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise AdapterValidationError("Registry source configuration must be an object")
+    allowed = {"adapter", "credential_ref", "default_disabled"}
+    if set(value) - allowed:
+        raise AdapterValidationError("Registry source configuration has forbidden fields")
+    adapter = str(value.get("adapter") or "registry.oci-manifest.v1")
+    if adapter != "registry.oci-manifest.v1":
+        raise AdapterValidationError("Registry source adapter is immutable")
+    reference = str(value.get("credential_ref") or "").strip()
+    if reference and not FOFA_CREDENTIAL_REF_PATTERN.fullmatch(reference):
+        raise AdapterValidationError("Registry credential_ref is malformed")
+    return {
+        "adapter": adapter,
+        "credential_ref": reference,
+        "default_disabled": True,
+    }
+
+
 def validate_fofa_source_config(
     value: Mapping[str, Any], *, require_credential_ref: bool
 ) -> dict[str, Any]:
@@ -559,6 +683,8 @@ class AdapterContext:
     vulnerabilities: tuple[Mapping[str, Any], ...] = ()
     repositories: tuple[Mapping[str, Any], ...] = ()
     container_archives: tuple[Mapping[str, Any], ...] = ()
+    local_artifacts: tuple[Mapping[str, Any], ...] = ()
+    registry_images: tuple[Mapping[str, Any], ...] = ()
     sboms: tuple[Mapping[str, Any], ...] = ()
     cursor: Mapping[str, Any] = field(default_factory=dict)
     request_header: str = "X-Cairn-Research"
@@ -3325,6 +3451,1154 @@ class KatanaCrawlerAdapter(ActiveNetworkTargetAdapter):
         return {"observations_created": created, "observations_updated": updated}
 
 
+class GitLocalMetadataAdapter(VulnSourceAdapter):
+    """Collect bounded metadata from explicitly registered local Git repositories."""
+
+    tool_id = "git.local-metadata.v1"
+    version = "1.0.0"
+    risk_class = "R1"
+    source_type = "code"
+    dimension = "code"
+    binary = _configured_user_binary("git", "CAIRN_GIT_BINARY")
+    version_args = ("--version",)
+    timeout_seconds = 30
+    uses_http = False
+    uses_network = False
+    input_schema = {
+        "type": "object",
+        "required": ["repositories"],
+        "properties": {
+            "repositories": {
+                "type": "array",
+                "items": {"type": "object"},
+                "maxItems": 5,
+            }
+        },
+        "additionalProperties": False,
+    }
+    output_schema = {
+        "type": "object",
+        "required": ["repositories"],
+        "properties": {
+            "repositories": {"type": "array", "items": {"type": "object"}}
+        },
+        "additionalProperties": False,
+    }
+
+    _CONFIG_PATHS = (
+        "*.json",
+        "*.yaml",
+        "*.yml",
+        "*.toml",
+        "*.ini",
+        "*.cfg",
+        "*.conf",
+        "*.tf",
+        "*.tfvars",
+        "*.lock",
+        "Dockerfile*",
+        "Containerfile*",
+        "Makefile",
+        "Jenkinsfile",
+        ".github/workflows/*.yml",
+        ".github/workflows/*.yaml",
+        ".gitlab-ci.yml",
+    )
+
+    def validate(self, context: AdapterContext) -> None:
+        super().validate(context)
+        if not context.repositories:
+            raise AdapterValidationError(
+                "Git metadata collection requires a registered local repository asset"
+            )
+        if len(context.repositories) > 5:
+            raise AdapterValidationError(
+                "Git metadata collection accepts at most five repositories per task"
+            )
+        for repository in context.repositories:
+            path = authorized_local_repository(str(repository.get("path") or ""))
+            if path != Path(str(repository.get("path") or "")).expanduser().resolve():
+                raise AdapterValidationError("Repository path did not resolve deterministically")
+            if not repository.get("asset_id"):
+                raise AdapterValidationError("Repository input is not linked to an asset")
+
+    def estimate(self, context: AdapterContext) -> dict[str, Any]:
+        return {
+            "command_count": len(context.repositories) * 3,
+            "timeout_seconds": self.timeout_seconds,
+            "risk_class": self.risk_class,
+            "network_request_count": 0,
+            "offline_only": True,
+            "max_commits_per_repository": 100,
+            "max_refs_per_repository": 200,
+            "max_config_paths_per_repository": 1000,
+        }
+
+    @staticmethod
+    def _target(path: Path, kind: str) -> str:
+        return json.dumps(
+            {"repository": str(path), "kind": kind},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        invocations: list[AdapterInvocation] = []
+        for repository in context.repositories:
+            path = authorized_local_repository(str(repository["path"]))
+            common = (self.binary, "-C", str(path), "--no-pager")
+            invocations.extend(
+                (
+                    AdapterInvocation(
+                        argv=(
+                            *common,
+                            "log",
+                            "-n",
+                            "100",
+                            "--date=iso-strict",
+                            "--pretty=format:%H%x00%aI%x00%s%x00",
+                        ),
+                        target=self._target(path, "commits"),
+                    ),
+                    AdapterInvocation(
+                        argv=(
+                            *common,
+                            "for-each-ref",
+                            "--count=200",
+                            "--format=%(refname:short)%09%(objectname)",
+                            "refs/heads",
+                            "refs/remotes",
+                        ),
+                        target=self._target(path, "refs"),
+                    ),
+                    AdapterInvocation(
+                        argv=(
+                            *common,
+                            "ls-files",
+                            "-z",
+                            "--",
+                            *self._CONFIG_PATHS,
+                        ),
+                        target=self._target(path, "config_paths"),
+                    ),
+                )
+            )
+        return invocations
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        return self._execute_materialized(context)
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        grouped: dict[str, dict[str, Any]] = {}
+        for result in execution.results:
+            try:
+                target = json.loads(str(result.target or ""))
+            except json.JSONDecodeError as exc:
+                raise AdapterExecutionError(
+                    "Git metadata invocation provenance is invalid", execution
+                ) from exc
+            if not isinstance(target, dict):
+                raise AdapterExecutionError(
+                    "Git metadata invocation provenance is invalid", execution
+                )
+            repository = authorized_local_repository(str(target.get("repository") or ""))
+            kind = str(target.get("kind") or "")
+            item = grouped.setdefault(
+                str(repository),
+                {
+                    "repository": str(repository),
+                    "recent_commits": [],
+                    "refs": [],
+                    "security_relevant_paths": [],
+                },
+            )
+            if kind == "commits":
+                fields = result.stdout.rstrip("\0").split("\0") if result.stdout else []
+                if len(fields) % 3:
+                    raise AdapterExecutionError(
+                        "Git log returned an incomplete record", execution
+                    )
+                item["recent_commits"] = [
+                    {
+                        "commit": fields[index][:64],
+                        "authored_at": fields[index + 1][:64],
+                        "subject": fields[index + 2][:1000],
+                    }
+                    for index in range(0, min(len(fields), 300), 3)
+                ]
+            elif kind == "refs":
+                refs: list[dict[str, str]] = []
+                for line in result.stdout.splitlines()[:200]:
+                    name, separator, commit = line.partition("\t")
+                    if (
+                        not separator
+                        or not name
+                        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", commit)
+                    ):
+                        raise AdapterExecutionError(
+                            "Git ref inventory returned an invalid record", execution
+                        )
+                    refs.append({"name": name[:512], "commit": commit.lower()})
+                item["refs"] = refs
+            elif kind == "config_paths":
+                paths: list[str] = []
+                for raw_path in result.stdout.rstrip("\0").split("\0")[:1000]:
+                    if not raw_path:
+                        continue
+                    path = Path(raw_path)
+                    if path.is_absolute() or ".." in path.parts:
+                        raise AdapterExecutionError(
+                            "Git file inventory escaped the approved repository", execution
+                        )
+                    paths.append(path.as_posix()[:2048])
+                item["security_relevant_paths"] = sorted(set(paths))
+            else:
+                raise AdapterExecutionError(
+                    "Git metadata invocation kind is invalid", execution
+                )
+        return {"repositories": [grouped[key] for key in sorted(grouped)]}
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        from cairn.server.services import utcnow
+        from cairn.server.vulnerability_services import (
+            next_vulnerability_id,
+            record_collection_task_asset,
+        )
+
+        repositories_by_path = {
+            str(authorized_local_repository(str(item.get("path") or ""))): item
+            for item in context.repositories
+        }
+        created = 0
+        updated = 0
+        now = utcnow()
+        for record in parsed.get("repositories", []):
+            repository = repositories_by_path.get(str(record.get("repository") or ""))
+            if repository is None:
+                raise AdapterValidationError(
+                    "Git metadata result is not linked to an approved repository asset"
+                )
+            asset_id = str(repository["asset_id"])
+            payload = {
+                "record_type": "git_repository_metadata",
+                "repository": str(record["repository"]),
+                "head": (
+                    record["recent_commits"][0]["commit"]
+                    if record.get("recent_commits")
+                    else None
+                ),
+                "recent_commits": list(record.get("recent_commits", [])),
+                "refs": list(record.get("refs", [])),
+                "security_relevant_paths": list(
+                    record.get("security_relevant_paths", [])
+                ),
+            }
+            digest = hashlib.sha256(
+                json.dumps(
+                    {
+                        "campaign_id": context.campaign_id,
+                        "source_id": str(context.source["id"]),
+                        "asset_id": asset_id,
+                        "data": payload,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            existed = context.conn.execute(
+                "SELECT 1 FROM vuln_observations WHERE campaign_id = ? AND evidence_hash = ?",
+                (context.campaign_id, digest),
+            ).fetchone()
+            context.conn.execute(
+                """
+                INSERT INTO vuln_observations
+                    (id, campaign_id, asset_id, source_id, dimension, data_json,
+                     evidence_hash, confidence, status, raw_reference,
+                     first_seen_at, last_seen_at)
+                VALUES (?, ?, ?, ?, 'code', ?, ?, 1.0, 'current', ?, ?, ?)
+                ON CONFLICT(campaign_id, evidence_hash)
+                DO UPDATE SET last_seen_at = excluded.last_seen_at
+                """,
+                (
+                    next_vulnerability_id(context.conn, "observation", "observation"),
+                    context.campaign_id,
+                    asset_id,
+                    str(context.source["id"]),
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    digest,
+                    f"collection-task:{context.task_id}",
+                    now,
+                    now,
+                ),
+            )
+            record_collection_task_asset(
+                context.conn,
+                context.task_id,
+                str(context.source["id"]),
+                asset_id,
+            )
+            created += int(existed is None)
+            updated += int(existed is not None)
+        return {"observations_created": created, "observations_updated": updated}
+
+
+def _record_linked_asset_metadata(
+    context: AdapterContext,
+    *,
+    asset_id: str,
+    dimension: str,
+    payload: Mapping[str, Any],
+    confidence: float = 1.0,
+) -> bool:
+    from cairn.server.services import utcnow
+    from cairn.server.vulnerability_services import (
+        next_vulnerability_id,
+        record_collection_task_asset,
+    )
+
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "campaign_id": context.campaign_id,
+                "source_id": str(context.source["id"]),
+                "asset_id": asset_id,
+                "data": payload,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    existing = context.conn.execute(
+        "SELECT 1 FROM vuln_observations WHERE campaign_id = ? AND evidence_hash = ?",
+        (context.campaign_id, digest),
+    ).fetchone()
+    now = utcnow()
+    context.conn.execute(
+        """
+        INSERT INTO vuln_observations
+            (id, campaign_id, asset_id, source_id, dimension, data_json,
+             evidence_hash, confidence, status, raw_reference,
+             first_seen_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'current', ?, ?, ?)
+        ON CONFLICT(campaign_id, evidence_hash)
+        DO UPDATE SET last_seen_at = excluded.last_seen_at
+        """,
+        (
+            next_vulnerability_id(context.conn, "observation", "observation"),
+            context.campaign_id,
+            asset_id,
+            str(context.source["id"]),
+            dimension,
+            serialized,
+            digest,
+            confidence,
+            f"collection-task:{context.task_id}",
+            now,
+            now,
+        ),
+    )
+    record_collection_task_asset(
+        context.conn,
+        context.task_id,
+        str(context.source["id"]),
+        asset_id,
+    )
+    return existing is None
+
+
+class CloudInventoryArtifactAdapter(VulnSourceAdapter):
+    """Normalize a bounded, operator-exported cloud inventory without retaining secrets."""
+
+    tool_id = "cloud.inventory-artifact.v1"
+    version = "1.0.0"
+    risk_class = "R0"
+    source_type = "cloud_inventory_artifact"
+    dimension = "external"
+    binary = "builtin:cloud-inventory-parser"
+    uses_http = False
+    uses_network = False
+    requires_human_approval = True
+    timeout_seconds = 30
+    input_schema = {
+        "type": "object",
+        "required": ["local_artifacts"],
+        "properties": {
+            "local_artifacts": {
+                "type": "array",
+                "items": {"type": "object"},
+                "maxItems": 5,
+            }
+        },
+        "additionalProperties": False,
+    }
+    output_schema = {
+        "type": "object",
+        "required": ["inventories"],
+        "properties": {
+            "inventories": {"type": "array", "items": {"type": "object"}}
+        },
+        "additionalProperties": False,
+    }
+    _MAX_BYTES = 20 * 1024 * 1024
+    _PROVIDERS = {"aws", "azure", "gcp", "oci", "alibaba", "tencent"}
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "healthy": True,
+            "tool_id": self.tool_id,
+            "version": self.version,
+            "expected_version": self.version,
+            "offline_only": True,
+            "error": None,
+        }
+
+    def validate(self, context: AdapterContext) -> None:
+        super().validate(context)
+        if not context.local_artifacts or len(context.local_artifacts) > 5:
+            raise AdapterValidationError(
+                "Cloud inventory parsing requires one to five registered artifacts"
+            )
+        for artifact in context.local_artifacts:
+            if artifact.get("asset_type") != "cloud_inventory":
+                raise AdapterValidationError("Cloud inventory input has an invalid asset type")
+            if not artifact.get("asset_id"):
+                raise AdapterValidationError("Cloud inventory input is not linked to an asset")
+            path = authorized_local_artifact(
+                str(artifact.get("path") or ""), maximum_bytes=self._MAX_BYTES
+            )
+            if path.suffix.casefold() != ".json":
+                raise AdapterValidationError("Cloud inventory artifact must be JSON")
+
+    def estimate(self, context: AdapterContext) -> dict[str, Any]:
+        return {
+            "command_count": 0,
+            "timeout_seconds": self.timeout_seconds,
+            "risk_class": self.risk_class,
+            "network_request_count": 0,
+            "offline_only": True,
+            "max_resources_per_artifact": 5000,
+        }
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        return []
+
+    @staticmethod
+    def _safe_endpoint(value: Any) -> str | None:
+        candidate = str(value or "").strip()[:2048]
+        if not candidate or "\r" in candidate or "\n" in candidate:
+            return None
+        parsed = urlsplit(candidate)
+        if parsed.scheme:
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                return None
+            return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+        try:
+            ipaddress.ip_address(candidate)
+    return candidate
+
+
+def _is_ip_literal(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+        except ValueError:
+            try:
+                return normalize_domain(candidate)
+            except AdapterValidationError:
+                return None
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        self.validate(context)
+        results: list[CommandResult] = []
+        for artifact in context.local_artifacts:
+            started = time.monotonic()
+            path = authorized_local_artifact(
+                str(artifact["path"]), maximum_bytes=self._MAX_BYTES
+            )
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise AdapterExecutionError("Cloud inventory artifact is invalid JSON") from exc
+            if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+                raise AdapterExecutionError(
+                    "Cloud inventory must use Cairn inventory schema version 1"
+                )
+            provider = str(raw.get("provider") or "").casefold()
+            resources = raw.get("resources")
+            if provider not in self._PROVIDERS or not isinstance(resources, list):
+                raise AdapterExecutionError("Cloud inventory provider or resources are invalid")
+            if len(resources) > 5000:
+                raise AdapterExecutionError("Cloud inventory exceeds 5000 resources")
+            account = str(raw.get("account") or "")[:256]
+            normalized_resources: list[dict[str, Any]] = []
+            for resource in resources:
+                if not isinstance(resource, Mapping):
+                    raise AdapterExecutionError("Cloud inventory resource is invalid")
+                resource_id = str(resource.get("id") or "").strip()[:1024]
+                resource_type = str(resource.get("type") or "").strip()[:128]
+                if not resource_id or not resource_type:
+                    raise AdapterExecutionError("Cloud resource requires id and type")
+                raw_endpoints = resource.get("public_endpoints") or []
+                if not isinstance(raw_endpoints, list):
+                    raise AdapterExecutionError(
+                        "Cloud resource public_endpoints must be an array"
+                    )
+                endpoints = [
+                    endpoint
+                    for endpoint in (
+                        self._safe_endpoint(value)
+                        for value in raw_endpoints[:20]
+                    )
+                    if endpoint is not None
+                ]
+                tags = resource.get("tags")
+                tag_keys = (
+                    sorted(str(key)[:128] for key in list(tags)[:100])
+                    if isinstance(tags, Mapping)
+                    else []
+                )
+                normalized_resources.append(
+                    {
+                        "id": resource_id,
+                        "type": resource_type,
+                        "name": str(resource.get("name") or "")[:512] or None,
+                        "region": str(resource.get("region") or "")[:128] or None,
+                        "public_endpoints": sorted(set(endpoints)),
+                        "tag_keys": tag_keys,
+                        "internet_exposed": bool(resource.get("internet_exposed", False)),
+                    }
+                )
+            safe = {
+                "asset_id": str(artifact["asset_id"]),
+                "artifact_path_hash": hashlib.sha256(str(path).encode()).hexdigest(),
+                "document_hash": _sha256_file(path),
+                "provider": provider,
+                "account": account,
+                "resource_count": len(normalized_resources),
+                "resources": normalized_resources,
+            }
+            results.append(
+                CommandResult(
+                    target=str(path),
+                    stdout=json.dumps(safe, ensure_ascii=False, sort_keys=True),
+                    stderr="",
+                    returncode=0,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                )
+            )
+        return AdapterExecution(tuple(results))
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        inventories: list[dict[str, Any]] = []
+        for result in execution.results:
+            try:
+                item = json.loads(result.stdout)
+            except json.JSONDecodeError as exc:
+                raise AdapterExecutionError(
+                    "Cloud inventory parser produced invalid output", execution
+                ) from exc
+            if not isinstance(item, dict):
+                raise AdapterExecutionError(
+                    "Cloud inventory parser output must be an object", execution
+                )
+            inventories.append(item)
+        return {"inventories": inventories}
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        from cairn.server.vulnerability_models import AssetInput
+        from cairn.server.vulnerability_services import upsert_discovered_asset
+
+        created = 0
+        updated = 0
+        discovered = 0
+        for inventory in parsed.get("inventories", []):
+            asset_id = str(inventory["asset_id"])
+            payload = {
+                "record_type": "cloud_inventory",
+                **{key: value for key, value in inventory.items() if key != "asset_id"},
+            }
+            was_created = _record_linked_asset_metadata(
+                context,
+                asset_id=asset_id,
+                dimension="external",
+                payload=payload,
+            )
+            created += int(was_created)
+            updated += int(not was_created)
+            for resource in inventory.get("resources", []):
+                identifier = ":".join(
+                    (
+                        str(inventory["provider"]),
+                        str(inventory.get("account") or "unknown"),
+                        str(resource.get("region") or "global"),
+                        str(resource["type"]),
+                        str(resource["id"]),
+                    )
+                )[:2048]
+                asset, _asset_created, _lineage = upsert_discovered_asset(
+                    context.conn,
+                    context.campaign_id,
+                    AssetInput(
+                        asset_type="cloud_resource",
+                        identifier=identifier,
+                        technology=[str(inventory["provider"]), str(resource["type"])],
+                        risk=("high" if resource.get("internet_exposed") else "unknown"),
+                        source_name=str(context.source["name"] or "cloud inventory"),
+                    ),
+                    discovery_kind="cloud_inventory_resource",
+                    parent_asset_id=asset_id,
+                    source_id=str(context.source["id"]),
+                    task_id=context.task_id,
+                    evidence_hash=str(inventory["document_hash"]),
+                )
+                discovered += int(asset is not None)
+                if asset is not None:
+                    for endpoint in resource.get("public_endpoints", []):
+                        parsed_endpoint = urlsplit(str(endpoint))
+                        endpoint_type = "url" if parsed_endpoint.scheme else (
+                            "ip"
+                            if _is_ip_literal(str(endpoint))
+                            else "domain"
+                        )
+                        endpoint_asset, _endpoint_created, _endpoint_lineage = (
+                            upsert_discovered_asset(
+                                context.conn,
+                                context.campaign_id,
+                                AssetInput(
+                                    asset_type=endpoint_type,
+                                    identifier=str(endpoint),
+                                    technology=[str(inventory["provider"]), "cloud_endpoint"],
+                                    risk="high",
+                                    source_name=str(
+                                        context.source["name"] or "cloud inventory"
+                                    ),
+                                ),
+                                discovery_kind="cloud_public_endpoint",
+                                parent_asset_id=asset.id,
+                                source_id=str(context.source["id"]),
+                                task_id=context.task_id,
+                                evidence_hash=str(inventory["document_hash"]),
+                            )
+                        )
+                        discovered += int(endpoint_asset is not None)
+        return {
+            "observations_created": created,
+            "observations_updated": updated,
+            "assets_discovered": discovered,
+        }
+
+
+class MobileArchiveMetadataAdapter(VulnSourceAdapter):
+    """Extract bounded APK/IPA package metadata without executing application code."""
+
+    tool_id = "mobile.archive-metadata.v1"
+    version = "1.0.0"
+    risk_class = "R0"
+    source_type = "mobile_archive_metadata"
+    dimension = "supply_chain"
+    binary = "builtin:mobile-archive-parser"
+    uses_http = False
+    uses_network = False
+    requires_human_approval = True
+    timeout_seconds = 30
+    input_schema = CloudInventoryArtifactAdapter.input_schema
+    output_schema = {
+        "type": "object",
+        "required": ["archives"],
+        "properties": {"archives": {"type": "array", "items": {"type": "object"}}},
+        "additionalProperties": False,
+    }
+    _MAX_BYTES = 2 * 1024 * 1024 * 1024
+    _MAX_EXPANDED_BYTES = 4 * 1024 * 1024 * 1024
+    _MAX_ENTRIES = 100_000
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "healthy": True,
+            "tool_id": self.tool_id,
+            "version": self.version,
+            "expected_version": self.version,
+            "offline_only": True,
+            "error": None,
+        }
+
+    def validate(self, context: AdapterContext) -> None:
+        VulnSourceAdapter.validate(self, context)
+        if not context.local_artifacts or len(context.local_artifacts) > 5:
+            raise AdapterValidationError(
+                "Mobile metadata parsing requires one to five registered artifacts"
+            )
+        for artifact in context.local_artifacts:
+            if artifact.get("asset_type") != "mobile_artifact":
+                raise AdapterValidationError("Mobile archive input has an invalid asset type")
+            if not artifact.get("asset_id"):
+                raise AdapterValidationError("Mobile archive input is not linked to an asset")
+            path = authorized_local_artifact(
+                str(artifact.get("path") or ""), maximum_bytes=self._MAX_BYTES
+            )
+            if path.suffix.casefold() not in {".apk", ".ipa"}:
+                raise AdapterValidationError("Mobile archive must be an APK or IPA file")
+
+    def estimate(self, context: AdapterContext) -> dict[str, Any]:
+        return {
+            "command_count": 0,
+            "timeout_seconds": self.timeout_seconds,
+            "risk_class": self.risk_class,
+            "network_request_count": 0,
+            "offline_only": True,
+            "max_archive_entries": self._MAX_ENTRIES,
+        }
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        return []
+
+    @staticmethod
+    def _safe_archive_name(value: str) -> str:
+        normalized = value.replace("\\", "/")
+        path = Path(normalized)
+        if (
+            not normalized
+            or normalized.startswith("/")
+            or path.is_absolute()
+            or ".." in path.parts
+            or "\x00" in normalized
+        ):
+            raise AdapterExecutionError("Mobile archive contains an unsafe member path")
+        return normalized
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        self.validate(context)
+        results: list[CommandResult] = []
+        for artifact in context.local_artifacts:
+            started = time.monotonic()
+            path = authorized_local_artifact(
+                str(artifact["path"]), maximum_bytes=self._MAX_BYTES
+            )
+            try:
+                with zipfile.ZipFile(path, "r") as archive:
+                    entries = archive.infolist()
+                    if len(entries) > self._MAX_ENTRIES:
+                        raise AdapterExecutionError(
+                            "Mobile archive exceeds its entry-count boundary"
+                        )
+                    expanded = sum(max(0, int(item.file_size)) for item in entries)
+                    if expanded > self._MAX_EXPANDED_BYTES:
+                        raise AdapterExecutionError(
+                            "Mobile archive exceeds its expanded-size boundary"
+                        )
+                    names = [self._safe_archive_name(item.filename) for item in entries]
+                    suffix = path.suffix.casefold()
+                    metadata: dict[str, Any] = {
+                        "platform": "android" if suffix == ".apk" else "ios",
+                        "entry_count": len(entries),
+                        "expanded_bytes": expanded,
+                        "native_abis": sorted(
+                            {
+                                name.split("/", 2)[1]
+                                for name in names
+                                if name.startswith("lib/") and name.count("/") >= 2
+                            }
+                        )[:32],
+                        "dex_count": sum(
+                            1 for name in names if re.fullmatch(r"classes\d*\.dex", name)
+                        ),
+                        "signing_entries": [],
+                        "bundle_identifier": None,
+                        "version": None,
+                    }
+                    signing = [
+                        item
+                        for item in entries
+                        if item.filename.upper().startswith("META-INF/")
+                        and item.filename.upper().endswith((".RSA", ".DSA", ".EC"))
+                        and item.file_size <= 2 * 1024 * 1024
+                    ][:20]
+                    metadata["signing_entries"] = [
+                        {
+                            "name": self._safe_archive_name(item.filename)[:512],
+                            "sha256": hashlib.sha256(archive.read(item)).hexdigest(),
+                        }
+                        for item in signing
+                    ]
+                    if suffix == ".ipa":
+                        plist_entries = [
+                            item
+                            for item in entries
+                            if re.fullmatch(r"Payload/[^/]+\.app/Info\.plist", item.filename)
+                            and item.file_size <= 1024 * 1024
+                        ]
+                        if len(plist_entries) == 1:
+                            plist = plistlib.loads(archive.read(plist_entries[0]))
+                            if isinstance(plist, Mapping):
+                                metadata["bundle_identifier"] = str(
+                                    plist.get("CFBundleIdentifier") or ""
+                                )[:512] or None
+                                metadata["version"] = str(
+                                    plist.get("CFBundleShortVersionString")
+                                    or plist.get("CFBundleVersion")
+                                    or ""
+                                )[:128] or None
+            except (
+                OSError,
+                RuntimeError,
+                zipfile.BadZipFile,
+                plistlib.InvalidFileException,
+            ) as exc:
+                raise AdapterExecutionError("Mobile archive could not be parsed") from exc
+            safe = {
+                "asset_id": str(artifact["asset_id"]),
+                "artifact_path_hash": hashlib.sha256(str(path).encode()).hexdigest(),
+                "document_hash": _sha256_file(path),
+                **metadata,
+            }
+            results.append(
+                CommandResult(
+                    target=str(path),
+                    stdout=json.dumps(safe, ensure_ascii=False, sort_keys=True),
+                    stderr="",
+                    returncode=0,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                )
+            )
+        return AdapterExecution(tuple(results))
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        archives: list[dict[str, Any]] = []
+        for result in execution.results:
+            try:
+                item = json.loads(result.stdout)
+            except json.JSONDecodeError as exc:
+                raise AdapterExecutionError(
+                    "Mobile archive parser produced invalid output", execution
+                ) from exc
+            if not isinstance(item, dict):
+                raise AdapterExecutionError(
+                    "Mobile archive parser output must be an object", execution
+                )
+            archives.append(item)
+        return {"archives": archives}
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        created = 0
+        updated = 0
+        for archive in parsed.get("archives", []):
+            asset_id = str(archive["asset_id"])
+            payload = {
+                "record_type": "mobile_archive_metadata",
+                **{key: value for key, value in archive.items() if key != "asset_id"},
+            }
+            was_created = _record_linked_asset_metadata(
+                context,
+                asset_id=asset_id,
+                dimension="supply_chain",
+                payload=payload,
+            )
+            created += int(was_created)
+            updated += int(not was_created)
+        return {"observations_created": created, "observations_updated": updated}
+
+
+class OciRegistryManifestAdapter(VulnSourceAdapter):
+    """Fetch one exact OCI/Docker manifest through the Campaign egress proxy."""
+
+    tool_id = "registry.oci-manifest.v1"
+    version = "1.0.0"
+    risk_class = "R2"
+    source_type = "oci_registry_manifest"
+    dimension = "supply_chain"
+    binary = "curl"
+    version_args = ("--version",)
+    uses_http = True
+    uses_network = True
+    timeout_seconds = 30
+    input_schema = {
+        "type": "object",
+        "required": ["registry_images"],
+        "properties": {
+            "registry_images": {
+                "type": "array",
+                "items": {"type": "object"},
+                "maxItems": 5,
+            }
+        },
+        "additionalProperties": False,
+    }
+    output_schema = {
+        "type": "object",
+        "required": ["manifests"],
+        "properties": {
+            "manifests": {"type": "array", "items": {"type": "object"}}
+        },
+        "additionalProperties": False,
+    }
+    _ACCEPT = (
+        "application/vnd.oci.image.index.v1+json,"
+        "application/vnd.oci.image.manifest.v1+json,"
+        "application/vnd.docker.distribution.manifest.list.v2+json,"
+        "application/vnd.docker.distribution.manifest.v2+json"
+    )
+
+    @staticmethod
+    def _source_config(context: AdapterContext) -> tuple[str, str | None]:
+        try:
+            raw = json.loads(str(context.source["config_json"] or "{}"))
+        except json.JSONDecodeError as exc:
+            raise AdapterValidationError("Registry source configuration is invalid") from exc
+        normalized = validate_registry_source_config(raw)
+        reference = str(normalized["credential_ref"])
+        return reference, _registry_bearer_token(reference)
+
+    def normalize_task_target(self, value: str) -> str:
+        return normalize_registry_image(value)
+
+    def validate(self, context: AdapterContext) -> None:
+        super().validate(context)
+        if not context.registry_images or len(context.registry_images) > 5:
+            raise AdapterValidationError(
+                "OCI Registry collection requires one to five exact image assets"
+            )
+        if not context.proxy_url:
+            raise AdapterValidationError("OCI Registry collection requires Campaign egress proxy")
+        proxy = urlsplit(context.proxy_url)
+        if proxy.scheme not in {"http", "https", "socks5", "socks5h"} or not proxy.hostname:
+            raise AdapterValidationError("Campaign egress proxy is invalid")
+        self.get_headers(context)
+        self._source_config(context)
+        for image in context.registry_images:
+            if image.get("asset_type") != "registry_image" or not image.get("asset_id"):
+                raise AdapterValidationError("Registry image is not linked to an exact asset")
+            if normalize_registry_image(str(image.get("identifier") or "")) != str(
+                image.get("identifier") or ""
+            ):
+                raise AdapterValidationError("Registry image identity is not canonical")
+
+    @staticmethod
+    def _config_value(value: str) -> str:
+        if "\r" in value or "\n" in value or "\x00" in value:
+            raise AdapterValidationError("Curl configuration contains an invalid value")
+        return value.replace("\\", "\\\\").replace('"', '\\"')
+
+    @staticmethod
+    def _image_parts(value: str) -> tuple[str, str, str]:
+        normalized = normalize_registry_image(value)
+        registry, repository_reference = normalized.split("/", 1)
+        if "@" in repository_reference:
+            repository, reference = repository_reference.rsplit("@", 1)
+        else:
+            repository, reference = repository_reference.rsplit(":", 1)
+        return registry, repository, reference
+
+    def materialize(self, context: AdapterContext) -> list[AdapterInvocation]:
+        _credential_ref, token = self._source_config(context)
+        headers = self.get_headers(context)
+        config_lines = [
+            f'proxy = "{self._config_value(str(context.proxy_url or ""))}"',
+            f'header = "Accept: {self._config_value(self._ACCEPT)}"',
+            *[
+                f'header = "{self._config_value(name)}: {self._config_value(value)}"'
+                for name, value in headers.items()
+            ],
+        ]
+        if token is not None:
+            config_lines.append(
+                f'header = "Authorization: Bearer {self._config_value(token)}"'
+            )
+        config = "\n".join(config_lines) + "\n"
+        invocations: list[AdapterInvocation] = []
+        for image in context.registry_images:
+            identifier = normalize_registry_image(str(image["identifier"]))
+            registry, repository, reference = self._image_parts(identifier)
+            url = (
+                f"https://{registry}/v2/{quote(repository, safe='/')}/manifests/"
+                f"{quote(reference, safe=':')}"
+            )
+            invocations.append(
+                AdapterInvocation(
+                    argv=(
+                        self.binary,
+                        "--config",
+                        "-",
+                        "--silent",
+                        "--show-error",
+                        "--fail-with-body",
+                        "--proto",
+                        "=https",
+                        "--tlsv1.2",
+                        "--connect-timeout",
+                        "5",
+                        "--max-time",
+                        str(self.timeout_seconds),
+                        "--max-filesize",
+                        str(5 * 1024 * 1024),
+                        "--max-redirs",
+                        "0",
+                        "--write-out",
+                        "\nCAIRN_REGISTRY_DIGEST:%header{docker-content-digest}"
+                        "\nCAIRN_HTTP_STATUS:%{http_code}",
+                        url,
+                    ),
+                    target=identifier,
+                    stdin=config,
+                )
+            )
+        return invocations
+
+    def execute(self, context: AdapterContext) -> AdapterExecution:
+        return self._execute_materialized(context)
+
+    def parse(self, execution: AdapterExecution) -> dict[str, Any]:
+        manifests: list[dict[str, Any]] = []
+        for result in execution.results:
+            payload_with_digest, separator, raw_status = result.stdout.rpartition(
+                "\nCAIRN_HTTP_STATUS:"
+            )
+            if not separator or raw_status.strip() != "200":
+                raise AdapterExecutionError("Registry manifest response is incomplete", execution)
+            body, digest_separator, registry_digest = payload_with_digest.rpartition(
+                "\nCAIRN_REGISTRY_DIGEST:"
+            )
+            if not digest_separator:
+                raise AdapterExecutionError("Registry digest metadata is incomplete", execution)
+            registry_digest = registry_digest.strip().casefold()
+            if registry_digest and not re.fullmatch(
+                r"sha256:[0-9a-f]{64}", registry_digest
+            ):
+                raise AdapterExecutionError("Registry manifest digest is invalid", execution)
+            if len(body.encode("utf-8")) > 5 * 1024 * 1024:
+                raise AdapterExecutionError("Registry manifest exceeds five MiB", execution)
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise AdapterExecutionError("Registry returned invalid manifest JSON", execution) from exc
+            if not isinstance(payload, Mapping) or payload.get("schemaVersion") != 2:
+                raise AdapterExecutionError("Registry manifest schema is unsupported", execution)
+            media_type = str(payload.get("mediaType") or "")[:256]
+            if media_type not in {
+                "application/vnd.oci.image.index.v1+json",
+                "application/vnd.oci.image.manifest.v1+json",
+                "application/vnd.docker.distribution.manifest.list.v2+json",
+                "application/vnd.docker.distribution.manifest.v2+json",
+            }:
+                raise AdapterExecutionError(
+                    "Registry manifest media type is unsupported", execution
+                )
+            raw_layers = payload.get("layers") or []
+            raw_manifests = payload.get("manifests") or []
+            if not isinstance(raw_layers, list) or not isinstance(raw_manifests, list):
+                raise AdapterExecutionError("Registry manifest collections are invalid", execution)
+            if len(raw_layers) > 10_000 or len(raw_manifests) > 1000:
+                raise AdapterExecutionError("Registry manifest exceeds collection limits", execution)
+            layers: list[dict[str, Any]] = []
+            for layer in raw_layers:
+                if not isinstance(layer, Mapping):
+                    continue
+                digest = str(layer.get("digest") or "").casefold()
+                if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                    raise AdapterExecutionError("Registry layer digest is invalid", execution)
+                layers.append(
+                    {
+                        "digest": digest,
+                        "media_type": str(layer.get("mediaType") or "")[:256],
+                        "size": max(0, int(layer.get("size") or 0)),
+                    }
+                )
+            platforms: list[dict[str, str | None]] = []
+            for manifest in raw_manifests:
+                if not isinstance(manifest, Mapping):
+                    continue
+                platform = manifest.get("platform")
+                if not isinstance(platform, Mapping):
+                    continue
+                platforms.append(
+                    {
+                        "os": str(platform.get("os") or "")[:64] or None,
+                        "architecture": str(platform.get("architecture") or "")[:64] or None,
+                        "variant": str(platform.get("variant") or "")[:64] or None,
+                    }
+                )
+            identifier = normalize_registry_image(str(result.target or ""))
+            if "@" in identifier:
+                expected_digest = identifier.rsplit("@", 1)[1]
+                if registry_digest != expected_digest:
+                    raise AdapterExecutionError(
+                        "Registry response digest does not match the requested image", execution
+                    )
+            manifests.append(
+                {
+                    "identifier": identifier,
+                    "registry_digest": registry_digest or None,
+                    "manifest_body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                    "media_type": media_type,
+                    "layer_count": len(layers),
+                    "layers": layers,
+                    "platforms": platforms,
+                    "config_digest": str(
+                        (payload.get("config") or {}).get("digest") or ""
+                    )[:80]
+                    if isinstance(payload.get("config"), Mapping)
+                    else None,
+                }
+            )
+        return {"manifests": manifests}
+
+    def normalize(self, context: AdapterContext, parsed: Any) -> dict[str, int]:
+        from cairn.server.vulnerability_models import AssetInput
+        from cairn.server.vulnerability_services import upsert_discovered_asset
+
+        images = {
+            str(image["identifier"]): str(image["asset_id"])
+            for image in context.registry_images
+        }
+        created = 0
+        updated = 0
+        discovered = 0
+        for manifest in parsed.get("manifests", []):
+            asset_id = images.get(str(manifest.get("identifier") or ""))
+            if asset_id is None:
+                raise AdapterValidationError(
+                    "Registry result is not linked to an approved image asset"
+                )
+            payload = {"record_type": "oci_registry_manifest", **manifest}
+            was_created = _record_linked_asset_metadata(
+                context,
+                asset_id=asset_id,
+                dimension="supply_chain",
+                payload=payload,
+            )
+            created += int(was_created)
+            updated += int(not was_created)
+            registry_digest = manifest.get("registry_digest")
+            if registry_digest and "@" not in str(manifest["identifier"]):
+                repository = str(manifest["identifier"]).rsplit(":", 1)[0]
+                digest_asset, _asset_created, _lineage = upsert_discovered_asset(
+                    context.conn,
+                    context.campaign_id,
+                    AssetInput(
+                        asset_type="registry_image",
+                        identifier=f"{repository}@{registry_digest}",
+                        technology=["oci", str(manifest.get("media_type") or "manifest")],
+                        source_name=str(context.source["name"] or "OCI Registry"),
+                    ),
+                    discovery_kind="registry_manifest_digest",
+                    parent_asset_id=asset_id,
+                    source_id=str(context.source["id"]),
+                    task_id=context.task_id,
+                    evidence_hash=str(manifest["manifest_body_sha256"]),
+                )
+                discovered += int(digest_asset is not None)
+        return {
+            "observations_created": created,
+            "observations_updated": updated,
+            "assets_discovered": discovered,
+        }
+
+
 class GitleaksLocalRepositoryAdapter(VulnSourceAdapter):
     """Scan only explicitly allowlisted local repository snapshots, fully redacted."""
 
@@ -5725,6 +6999,10 @@ _ADAPTERS: tuple[VulnSourceAdapter, ...] = (
     DnsxResolveAdapter(),
     HttpxHttpMetadataAdapter(),
     TlsxTlsMetadataAdapter(),
+    GitLocalMetadataAdapter(),
+    CloudInventoryArtifactAdapter(),
+    MobileArchiveMetadataAdapter(),
+    OciRegistryManifestAdapter(),
     GitleaksLocalRepositoryAdapter(),
     SyftLocalSbomAdapter(),
     SyftContainerArchiveSbomAdapter(),

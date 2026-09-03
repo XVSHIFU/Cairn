@@ -2202,6 +2202,91 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             "(30, 'vulnerability_container_archive_sbom', "
             "strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
         )
+    if 31 not in applied:
+        conn.execute(
+            """
+            UPDATE vuln_sources
+            SET config_json = '{"adapter":"git.local-metadata.v1"}',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            WHERE source_type = 'code'
+              AND (config_json = '{}' OR config_json IS NULL)
+            """
+        )
+        for prefix, name, source_type, adapter in (
+            (
+                "source-r0-cloud-inventory-",
+                "Cloud inventory artifact",
+                "cloud_inventory_artifact",
+                "cloud.inventory-artifact.v1",
+            ),
+            (
+                "source-r0-mobile-archive-",
+                "Mobile archive metadata",
+                "mobile_archive_metadata",
+                "mobile.archive-metadata.v1",
+            ),
+        ):
+            conn.execute(
+                """
+                INSERT INTO vuln_sources
+                    (id, campaign_id, name, source_type, status, enabled,
+                     freshness_seconds, config_json, created_at, updated_at)
+                SELECT ? || campaign.id, campaign.id, ?, ?, 'idle', 0, 86400, ?,
+                       strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                       strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                FROM vuln_campaigns AS campaign
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM vuln_sources AS source
+                    WHERE source.campaign_id = campaign.id
+                      AND source.source_type = ?
+                )
+                """,
+                (
+                    prefix,
+                    name,
+                    source_type,
+                    json.dumps(
+                        {
+                            "adapter": adapter,
+                            "default_disabled": True,
+                            "offline_only": True,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    source_type,
+                ),
+            )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES "
+            "(31, 'vulnerability_code_cloud_mobile_sources', "
+            "strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 32 not in applied:
+        conn.execute(
+            """
+            INSERT INTO vuln_sources
+                (id, campaign_id, name, source_type, status, enabled,
+                 freshness_seconds, config_json, created_at, updated_at)
+            SELECT 'source-r2-oci-registry-' || campaign.id,
+                   campaign.id, 'OCI Registry manifest', 'oci_registry_manifest',
+                   'idle', 0, 21600,
+                   '{"adapter":"registry.oci-manifest.v1","credential_ref":"","default_disabled":true}',
+                   strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                   strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            FROM vuln_campaigns AS campaign
+            WHERE NOT EXISTS (
+                SELECT 1 FROM vuln_sources AS source
+                WHERE source.campaign_id = campaign.id
+                  AND source.source_type = 'oci_registry_manifest'
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES "
+            "(32, 'vulnerability_oci_registry_manifest_source', "
+            "strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
 
 
 def _ensure_ctf_columns(conn: sqlite3.Connection) -> None:
