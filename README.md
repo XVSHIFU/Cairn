@@ -151,6 +151,8 @@ docker compose up --build
 
 漏洞分析容器使用只读根文件系统、删除全部 Linux capabilities、`no-new-privileges`、PID/内存/CPU 上限及有界 `/tmp`。已有项目容器不满足同一隔离版本时会拒绝复用，需由运维移除后按当前配置重建。
 
+漏洞 Campaign 的异常通知默认关闭。启用前由服务端配置三个环境变量：`CAIRN_NOTIFICATION_ALLOWED_HOSTS` 是逗号分隔的 HTTPS 目标主机精确白名单，`CAIRN_NOTIFICATION_PROXY_URL` 是通知专用 HTTP/HTTPS 出口代理，`CAIRN_NOTIFICATION_SECRETS` 是 `secret_ref` 到 HMAC 密钥的 JSON 对象（每项 32～4096 字节）。密钥只存在于服务端环境，不写入数据库、API 响应或通知正文。通道配置和失败重试 API 均要求漏洞审批人身份；投递不跟随重定向，并对请求、响应、超时、租约和重试次数设硬限制。
+
 ### 方式三：手动
 
 ```bash

@@ -822,6 +822,48 @@ CREATE INDEX IF NOT EXISTS idx_vuln_autonomy_cycles_campaign
 ON vuln_autonomy_cycles(campaign_id, created_at DESC);
 """
 
+VULNERABILITY_NOTIFICATION_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS vuln_notification_channels (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    secret_ref TEXT,
+    event_types_json TEXT NOT NULL DEFAULT '[]',
+    enabled INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(campaign_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS vuln_notification_outbox (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES vuln_campaigns(id) ON DELETE CASCADE,
+    channel_id TEXT NOT NULL REFERENCES vuln_notification_channels(id) ON DELETE CASCADE,
+    audit_event_id TEXT NOT NULL REFERENCES vuln_audit_events(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'delivering', 'retry', 'delivered', 'failed', 'cancelled')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 5 CHECK(max_attempts BETWEEN 1 AND 20),
+    not_before TEXT,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    response_code INTEGER,
+    response_hash TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    delivered_at TEXT,
+    updated_at TEXT NOT NULL,
+    UNIQUE(channel_id, audit_event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vuln_notification_outbox_ready
+ON vuln_notification_outbox(status, not_before, lease_expires_at, created_at);
+"""
+
 VULNERABILITY_RESEARCH_REGISTRY_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS vuln_research_manifest_runs (
     id TEXT PRIMARY KEY,
@@ -2327,6 +2369,13 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES "
             "(33, 'vulnerability_autonomy_health_and_recovery', "
+            "strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+    if 34 not in applied:
+        conn.executescript(VULNERABILITY_NOTIFICATION_SCHEMA)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES "
+            "(34, 'vulnerability_notification_outbox', "
             "strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
         )
 
