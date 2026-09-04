@@ -1,3 +1,4 @@
+import sqlite3
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
@@ -43,13 +44,27 @@ from cairn.server.services import (
 router = APIRouter(tags=["projects"])
 
 
+def _expire_leases_when_available(
+    conn: sqlite3.Connection, project_id: str | None = None
+) -> None:
+    """Keep read endpoints available while a vulnerability result is committing."""
+
+    try:
+        expire_workers(conn, project_id)
+        expire_reason_leases(conn, project_id)
+    except sqlite3.OperationalError as exc:
+        conn.rollback()
+        if "locked" not in str(exc).casefold():
+            raise
+
+
 @router.get("/projects", response_model=list[ProjectSummary])
 def list_projects(
     project_kind: Literal["general", "vulnerability"] = Query(default="general"),
 ):
     with get_conn() as conn:
-        expire_workers(conn)
-        expire_reason_leases(conn)
+        if project_kind == "general":
+            _expire_leases_when_available(conn)
         rows = conn.execute("""
             SELECT p.*,
                 (SELECT COUNT(*) FROM facts WHERE project_id = p.id) AS fact_count,
@@ -140,8 +155,11 @@ def create_project(body: CreateProjectRequest):
 @router.get("/projects/{project_id}", response_model=ProjectDetail)
 def get_project(project_id: str):
     with get_conn() as conn:
-        expire_workers(conn, project_id)
-        expire_reason_leases(conn, project_id)
+        project_kind = conn.execute(
+            "SELECT project_kind FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        if project_kind is None or project_kind["project_kind"] == "general":
+            _expire_leases_when_available(conn, project_id)
         row = get_project_or_404(conn, project_id)
 
         facts = conn.execute(

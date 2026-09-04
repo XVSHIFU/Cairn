@@ -2419,8 +2419,13 @@ def _ensure_ctf_columns(conn: sqlite3.Connection) -> None:
 @contextmanager
 def get_conn() -> Generator[sqlite3.Connection, None, None]:
     assert _db_path is not None
-    conn = sqlite3.connect(str(_db_path))
+    # Collection result application is intentionally atomic and can briefly
+    # hold SQLite's single WAL writer slot.  Give concurrent Web mutations a
+    # bounded opportunity to wait instead of failing immediately at the first
+    # collision.
+    conn = sqlite3.connect(str(_db_path), timeout=5.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     try:

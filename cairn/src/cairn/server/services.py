@@ -223,9 +223,7 @@ def clear_project_reason(conn: sqlite3.Connection, project_id: str) -> None:
 def expire_workers(conn: sqlite3.Connection, project_id: str | None = None) -> None:
     timeout = get_intent_timeout(conn)
     now = utcnow()
-    query = """
-        UPDATE intents
-        SET worker = NULL
+    predicate = """
         WHERE to_fact_id IS NULL
           AND worker IS NOT NULL
           AND last_heartbeat_at IS NOT NULL
@@ -233,26 +231,43 @@ def expire_workers(conn: sqlite3.Connection, project_id: str | None = None) -> N
     """
     params: tuple = (now, timeout)
     if project_id is not None:
-        query = query.replace("WHERE ", "WHERE project_id = ? AND ", 1)
+        predicate = predicate.replace("WHERE ", "WHERE project_id = ? AND ", 1)
         params = (project_id, now, timeout)
-    conn.execute(query, params)
+    # Project reads used to execute an UPDATE even when no lease had expired.
+    # That unnecessarily competed with atomic vulnerability result writes.
+    if (
+        conn.execute(f"SELECT 1 FROM intents {predicate} LIMIT 1", params).fetchone()
+        is None
+    ):
+        return
+    conn.execute(f"UPDATE intents SET worker = NULL {predicate}", params)
 
 
 def expire_reason_leases(conn: sqlite3.Connection, project_id: str | None = None) -> None:
     timeout = get_reason_timeout(conn)
     now = utcnow()
-    query = """
-        UPDATE projects
-        SET reason_worker = NULL,
-            reason_trigger = NULL,
-            reason_started_at = NULL,
-            reason_last_heartbeat_at = NULL
+    predicate = """
         WHERE reason_worker IS NOT NULL
           AND reason_last_heartbeat_at IS NOT NULL
           AND (julianday(?) - julianday(reason_last_heartbeat_at)) * 86400 > ?
     """
     params: tuple = (now, timeout)
     if project_id is not None:
-        query = query.replace("WHERE ", "WHERE id = ? AND ", 1)
+        predicate = predicate.replace("WHERE ", "WHERE id = ? AND ", 1)
         params = (project_id, now, timeout)
-    conn.execute(query, params)
+    if (
+        conn.execute(f"SELECT 1 FROM projects {predicate} LIMIT 1", params).fetchone()
+        is None
+    ):
+        return
+    conn.execute(
+        f"""
+        UPDATE projects
+        SET reason_worker = NULL,
+            reason_trigger = NULL,
+            reason_started_at = NULL,
+            reason_last_heartbeat_at = NULL
+        {predicate}
+        """,
+        params,
+    )
