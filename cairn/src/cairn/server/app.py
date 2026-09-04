@@ -15,7 +15,21 @@ STATIC_DIR = Path(__file__).parent / "static"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.configure(db.DEFAULT_DB)
-    yield
+    collector = None
+    if getattr(app.state, "vulnerability_collector_enabled", False):
+        from cairn.server.vulnerability_runtime import embedded_vulnerability_collector
+
+        collector = embedded_vulnerability_collector
+        collector.start(
+            interval_seconds=getattr(
+                app.state, "vulnerability_collector_interval_seconds", 60
+            )
+        )
+    try:
+        yield
+    finally:
+        if collector is not None:
+            collector.stop()
 
 
 app = FastAPI(

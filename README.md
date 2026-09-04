@@ -126,15 +126,17 @@ Worker 直接跑在调度器宿主机上，复用本机已配置好的 `claude` 
 
 ```bash
 # 仓库根目录一键起停
-./cairn-local.sh start      # 启动 server(:8000) + dispatcher
+./cairn-local.sh start      # 启动 server(:8000，内置漏洞采集器) + dispatcher
 ./cairn-local.sh status     # 查看进程与 API 状态
 ./cairn-local.sh stop       # 停止
 ./cairn-local.sh restart    # 重启
 
 # 或手动
-uv run --project cairn cairn serve                          # 后端 :8000
+uv run --project cairn cairn serve                          # 后端 :8000 + 漏洞采集器
 uv run --project cairn cairn dispatch --config dispatch.yaml # 调度器
 ```
+
+`cairn serve` 默认托管漏洞持续采集器，因此 Web 控制台提交的真实采集任务会立即进入受控执行队列，不需要再为每个 Campaign 手工启动 `vuln-collect`。需要将采集器拆成独立进程时，可用 `cairn serve --no-vuln-collector`，并另行运行 `cairn vuln-collect --interval 60`。
 
 本地模式通过 `runtime.execution: local` 开启（参见 `dispatch.local.example.yaml`）。调度器启动时检查每个配置的 Worker CLI 是否可执行，并提示它们必须已登录。每个项目在 `local.workspace_root`（默认：调度器当前目录）下获得独立工作目录。**请直接在宿主机上运行调度器，不要放进 Docker**——Agent 将以你的用户权限运行且无沙箱。
 
@@ -156,7 +158,7 @@ docker compose up --build
 ### 方式三：手动
 
 ```bash
-# 启动 server
+# 启动 server（默认同时启动漏洞持续采集器）
 uv run --project cairn cairn serve
 
 # 运行 dispatcher

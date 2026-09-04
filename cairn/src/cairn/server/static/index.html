@@ -643,8 +643,8 @@
       <span x-text="t('vulnLastUpdated')"></span>
       <span class="font-medium text-slate-600 tabular-nums" x-text="vulnerabilityUpdatedAt"></span>
     </div>
-    <button @click="vulnerabilityRefreshRecon()" :disabled="vulnerabilityRefreshing" class="h-7 w-7 shrink-0 rounded-lg border border-slate-200 text-xs text-slate-600 hover:bg-slate-50 transition inline-flex items-center justify-center gap-1.5 disabled:opacity-50 sm:w-auto sm:px-2.5">
-      <svg class="w-3.5 h-3.5" :class="{ 'vuln-refreshing': vulnerabilityRefreshing }" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.34 5.66"/><path d="M20 4v7h-7"/></svg>
+    <button @click="vulnerabilityRefreshRecon()" :disabled="vulnerabilityRefreshing || vulnerabilityCampaign.status !== 'running' || !vulnerabilityCampaign.authorized" class="h-7 w-7 shrink-0 rounded-lg bg-sky-600 text-xs text-white hover:bg-sky-700 transition inline-flex items-center justify-center gap-1.5 disabled:cursor-not-allowed disabled:opacity-40 sm:w-auto sm:px-2.5">
+      <svg class="w-3.5 h-3.5" :class="{ 'vuln-refreshing': vulnerabilityRefreshing }" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="M8 5v14l11-7Z"/></svg>
       <span class="hidden sm:inline" x-text="vulnerabilityRefreshing ? t('vulnRefreshing') : t('vulnRefresh')"></span>
     </button>
     <button type="button" @click="setVulnerabilitySection('settings')" class="h-7 w-7 rounded-lg border transition inline-flex items-center justify-center" :class="vulnerabilitySection === 'settings' ? 'border-sky-300 bg-sky-50 text-sky-700' : 'border-slate-200 text-slate-400 hover:bg-slate-50 hover:text-slate-600'" :title="t('vulnSettings')" :aria-label="t('vulnSettings')">
@@ -2024,7 +2024,7 @@ const CAIRN_I18N = {
     statusConcluded:"Concluded", statusBootstrapRunning:"Bootstrap Running", statusBootstrapPending:"Bootstrap Pending",
     statusInProgress:"In Progress", statusUnclaimed:"Unclaimed",
     vulnerabilityMining:"Vulnerability Mining", vulnCollection:"Information Collection", vulnMiningWorkspace:"Vulnerability Mining", vulnWorkspace:"Authorized research workspace", vulnAuthorized:"Authorized",
-    vulnBackProjects:"Back to projects", vulnLastUpdated:"Last updated", vulnRefresh:"Refresh", vulnRefreshing:"Refreshing...",
+    vulnBackProjects:"Back to projects", vulnLastUpdated:"Last updated", vulnRefresh:"Run collection", vulnRefreshing:"Starting...",
     vulnCurrentCampaign:"Current campaign", vulnContinuousMonitoring:"Continuous monitoring", vulnAuthorizationUntil:"Authorization until",
     vulnScopeItems:"Scope items", vulnOverview:"Overview", vulnRecon:"Reconnaissance", vulnAssets:"Asset Graph", vulnCollectionResults:"Results", vulnCollectionDetails:"Coverage & Sources", vulnAssetView:"Asset Map", vulnAgentWorkspace:"Agent Analysis", vulnExecutionQueue:"Execution Queue",
     vulnTasks:"Mining Tasks", vulnFindings:"Findings", vulnReports:"Reports", vulnAIAnalysis:"AI Analysis", vulnSettings:"Settings",
@@ -2126,7 +2126,7 @@ const CAIRN_I18N = {
     vulnRequestsPerSecond:"Maximum requests per second", vulnMockSafetySummary:"The backend validates authorization and scope. Active requests remain unavailable until a separately configured executor passes the same checks.",
     vulnPrevious:"Previous", vulnNext:"Next", vulnCreateMock:"Create campaign", vulnCreating:"Creating...", vulnCampaignCreated:"Campaign created.",
     vulnCampaignCreatedMock:"Campaign created.", vulnAllAuthorizedAssets:"All authorized assets", vulnActiveDryRunJob:"Active policy dry-run",
-    vulnPassiveRefreshJob:"Passive refresh", vulnIncrementalRefreshJob:"Incremental refresh", vulnRefreshRecorded:"Refresh dry-run recorded; no external request was sent.",
+    vulnPassiveRefreshJob:"Passive refresh", vulnIncrementalRefreshJob:"Incremental refresh", vulnRefreshRecorded:"Collection started. Progress and results will update automatically.",
     vulnImportAssets:"Import assets", vulnImportAssetsHint:"Add normalized observations manually, one identifier per line.", vulnAssetType:"Asset type",
     vulnIdentifiersLines:"Identifiers (one per line)", vulnIdentifiersPlaceholder:"api.example.com\n203.0.113.7", vulnImportScopeHint:"Every item is classified by the backend as in-scope or out-of-scope; out-of-scope assets can never be actively tested.",
     vulnImport:"Import", vulnAssetsImported:"Imported {created} new and updated {updated} existing assets.", vulnNoTasks:"No jobs have been recorded.", vulnLogs:"Logs", vulnNoLogs:"No logs.",
@@ -2215,7 +2215,7 @@ const CAIRN_I18N = {
     statusConcluded:"已结案", statusBootstrapRunning:"引导执行中", statusBootstrapPending:"引导待执行",
     statusInProgress:"执行中", statusUnclaimed:"未认领",
     vulnerabilityMining:"漏洞挖掘", vulnCollection:"信息收集", vulnMiningWorkspace:"漏洞挖掘", vulnWorkspace:"已授权研究工作台", vulnAuthorized:"已授权",
-    vulnBackProjects:"返回项目列表", vulnLastUpdated:"最后更新", vulnRefresh:"刷新", vulnRefreshing:"刷新中...",
+    vulnBackProjects:"返回项目列表", vulnLastUpdated:"最后更新", vulnRefresh:"开始采集", vulnRefreshing:"启动中...",
     vulnCurrentCampaign:"当前挖掘项目", vulnContinuousMonitoring:"持续监控中", vulnAuthorizationUntil:"授权有效期",
     vulnScopeItems:"范围条目", vulnOverview:"项目总览", vulnRecon:"信息搜集", vulnAssets:"资产图谱", vulnCollectionResults:"收集结果", vulnCollectionDetails:"覆盖与来源", vulnAssetView:"资产图谱", vulnAgentWorkspace:"Agent 分析", vulnExecutionQueue:"执行队列",
     vulnTasks:"挖掘任务", vulnFindings:"漏洞中心", vulnReports:"报告中心", vulnAIAnalysis:"AI 分析", vulnSettings:"项目设置",
@@ -2317,7 +2317,7 @@ const CAIRN_I18N = {
     vulnRequestsPerSecond:"每秒最大请求数", vulnMockSafetySummary:"后端会校验授权与范围；在单独配置执行器并通过同样检查前，主动请求仍不可用。",
     vulnPrevious:"上一步", vulnNext:"下一步", vulnCreateMock:"创建挖掘项目", vulnCreating:"创建中...", vulnCampaignCreated:"挖掘项目已创建。",
     vulnCampaignCreatedMock:"挖掘项目已创建。", vulnAllAuthorizedAssets:"全部授权资产", vulnActiveDryRunJob:"主动策略预检",
-    vulnPassiveRefreshJob:"被动信息刷新", vulnIncrementalRefreshJob:"增量信息刷新", vulnRefreshRecorded:"刷新预检已记录，未发送外部请求。",
+    vulnPassiveRefreshJob:"被动信息刷新", vulnIncrementalRefreshJob:"增量信息刷新", vulnRefreshRecorded:"采集任务已启动，进度和结果将自动更新。",
     vulnImportAssets:"导入资产", vulnImportAssetsHint:"手工添加标准化观察数据，每行填写一个标识符。", vulnAssetType:"资产类型",
     vulnIdentifiersLines:"标识符（每行一个）", vulnIdentifiersPlaceholder:"api.example.com\n203.0.113.7", vulnImportScopeHint:"后端会把每项判定为范围内或范围外；范围外资产永远不能执行主动测试。",
     vulnImport:"导入", vulnAssetsImported:"新增 {created} 个、更新 {updated} 个资产。", vulnNoTasks:"尚无任务记录。", vulnLogs:"日志", vulnNoLogs:"暂无日志。",

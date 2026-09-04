@@ -26,11 +26,34 @@ def main():
 )
 @click.option("--log-level", default="info", show_default=True, help="Uvicorn log level")
 @click.option("--access-log/--no-access-log", default=True, show_default=True, help="Enable Uvicorn access log")
-def serve(host: str, port: int, db_path: str, log_level: str, access_log: bool):
+@click.option(
+    "--vuln-collector/--no-vuln-collector",
+    default=True,
+    show_default=True,
+    help="Run the vulnerability collection scheduler with the Web service",
+)
+@click.option(
+    "--vuln-collector-interval",
+    type=click.IntRange(min=5, max=86400),
+    default=60,
+    show_default=True,
+    help="Seconds between embedded vulnerability collector ticks",
+)
+def serve(
+    host: str,
+    port: int,
+    db_path: str,
+    log_level: str,
+    access_log: bool,
+    vuln_collector: bool,
+    vuln_collector_interval: int,
+):
     """Start the Cairn API server."""
     db.configure(Path(db_path))
     from cairn.server.app import app
 
+    app.state.vulnerability_collector_enabled = vuln_collector
+    app.state.vulnerability_collector_interval_seconds = vuln_collector_interval
     uvicorn.run(
         app,
         host=host,
