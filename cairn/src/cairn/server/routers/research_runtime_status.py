@@ -21,7 +21,7 @@ AVAILABLE_FRESHNESS_SECONDS = 90
 
 @router.get("/runtime")
 def runtime_status():
-    installed = shutil.which("claude") is not None
+    installed = shutil.which("claude") is not None or shutil.which("pi") is not None
     worker = None
     try:
         with db.get_conn() as conn:
@@ -50,7 +50,7 @@ def runtime_status():
     elif installed:
         message = "会话语已持久保存；研究执行器尚未启动或最近未心跳。"
     else:
-        message = "未找到 Claude Code；研究执行器无法运行。"
+        message = "未找到可用的研究 Agent（claude 或 pi）；研究执行器无法运行。"
     return {
         "available": available,
         "cli_installed": installed,
@@ -59,6 +59,6 @@ def runtime_status():
             "current_session_id": current_session,
             "last_heartbeat_seconds_ago": freshness,
         } if worker is not None else None,
-        "configuration_source": "Claude Code user settings" if installed else None,
+        "configuration_source": ("pi" if shutil.which("pi") else "claude") if installed else None,
         "message": message,
     }
