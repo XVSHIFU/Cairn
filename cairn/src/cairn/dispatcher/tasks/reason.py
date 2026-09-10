@@ -27,7 +27,6 @@ from cairn.dispatcher.tasks.common import (
 )
 from cairn.dispatcher.workers.registry import get_driver
 from cairn.server.models import ProjectDetail
-from cairn.vulnerability_ai_protocol import parse_analysis_draft
 
 LOG = logging.getLogger(__name__)
 

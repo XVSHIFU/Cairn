@@ -1,3 +1,5 @@
+> **开发入口（2026-09-09）**：产品正转向个人自主研究工作台。请先阅读 [开发总纲](docs/development-charter.md)、[前端 MVP](docs/frontend-mvp.md) 和 [当前状态](docs/implementation-status.md)。旧漏洞模块方案已归档；下文部分功能描述为既有实现参考。
+
 <div align="center">
 
 <img src="./README/banner.png" alt="Cairn Banner"/>

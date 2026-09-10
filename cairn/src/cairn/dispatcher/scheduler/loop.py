@@ -22,9 +22,7 @@ from cairn.dispatcher.workers.registry import get_driver
 from cairn.dispatcher.tasks.bootstrap import run_bootstrap_task
 from cairn.dispatcher.tasks.explore import run_explore_task
 from cairn.dispatcher.tasks.reason import run_reason_task
-from cairn.dispatcher.tasks.vulnerability_analysis import run_vulnerability_analysis_task
 from cairn.server.models import Intent, ProjectDetail, ProjectSummary
-from cairn.vulnerability_ai_protocol import is_analysis_intent
 
 LOG = logging.getLogger(__name__)
 UNHEALTHY_RETRY_AFTER_SECONDS = 5
@@ -312,10 +310,6 @@ class DispatcherLoop:
             and intent.worker is None
             and intent.id not in running_intent_ids
             and not self._is_bootstrap_intent(intent)
-            and (
-                self.config.runtime.profile != "vulnerability"
-                or is_analysis_intent(intent.description)
-            )
         ]
         if running_intent_ids and not unclaimed_intents:
             self._log_changed(
@@ -377,11 +371,7 @@ class DispatcherLoop:
         return self._dispatch_bootstrap(project, intent)
 
     def _dispatch_reason(self, project: ProjectDetail, export_yaml: str, trigger: str) -> bool:
-        worker_task_type = (
-            "vulnerability_analysis"
-            if self.config.runtime.profile == "vulnerability"
-            else "reason"
-        )
+        worker_task_type = "reason"
         selection = self._select_worker(project.project.id, worker_task_type)
         worker = selection.worker
         if worker is None:
@@ -504,8 +494,6 @@ class DispatcherLoop:
         return True
 
     def _dispatch_explore(self, project: ProjectDetail, export_yaml: str, intent: Intent) -> bool:
-        if self.config.runtime.profile == "vulnerability":
-            return self._dispatch_vulnerability_analysis(project, intent)
         selection = self._select_worker(project.project.id, "explore")
         worker = selection.worker
         if worker is None:
@@ -562,76 +550,6 @@ class DispatcherLoop:
         self.runtime_project_ids.add(project.project.id)
         self._clear_project_log_state(project.project.id)
         LOG.info("dispatched explore project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
-        return True
-
-    def _dispatch_vulnerability_analysis(
-        self, project: ProjectDetail, intent: Intent
-    ) -> bool:
-        selection = self._select_worker(
-            project.project.id, "vulnerability_analysis"
-        )
-        worker = selection.worker
-        if worker is None:
-            self._log_changed(
-                f"project:{project.project.id}:worker:vulnerability_analysis",
-                logging.INFO,
-                "no worker available for vulnerability analysis project=%s intent=%s blocked_busy=%s blocked_unhealthy=%s blocked_rejected=%s",
-                project.project.id,
-                intent.id,
-                selection.blocked_busy,
-                selection.blocked_unhealthy,
-                selection.blocked_rejected,
-            )
-            return False
-        claim = self.client.heartbeat(
-            project.project.id, intent.id, worker.name
-        )
-        if not claim.ok:
-            level = logging.INFO if claim.status_code in (403, 409) else logging.WARNING
-            LOG.log(
-                level,
-                "vulnerability analysis claim failed project=%s intent=%s worker=%s status=%s",
-                project.project.id,
-                intent.id,
-                worker.name,
-                claim.status_code,
-            )
-            return False
-        try:
-            future = self.executor.submit(
-                run_vulnerability_analysis_task,
-                self.config,
-                self.client,
-                self.container_manager,
-                project,
-                intent,
-                worker,
-                cancellation := TaskCancellation(),
-            )
-        except Exception:
-            LOG.exception(
-                "failed to submit vulnerability analysis project=%s intent=%s worker=%s",
-                project.project.id,
-                intent.id,
-                worker.name,
-            )
-            self._best_effort_release(project.project.id, intent.id, worker.name)
-            return False
-        self.futures[future] = RunningTask(
-            project.project.id,
-            "vulnerability_analysis",
-            worker.name,
-            cancellation,
-            intent_id=intent.id,
-        )
-        self.runtime_project_ids.add(project.project.id)
-        self._clear_project_log_state(project.project.id)
-        LOG.info(
-            "dispatched vulnerability analysis project=%s intent=%s worker=%s",
-            project.project.id,
-            intent.id,
-            worker.name,
-        )
         return True
 
     def _select_worker(self, project_id: str, task_type: str) -> WorkerSelection:
@@ -725,7 +643,7 @@ class DispatcherLoop:
             task.intent_id
             for task in self.futures.values()
             if task.project_id == project_id
-            and task.task_type in {"explore", "vulnerability_analysis"}
+            and task.task_type in {"explore", "reason"}
             and task.intent_id is not None
         }
 

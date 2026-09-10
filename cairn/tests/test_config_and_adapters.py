@@ -27,16 +27,6 @@ def test_dispatch_config_merges_common_env_with_worker_override() -> None:
     assert config.workers[0].env["OVERRIDE"] == "worker"
 
 
-def test_vulnerability_dispatch_example_has_separate_profile_and_budget() -> None:
-    config = DispatchConfig.load(REPO_ROOT / "dispatch.vulnerability.example.yaml")
-
-    assert config.runtime.profile == "vulnerability"
-    assert config.tasks.vulnerability_analysis.max_budget_units == 20
-    assert all(
-        worker.task_types == ["vulnerability_analysis"] for worker in config.workers
-    )
-
-
 def test_dispatch_config_defaults_worker_healthcheck_and_rejects_unknown_mode() -> None:
     payload = make_config().model_dump()
     payload["runtime"].pop("worker_healthcheck")

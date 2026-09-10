@@ -45,22 +45,6 @@ DEFAULT_PROMPT_REQUIRED_TOKENS: dict[str, tuple[str, ...]] = {
     "bootstrap_conclude.md": ("{origin}", "{goal}", "{hints}"),
 }
 
-VULNERABILITY_PROMPT_REQUIRED_TOKENS: dict[str, tuple[str, ...]] = {
-    "vulnerability_reason.md": (
-        "{graph_yaml}",
-        "{fact_ids}",
-        "{open_intents}",
-        "{analysis_context_json}",
-        "{max_intents}",
-        "{max_budget_units}",
-    ),
-    "vulnerability_analysis.md": (
-        "{intent_context_json}",
-        "{observations_json}",
-        "{max_output_bytes}",
-    ),
-}
-
 PROMPT_REQUIRED_TOKENS_BY_GROUP: dict[str, dict[str, tuple[str, ...]]] = {
     "mock": {
         "reason.md": ("{fact_ids}", "{open_intents}", "{max_intents}"),
@@ -68,18 +52,6 @@ PROMPT_REQUIRED_TOKENS_BY_GROUP: dict[str, dict[str, tuple[str, ...]]] = {
         "explore_conclude.md": ("{intent_id}",),
         "bootstrap.md": ("{origin}", "{goal}", "{hints}"),
         "bootstrap_conclude.md": ("{origin}", "{goal}", "{hints}"),
-        "vulnerability_reason.md": (
-            "{fact_ids}",
-            "{open_intents}",
-            "{analysis_context_json}",
-            "{max_intents}",
-            "{max_budget_units}",
-        ),
-        "vulnerability_analysis.md": (
-            "{intent_context_json}",
-            "{observations_json}",
-            "{max_output_bytes}",
-        ),
     }
 }
 
@@ -422,23 +394,6 @@ def validate_prompt_resources(prompt_group: str, profile: str = "general") -> No
         missing = [token for token in tokens if token not in content]
         if missing:
             raise ValueError(f"prompt group {prompt_group} resource {name} missing placeholders: {', '.join(missing)}")
-    if profile == "vulnerability":
-        vulnerability_tokens = VULNERABILITY_PROMPT_REQUIRED_TOKENS
-        if prompt_group == "mock":
-            vulnerability_tokens = {
-                name: PROMPT_REQUIRED_TOKENS_BY_GROUP["mock"][name]
-                for name in VULNERABILITY_PROMPT_REQUIRED_TOKENS
-            }
-        for name, tokens in vulnerability_tokens.items():
-            try:
-                content = group_dir.joinpath(name).read_text(encoding="utf-8")
-            except FileNotFoundError as exc:
-                raise ValueError(f"prompt group {prompt_group} missing resource: {name}") from exc
-            missing = [token for token in tokens if token not in content]
-            if missing:
-                raise ValueError(
-                    f"prompt group {prompt_group} resource {name} missing placeholders: {', '.join(missing)}"
-                )
 
 
 def resolve_mock_behavior(worker_name: str, env: dict[str, str]) -> dict[str, dict[str, Any]]:

@@ -269,10 +269,10 @@
       </button>
     </div>
     <div class="flex items-center gap-1.5">
-      <button @click="openVulnerability('collection')" class="h-7 px-2.5 rounded-lg border border-sky-200 bg-sky-50/70 text-xs text-sky-700 hover:bg-sky-100/70 transition inline-flex items-center gap-1.5">
+      <a href="/research" class="h-7 px-2.5 rounded-lg border border-sky-200 bg-sky-50/70 text-xs text-sky-700 hover:bg-sky-100/70 transition inline-flex items-center gap-1.5 no-underline">
         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="M12 3 4.5 6v5.25c0 4.49 3.2 8.7 7.5 9.75 4.3-1.05 7.5-5.26 7.5-9.75V6L12 3Z"/><path d="m9.5 12 1.75 1.75L15 10"/></svg>
-        <span x-text="t('vulnerabilityMining')"></span>
-      </button>
+        <span>安全研究</span>
+      </a>
       <button @click="showNewProject = true" class="h-7 px-2.5 rounded-lg border border-brand-200 text-xs text-brand-600 hover:bg-brand-50 transition inline-flex items-center gap-1.5">
         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="1.9" viewBox="0 0 24 24"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
         <span x-text="t('newProject')"></span>

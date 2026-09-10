@@ -1,0 +1,50 @@
+[
+  {
+    "path": "vulnerability-mining/architecture-confirmation.md",
+    "sha256": "394e3fc949ce103f17ffb4988c7b279ba4554b701e7c0693d5c2380765ab3a6a"
+  },
+  {
+    "path": "vulnerability-mining/archive/src-6k-reference-integration-proposal-pre-merge-20260902.md",
+    "sha256": "448eac540e5d5be7b2fa5c249aabc57fdc367845c572034335e4bbd1bc4169f2"
+  },
+  {
+    "path": "vulnerability-mining/archive/vulnerability-mining-plan-v4.0-pre-consolidation-20260902.md",
+    "sha256": "f8f47e5f823d116b3a5e687c636e8f4e949550eed4fb9d229e7a71360514c566"
+  },
+  {
+    "path": "vulnerability-mining/codex已完成阶段.md",
+    "sha256": "a5dc8b0caeac4109fb33a5992d526d5a79f5fda534ea0470556d1086698da932"
+  },
+  {
+    "path": "vulnerability-mining/implementation-status.md",
+    "sha256": "4e25391699ac112f435afea2c620ce4145451d4bce423d4e688249a2350c19bb"
+  },
+  {
+    "path": "vulnerability-mining/r3-deterministic-exit-diagnosis-20260901.md",
+    "sha256": "baf0701098524f603e3831f8cfde4aa504c8c5a94c583b4b8be9943be6dde3a2"
+  },
+  {
+    "path": "vulnerability-mining/src-6k-reference-integration-proposal.md",
+    "sha256": "59258474274a897b833897c28c81d0b426512ecb45b5b2d49c81317a8b73df94"
+  },
+  {
+    "path": "vulnerability-mining/vulnerability-mining-plan.md",
+    "sha256": "a42a5edba6a52e75c99774762c208b5792ebb6bee88c2a00e38733e6d83b5a51"
+  },
+  {
+    "path": "vulnerability-mining/vulnerability-mining-plan[旧文档备份].md",
+    "sha256": "39ef2b0a861edd4b0a361049d595808ea465f4339f00cf260c9ba7ef7e6643bc"
+  },
+  {
+    "path": "vulnerability-mining/参考内容.md",
+    "sha256": "3f60f5ffde8c8cc81f91809d61ca92e138e45ed2801384d00f8df33bcefce3bf"
+  },
+  {
+    "path": "vulnerability-mining/说明.md",
+    "sha256": "5cde9aaa0a604f38ffd5b1854cf2935dd6412f184660307837c28bf1e0b9b795"
+  },
+  {
+    "path": "vulnerability-mining-plan.md",
+    "sha256": "5ccbf62e02e8c7fab050fdac101150df131f98384e79cb7b28975067707888b0"
+  }
+]

@@ -2379,6 +2379,100 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             "strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
         )
 
+    if 35 not in applied:
+        from cairn.server.research_schema import RESEARCH_SCHEMA
+        conn.executescript(RESEARCH_SCHEMA)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES "
+            "(35, 'research_workbench', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+
+    if 36 not in applied:
+        from cairn.server.research_schema import RESEARCH_REPORT_SCHEMA
+        conn.executescript(RESEARCH_REPORT_SCHEMA)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES "
+            "(36, 'research_report_snapshots', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+
+    if 37 not in applied:
+        from cairn.server.research_schema import RESEARCH_IDENTITY_SCHEMA
+        conn.executescript(RESEARCH_IDENTITY_SCHEMA)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES "
+            "(37, 'research_identity_storage', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+
+    if 38 not in applied:
+        from cairn.server.research_schema import RESEARCH_SOURCE_SCHEMA
+        conn.executescript(RESEARCH_SOURCE_SCHEMA)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES "
+            "(38, 'research_source_snapshots', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+
+    if 39 not in applied:
+        from cairn.server.research_schema import RESEARCH_WORKER_RUNTIME_SCHEMA
+        conn.executescript(RESEARCH_WORKER_RUNTIME_SCHEMA)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES "
+            "(39, 'research_worker_runtime', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+
+    if 40 not in applied:
+        from cairn.server.research_schema import RESEARCH_RUN_ACCOUNTS_SCHEMA
+        conn.executescript(RESEARCH_RUN_ACCOUNTS_SCHEMA)
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(research_sessions)")
+        }
+        if "current_run_id" not in columns:
+            conn.execute(
+                "ALTER TABLE research_sessions ADD COLUMN current_run_id TEXT"
+            )
+        if "cost_pending_check" not in columns:
+            conn.execute(
+                "ALTER TABLE research_sessions ADD COLUMN cost_pending_check INTEGER NOT NULL DEFAULT 0"
+            )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES "
+            "(40, 'research_run_accounts', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+
+    if 41 not in applied:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(research_sessions)")
+        }
+        if "retry_count" not in columns:
+            conn.execute(
+                "ALTER TABLE research_sessions ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "latest_failure_json" not in columns:
+            conn.execute(
+                "ALTER TABLE research_sessions ADD COLUMN latest_failure_json TEXT"
+            )
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES "
+            "(41, 'research_failure_recovery', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+
+    if 42 not in applied:
+        from cairn.server.research_schema import RESEARCH_EXPERIENCES_SCHEMA
+        conn.executescript(RESEARCH_EXPERIENCES_SCHEMA)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES "
+            "(42, 'research_experiences', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+
+    if 43 not in applied:
+        from cairn.server.research_schema import CHANGE_WATCH_SCHEMA
+        conn.executescript(CHANGE_WATCH_SCHEMA)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES "
+            "(43, 'research_changewatch', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+        )
+
 
 def _ensure_ctf_columns(conn: sqlite3.Connection) -> None:
     # ctf_config may not exist yet on databases created before the CTF feature.
