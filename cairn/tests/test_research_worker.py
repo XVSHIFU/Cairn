@@ -1123,12 +1123,13 @@ def test_egress_env_establishes_enforcement_and_model_gateway(monkeypatch, tmp_p
     config_root = tmp_path / "private"
     proxy, env = w._egress_environment(session, 10, config_root=config_root)
     try:
-        # interceptor is compiled into the private claude-config dir and referenced by
-        # its SANDBOX path (the dir is RO-bound at /claude-config) — a host /tmp path
+        # interceptor is compiled into a private host dir and referenced by its SANDBOX
+        # path (/cairn-egress) which is RO-bound into the sandbox — a host /tmp path
         # would be invisible inside bwrap. LD_PRELOAD is injected INSIDE by bwrap
         # --setenv, not in the outer env (outer LD_PRELOAD breaks bwrap's user-ns helper).
-        assert w._egress_preload_path == "/claude-config/libcairn_egress.so"
+        assert w._egress_so_sandbox == "/cairn-egress/libcairn_egress.so"
         assert (config_root / "claude-config-runtime" / "libcairn_egress.so").is_file()
+        assert w._egress_so_host.endswith("libcairn_egress.so")
         assert "LD_PRELOAD" not in env
         assert "CAIRN_EGRESS_PROXY" in env
         # model gateway is admitted as model traffic
@@ -1601,3 +1602,54 @@ def test_research_driver_pluggable(tmp_path, monkeypatch):
     w4 = ResearchWorker(db_path=tmp_path / "x.db", worker_id="w-drv4", driver="pi")
     assert w4._driver.type_name == "pi"
     monkeypatch.delenv("CAIRN_RESEARCH_DRIVER", raising=False)
+
+
+
+
+class _FakeResult:
+    def __init__(self, stdout="", stderr=""):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = 0
+        self.cancelled = False
+        self.timed_out = False
+
+
+def _pi_ndjson(assistant_text: str) -> str:
+    import json as _json
+    events = [
+        {"type": "session", "version": 3, "id": "s-1"},
+        {"type": "agent_start"},
+        {"type": "message_start", "message": {"role": "assistant", "content": []}},
+        {"type": "turn_end", "message": {"role": "assistant", "content": [{"type": "text", "text": assistant_text}]}},
+        {"type": "agent_end"},
+    ]
+    return "\n".join(_json.dumps(e) for e in events)
+
+
+def test_pi_extract_analysis_response_tolerates_fence_and_extra_data(tmp_path):
+    """pi (deepseek-flash) may wrap the envelope in a fence or append trailing text;
+    only the FIRST complete JSON value must be handed back to the worker."""
+    from cairn.dispatcher.workers import get_driver
+    d = get_driver("pi", execution="local")
+    text = '```json\n{"terminal": false, "summary": "ok"}\n```\nsome trailing context'
+    out = d.extract_analysis_response(_pi_ndjson(text), "")
+    import json as _json
+    parsed = _json.loads(out.text)
+    assert parsed["terminal"] is False
+    assert parsed["summary"] == "ok"
+
+
+def test_worker_extract_payload_defaults_awaiting_for_pi(tmp_path, monkeypatch):
+    """pi's model often drops the REQUIRED awaiting_input boolean; the worker defaults it
+    to False (keep going) but never fabricates a completion (terminal stays strict)."""
+    from cairn.server.research_worker import ResearchWorker
+    monkeypatch.delenv("CAIRN_CLAUDE_BIN", raising=False)
+    w = ResearchWorker(db_path=str(tmp_path / "r.db"), workspace_root=str(tmp_path / "ws"), worker_id="w-pi")
+    from cairn.dispatcher.workers import get_driver
+    w._driver = get_driver("pi", execution="local")
+    out = _pi_ndjson('{"terminal": false, "summary": "x"}')
+    payload, _ = w._extract_payload(_FakeResult(out))
+    assert payload is not None
+    assert payload["terminal"] is False
+    assert payload["awaiting_input"] is False

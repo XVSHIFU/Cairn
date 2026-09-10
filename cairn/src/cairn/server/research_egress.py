@@ -92,7 +92,10 @@ def extract_gateway_hosts(operator_home) -> list[str]:
                 if isinstance(item, (dict, list)):
                     _collect(item)
 
-    for name in (".claude.json", ".claude/settings.json", ".claude/settings.local.json"):
+    for name in (
+        ".claude.json", ".claude/settings.json", ".claude/settings.local.json",
+        ".pi/agent/models.json",
+    ):
         p = home / name
         if not p.is_file() or p.is_symlink():
             continue

@@ -84,6 +84,8 @@
   "awaiting_input": false
 }
 
+**这两个字段必须**：`terminal` 与 `awaiting_input` 都必须出现在 JSON 里，且必须是**原始 JSON 布尔值** `true` 或 `false`（禁止省略、禁止 `null`、禁止加引号的字符串）。两者不得同时为 `true`。
+
 如果本轮还不需要收束（你还会继续根据 next_direction 往下研究），设 terminal=false；一旦要结束本轮报告，设 terminal=true。若需要用户补充材料/调整边界，设 awaiting_input=true 并在 summary 说明。
 
 **即使未获得任何发现、或目标不可达/工具受阻，也必须输出以上这一条 JSON**（summary 如实说明受阻情况，findings/evidence 可为空数组，terminal 设为 true 或 false），不要只输出聊天文本或留空。

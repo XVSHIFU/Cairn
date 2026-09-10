@@ -489,3 +489,12 @@ Kali 是权威工作树，Windows 为同步副本。Git HEAD 仍为 5e2fcc5；�
 - 第②：移除旧漏洞挖掘平台（router/collectors/adapters/CLI/提示词/静态/测试；解耦 app/cli/scheduler/loop/reason/config 启动链；保留 DB 迁移与表）。App 启动正常、`/vulnerability` 路由已摘、全量 290 通过（仅剩 1 项既有 container-manager env 失败）。
 - 第③：新建并推送分支 `feat/research-workbench`（`b52de6f`），再从 `main` 快进合并（`merge-tree` 0 冲突，因 feat 自 main tip 派生），推送 `origin/main` 至 `b52de6f`。历史仍保留 32 个 vuln-4.1 提交，最终树只含研究工作台+CTF。
 - 排除 `参考资料/`、`runtime/` 未纳入 Git。
+
+### 2026-09-10 pi 成为一等研究后端（方案 A）——真实 WSL 单会话已验证
+- 泛化 research_sandbox.build_sandbox：额外只读运行时绑定(node/nvm)、沙箱 home 种子(~/.pi/agent 配置)、argv 全命令、可扩展 sandbox PATH；claude 路径保持原样。
+- 泛化 research_egress.extract_gateway_hosts 读 ~/.pi/agent/models.json，使 llm-router 作为“模型网关”免配额放行。
+- research_worker：pi 沙箱组装(绑 node 根+种子 ~/.pi+扩展 PATH+argv 全命令)；egress .so 改用驱动无关挂载点 /cairn-egress；worker_scoped_env 不再携带宿主代理变量(由 egress 代理统一接管，规避 127.0.0.1:7897 类坏代理)；pi 步骤无状态(不传 --session，每步重注入全量上下文)；pi 载荷缺失 awaiting_input 时安全缺省 False(不伪造完成，terminal 仍严格)。
+- PiDriver.extract_analysis_response：容错解析 pi --mode json 事件流 / 去围栏 / 取首个完整 JSON。
+- 强化 default/research.md：明确 terminal/awaiting_input 必须为原始布尔。
+- 验证：Kali 全量 292 过；WSL 真实 pi 单会话端到端过(白盒 code，沙箱内连 llm-router=deepseek，产出合规信封入库)。
+- 诚实标注：pi 真实输出质量取决于模型(deepseek-v4-flash 会漏 awaiting_input，已安全缺省)；每步无状态(靠 worker 重注入上下文续跑)；费用无法从 pi 信封取 total_cost_usd，成本按 费用待核对 挂账。

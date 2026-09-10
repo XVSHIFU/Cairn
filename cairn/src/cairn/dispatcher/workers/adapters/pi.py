@@ -5,7 +5,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from cairn.dispatcher.config import WorkerConfig
-from cairn.dispatcher.workers.base import DriverResult, WorkerDriver
+from cairn.dispatcher.workers.base import AnalysisResponse, DriverResult, WorkerDriver
 from cairn.dispatcher.workers.health import HealthResult, http_ping, proxies_from_env
 
 
@@ -191,6 +191,23 @@ class PiDriver(WorkerDriver):
             if isinstance(text, str) and text:
                 parts.append(text)
         return "\n".join(parts).strip() or stdout
+
+    def extract_analysis_response(self, stdout: str, stderr: str) -> AnalysisResponse:
+        """Return the research envelope text pi emitted. pi may wrap the JSON payload in a
+        markdown fence or append trailing context after the first object; tolerate both by
+        stripping fences and keeping only the FIRST complete JSON value (the worker then
+        parses that as the research payload)."""
+        text = self.extract_response_text(stdout, stderr)
+        candidate = text.strip()
+        if candidate.startswith("```"):
+            candidate = candidate.strip("`").strip()
+            if candidate.lower().startswith("json"):
+                candidate = candidate[4:].lstrip()
+        try:
+            _obj, end = json.JSONDecoder().raw_decode(candidate)
+        except (ValueError, TypeError):
+            return AnalysisResponse(text=candidate)
+        return AnalysisResponse(text=candidate[:end].strip())
 
     def _wrap_with_models(self, worker: WorkerConfig, pi_argv: list[str], *, enable_tools: bool = True) -> list[str]:
         script = (

@@ -158,6 +158,11 @@ def build_sandbox(
     claude_bin: str = "claude",
     claude_config_src: Path | None = None,
     config_root: Path | None = None,
+    host_home: Path | None = None,
+    home_mirror: dict[str, tuple[str, ...]] | None = None,
+    runtime_bind_dirs: list[Path] | None = None,
+    argv_is_full_command: bool = False,
+    sandbox_path: str | None = None,
 ) -> list[str]:
     """Prepend a bwrap invocation that confines ``argv`` to workspace + repo.
 
@@ -179,11 +184,6 @@ def build_sandbox(
         workspace.mkdir(parents=True, exist_ok=True)
     workspace = workspace.resolve()
     workspace.chmod(0o700)
-
-    resolved_bin = shutil.which(claude_bin) if claude_bin != "claude" else shutil.which("claude")
-    if resolved_bin is None:
-        raise RuntimeError(f"未找到可执行的 {claude_bin}")
-    claude_path = Path(resolved_bin)  # keep the symlink path (do not resolve to target)
 
     bind_dirs: set[str] = set()
     command: list[str] = ["bwrap", *_BWRAP_COMMON]
@@ -207,11 +207,26 @@ def build_sandbox(
         command += ["--ro-bind", str(repo_path), "/repo"]
 
     # Make the CLI binary and its resolved target reachable (a symlinked launcher).
-    claude_real = claude_path.resolve()
-    for bind in (claude_path.parent, claude_real.parent):
-        if str(bind) not in bind_dirs:
-            command += ["--ro-bind", str(bind), str(bind)]
-            bind_dirs.add(str(bind))
+    if claude_bin:
+        resolved_bin = shutil.which(claude_bin) if claude_bin != "claude" else shutil.which("claude")
+        if resolved_bin is None and not argv_is_full_command:
+            raise RuntimeError(f"未找到可执行的 {claude_bin}")
+        if resolved_bin is not None:
+            claude_path = Path(resolved_bin)  # keep the symlink path
+            claude_real = claude_path.resolve()
+            for bind in (claude_path.parent, claude_real.parent):
+                if str(bind) not in bind_dirs:
+                    command += ["--ro-bind", str(bind), str(bind)]
+                    bind_dirs.add(str(bind))
+
+    # Extra read-only runtime roots the driver CLI needs beyond system dirs (e.g. a
+    # language runtime such as node/nvm). Bound read-only; the model never edits them.
+    if runtime_bind_dirs:
+        for rb in runtime_bind_dirs:
+            rb = Path(rb).resolve()
+            if rb.is_dir() and not rb.is_symlink() and str(rb) not in bind_dirs:
+                command += ["--ro-bind", str(rb), str(rb)]
+                bind_dirs.add(str(rb))
 
     home = workspace / ".sandbox-home"
     home.mkdir(parents=True, exist_ok=True)
@@ -219,6 +234,24 @@ def build_sandbox(
     # config is read-only, so anything the CLI may want to write goes here instead.
     cache = workspace / ".sandbox-cache"
     cache.mkdir(parents=True, exist_ok=True)
+    # Seed any driver-configured home files (e.g. ~/.pi/agent) into the sandbox home so
+    # the CLI finds its own provider/auth config without binding the operator's home.
+    if host_home is not None and home_mirror:
+        host_home = Path(host_home)
+        for rel_dir, files in home_mirror.items():
+            dest_dir = home / rel_dir
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            for name in files:
+                src = host_home / rel_dir / name
+                if not src.is_file():
+                    continue
+                dst = dest_dir / name
+                try:
+                    shutil.copyfile(src, dst)
+                    dst.chmod(0o600)
+                    LOG.debug("seeded sandbox home %s", dst)
+                except OSError as exc:
+                    LOG.warning("seed fail %s: %s", src, exc)
     sandbox_home = Path("/workspace/.sandbox-home")
     sandbox_cache = Path("/workspace/.sandbox-cache")
     command += [
@@ -227,7 +260,7 @@ def build_sandbox(
         str(sandbox_home),
         "--setenv",
         "PATH",
-        "/usr/local/bin:/usr/bin:/bin",
+        sandbox_path or "/usr/local/bin:/usr/bin:/bin",
         "--setenv",
         "XDG_CACHE_HOME",
         str(sandbox_cache / ".cache"),
@@ -259,7 +292,7 @@ def build_sandbox(
                 command += ["--ro-bind", str(src), f"/claude-config/{name}"]
         command += ["--setenv", "CLAUDE_CONFIG_DIR", "/claude-config"]
 
-    full_argv = [claude_bin] + list(argv)
+    full_argv = list(argv) if argv_is_full_command else ([claude_bin] + list(argv))
     command += ["--", *full_argv]
     return command
 

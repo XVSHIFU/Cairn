@@ -59,8 +59,8 @@ def worker_scoped_env() -> dict[str, str]:
     CLI from its own config). Actual filesystem confinement is handled by bwrap.
     """
     allow = {
-        "ALL_PROXY", "HOME", "HTTPS_PROXY", "HTTP_PROXY", "LANG", "LC_ALL",
-        "NO_PROXY", "PATH", "SSL_CERT_DIR", "SSL_CERT_FILE", "TEMP", "TMP",
+        "HOME", "LANG", "LC_ALL",
+        "SSL_CERT_DIR", "SSL_CERT_FILE", "TEMP", "TMP",
         "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
     }
     return {key: value for key, value in os.environ.items() if key.upper() in allow}
@@ -279,15 +279,15 @@ class ResearchWorker:
         # /claude-config mount exists). Putting it in the outer env breaks bwrap's
         # user-namespace helper, which tries to load the interceptor before the sandbox
         # mount is active. The proxy env vars stay in the outer env (harmless).
-        preload_path = getattr(self, "_egress_preload_path", None)
+        preload_path = getattr(self, "_egress_so_sandbox", None)
         if preload_path and "--" in boundary:
             i = boundary.index("--")
             inject = ["--setenv", "LD_PRELOAD", preload_path]
-            # Overlay the interceptor as RO so the (now writable) config runtime dir
-            # cannot let the model tamper with enforcement.
-            host_so = getattr(self, "_egress_preload_host", None)
+            # Overlay the interceptor as RO (never writable to the model so it cannot
+            # tamper with enforcement) at a driver-agnostic sandbox path.
+            host_so = getattr(self, "_egress_so_host", None)
             if host_so:
-                inject += ["--ro-bind", host_so, "/claude-config/libcairn_egress.so"]
+                inject += ["--ro-bind", host_so, preload_path]
             boundary[i:i] = inject
         run_env = worker_scoped_env()
         run_env.update(egress_env)
@@ -407,19 +407,18 @@ class ResearchWorker:
             claude_dir = Path(config_root) / "claude-config-runtime"
             claude_dir.mkdir(parents=True, exist_ok=True)
             so = build_egress_preload(claude_dir)
-            so_in_sandbox = "/claude-config/libcairn_egress.so"
         else:
             so = build_egress_preload()
-            so_in_sandbox = so if so else None
         if so is None:
             proxy.stop()
             # Without the connect() interceptor a direct socket could bypass the proxy;
             # do not silently run research with uncontrolled egress.
             raise RuntimeError("缺少 C 编译器，无法建立出站强制（直接连接可能绕过代理）；拒绝放行研究执行")
-        # The interceptor is referenced by its SANDBOX-internal path and injected via
-        # bwrap --setenv by the caller (NOT in the outer env — see run_session).
-        self._egress_preload_path = so_in_sandbox
-        self._egress_preload_host = str(so)
+        # The interceptor lives OUTSIDE the workspace and is referenced by its SANDBOX-
+        # internal path; the caller RO-binds it into the sandbox and LD_PRELOADs it via
+        # bwrap --setenv (NOT in the outer env — see run_session).
+        self._egress_so_host = str(so)
+        self._egress_so_sandbox = "/cairn-egress/libcairn_egress.so"
         env = {
             "HTTP_PROXY": f"http://127.0.0.1:{port}",
             "HTTPS_PROXY": f"http://127.0.0.1:{port}",
@@ -489,22 +488,49 @@ class ResearchWorker:
         # a partial/uncertain answer can never auto-complete.
         if payload.get("terminal") is None:
             payload["terminal"] = False
+        # pi's model (e.g. deepseek-flash) sometimes drops the second REQUIRED boolean.
+        # Default awaiting_input=False (keep going / not awaiting input) without ever
+        # fabricating a completion — terminal=True still requires the model to say so.
+        # Claude keeps the strict three-state protocol (missing both -> still fails).
+        if self._driver.type_name == "pi" and not isinstance(payload.get("awaiting_input"), bool):
+            payload["awaiting_input"] = False
         return payload, analysis.metadata
 
     # -- claude invocation -----------------------------------------------------
 
-    def _build_sandboxed_argv(self, workspace: Path, session, argv: list[str], *, claude_bin: str = "claude") -> list[str]:
+    def _build_sandboxed_argv(
+        self, workspace: Path, session, argv: list[str], *, claude_bin: str = "claude",
+    ) -> list[str]:
         repo = session.get("repo") if session.get("repo") else None
         config_src = None
-        config_root = workspace.parent / ".cairn-sandbox-private"
-        if not os.environ.get("CAIRN_CLAUDE_BIN") and self._driver.type_name == "claudecode":
-            # Only seed the operator's real Claude config for the real claude binary,
-            # not for a test override or another agent driver. The config is staged
-            # OUTSIDE the workspace and mounted read-only.
+        host_home = None
+        home_mirror = None
+        runtime_bind_dirs = None
+        argv_is_full_command = False
+        sandbox_path = None
+        if claude_bin != "claude" and self._driver.type_name == "pi":
+            # pi runs on a node/nvm runtime and reads ~/.pi/agent config. Bind the node
+            # install root RO, seed the pi config into the sandbox HOME, extend PATH with
+            # the pi bin dir, and pass argv as the full command (pi's build_execute already
+            # returns a /bin/sh launcher).
+            resolved = shutil.which(claude_bin) or "pi"
+            node_root = Path(resolved).parent.parent
+            if node_root.is_dir():
+                runtime_bind_dirs = [node_root]
+            sandbox_path = f"{node_root}/bin:/usr/local/bin:/usr/bin:/bin"
+            host_home = Path(os.environ.get("HOME", "/root")) if os.environ.get("HOME") else None
+            home_mirror = {".pi/agent": ("auth.json", "settings.json", "models.json")}
+            argv_is_full_command = True
+        elif not os.environ.get("CAIRN_CLAUDE_BIN") and self._driver.type_name == "claudecode":
+            # Only seed the operator's real Claude config for the real claude binary.
             config_src = Path(os.environ.get("HOME", "/root")) if os.environ.get("HOME") else None
         return build_sandbox(
             workspace=workspace, repo=repo, argv=argv, claude_bin=claude_bin,
-            claude_config_src=config_src, config_root=config_root,
+            claude_config_src=config_src,
+            config_root=workspace.parent / ".cairn-sandbox-private",
+            host_home=host_home, home_mirror=home_mirror,
+            runtime_bind_dirs=runtime_bind_dirs, argv_is_full_command=argv_is_full_command,
+            sandbox_path=sandbox_path,
         )
 
     def _build_claude_argv(self, prompt: str, *, remaining_cost: float) -> list[str]:
@@ -532,7 +558,11 @@ class ResearchWorker:
             task_types=["vulnerability_analysis"], max_running=1, priority=0,
             env=dict(os.environ),
         )
-        return list(self._driver.build_execute(cfg, prompt, session_id).argv)
+        # pi rejects a --session whose file does not yet exist (sandbox /tmp is a fresh
+        # tmpfs each step). The research worker re-injects the full evidence/context into
+        # every prompt, so pi steps are intentionally stateless (it creates a new session).
+        sid = None if self._driver.type_name == "pi" else session_id
+        return list(self._driver.build_execute(cfg, prompt, sid).argv)
 
     def _load_prompt(self) -> str:
         return resources.files("cairn.dispatcher.prompts").joinpath("default").joinpath(
