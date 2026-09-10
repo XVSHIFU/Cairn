@@ -483,3 +483,9 @@ Kali 是权威工作树，Windows 为同步副本。Git HEAD 仍为 5e2fcc5；�
 - Git HEAD 保持 `5e2fcc5`，未提交未推送（与约定一致）。
 - 运行态：无 `research-worker` 进程；8015–8019 隔离验收服务已停；正式 `GET /api/research/runtime` 仍 `available=false`（worker 未附挂，符合不碰生产库约定）。
 - Windows↔Kali 本轮改动 md5 一致。
+
+### 2026-09-10 Git 交付：研究分支合并进 main
+- 第①：研究工作流可插拔其它 agent（`--driver`/`CAIRN_RESEARCH_DRIVER`，复用 `get_driver` 注册表 + 各 driver `build_execute`/`extract_analysis_response`；claude 默认全回归，codex/pi/mock 接通复用、真实输出未验证）。
+- 第②：移除旧漏洞挖掘平台（router/collectors/adapters/CLI/提示词/静态/测试；解耦 app/cli/scheduler/loop/reason/config 启动链；保留 DB 迁移与表）。App 启动正常、`/vulnerability` 路由已摘、全量 290 通过（仅剩 1 项既有 container-manager env 失败）。
+- 第③：新建并推送分支 `feat/research-workbench`（`b52de6f`），再从 `main` 快进合并（`merge-tree` 0 冲突，因 feat 自 main tip 派生），推送 `origin/main` 至 `b52de6f`。历史仍保留 32 个 vuln-4.1 提交，最终树只含研究工作台+CTF。
+- 排除 `参考资料/`、`runtime/` 未纳入 Git。
