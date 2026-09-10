@@ -1,4 +1,4 @@
-> **开发入口（2026-09-09）**：产品正转向个人自主研究工作台。请先阅读 [开发总纲](docs/development-charter.md)、[前端 MVP](docs/frontend-mvp.md) 和 [当前状态](docs/implementation-status.md)。旧漏洞模块方案已归档；下文部分功能描述为既有实现参考。
+> **开发入口**：产品当前是**个人授权的自主安全研究工作台**。请先阅读 [开发总纲](docs/development-charter.md)、[前端 MVP](docs/frontend-mvp.md) 与 [当前实施状态](docs/implementation-status.md)。
 
 <div align="center">
 
@@ -6,233 +6,167 @@
 
 # Cairn
 
-### 不止是 AI 渗透测试 — 面向通用状态空间搜索的问题求解引擎
+### 面向状态空间搜索的问题求解引擎 · 个人授权安全研究工作台
 
 </div>
 
-Cairn 是一个通用问题求解引擎。它不定义角色、不预设工作流。给定一个 **起点（Origin）** 与一个 **目标（Goal）**，它在一个未知的状态空间中自主搜索路径。AI 渗透测试只是其中一个已验证的问题域。
+Cairn 是一个通用问题求解引擎，并已落地为**个人授权的安全研究工作台**。它不预设工作流——给定**起点（Origin）**与**目标（Goal）**，在一个未知状态空间中自主搜索路径。当前两个已验证的问题域：
 
-> 本仓库为 **[oritera/Cairn](https://github.com/oritera/Cairn)** 的分支，额外内置了 **简体中文本地化**（中文 Agent 提示词 + 中英双语 Web 界面），详见 [中文支持](#中文支持)。
+1. **自主安全研究（研究工作台，本仓库当前重心）**——一次授权后，Agent 自主完成授权范围内的黑盒 / 白盒 / 联动研究：理解目标、读授权代码、提出并验证假设、保存证据、生成报告、修复后复测。
+2. **CTF / 通用任务**——继承原引擎的 `Bootstrap / Reason / Explore` 调度与黑板协作。
+
+> 本仓库为 **[oritera/Cairn](https://github.com/oritera/Cairn)** 的分支，由 **[XVSHIFU](https://github.com/XVSHIFU)** 维护，内置**简体中文本地化**。原漏洞挖掘平台已移除；当前以研究工作台为本。
 
 ---
 
-## 什么是 Cairn？
+## 研究工作台（当前重心）
 
-渗透测试本质上是对 **近乎无限状态空间的有向搜索**：
+面向个人研究者，在 Kali 等本机运行。用户给出目标与材料、**一次确认授权范围**（目标/排除项、代码目录、运行环境、允许动作、时长/请求/费用上限），Agent 自主完成探索、验证、证伪与报告；用户可以观察证据、补充方向、暂停和续跑。
 
-- **起点（Origin）**：已知（目标 IP、目标系统）
-- **目标（Goal）**：明确（拿到 shell、夺取 flag）
-- **路径（Path）**：未知
+### 三种研究模式
 
-这种结构并不局限于渗透测试。漏洞研究、数学证明、CTF 解题 —— 任何"起点明确、成功条件明确、中间路径未知"的问题都具有相同形态。Cairn 正是为这一类问题而生，渗透测试是它第一个被验证的领域。
+| 材料 | 模式 | 完成内容 |
+|------|------|----------|
+| 网站 / 域名 / IP | 黑盒 | 建立种子资产、发现接口与交互、提出假设、动态验证、请求/响应证据 |
+| Kali 本地代码目录 | 白盒 | 语言/框架自动识别、入口/权限/数据流审计、**`file:line` 坐标**与版本绑定、审计报告 |
+| 代码 + 已运行环境 | 联动 | 代码/路由/请求映射、静态疑点动态验证、基线/变体对照、修复后复测 |
 
-引擎基于 **黑板架构（Blackboard Architecture）**，核心是一个显式的"事实-意图"图，只需三种原语：
+系统会自动依据材料识别模式（`web` / `code` / `combined`），无需用户预选语言或框架。
 
-| 概念 | 含义 |
-|------|------|
-| **事实（Fact）** | 一条已确认的客观发现，写入黑板 |
-| **意图（Intent）** | 一个已声明但尚未执行的探索方向 |
-| **提示（Hint）** | 人类随时注入的判断，下一次读取时被 Agent 吸收 |
+### 执行与可靠性
 
-图从 `origin` 向 `goal` 生长：每个新 Fact 都是一块垫脚石，每个 Intent 都是迈向未知的一步。
+- **真实执行链**：网页创建的研究由独立后台进程 `cairn research-worker` 认领并实际运行（`queued → running → evidence → completed/report`），不是接口演示。
+- **受控执行边界**：bubblewrap 沙箱——只读挂载授权代码 `/repo`、可写会话工作区 `/workspace`、宿主文件系统不可见；逐请求计数与定域的出站强制代理（LD_PRELOAD `connect()` 拦截，直连也无法绕过），仅允许授权目标，越界/配额耗尽即拒绝。
+- **一次授权**：授权快照版本化；暂停/续跑/预算追加继承原授权，不允许重启刷预算。预算（成本/时长/请求/步数）是硬约束，结算前遥测、耗尽后可明确追加预算续跑。
+- **失败分类 + 有界恢复**：把执行失败归类（provider 限流 / 超时 / 预算耗尽 / 协议 / 权限 / 执行异常），仅瞬态错误在有界次数内自动重排队，永久失败立即终止。
+- **经验反馈**：每轮 confirmed findings 与失败教训沉淀为经验，注入后续同类目标的提示词（带来源引用，仅供参考、非本会话证据）。
+- **变化触发复测**：对目标代码/url 计算稳定指纹并建基线；内容变化时把完成的会话自动重新排队复测，复核先前发现是否仍成立。
+- **自动收束**：非终态步骤在预算/步数耗尽、无法再开新步骤时自动收束为 `completed` + 报告（如实注明未验证项，不凭空编造发现）。
 
-Agent Worker 运行 **OODA 循环** —— 观察（Observe）完整图、定向（Orient）当前状态、决策（Decide）下一步意图、行动（Act）探索并写回新 Fact。Worker 没有固定角色，任务由运行时根据图状态动态生成，而非预定义岗位说明。
+### 可插拔 Agent 驱动
 
-Agent 之间仅通过共享黑板协作（**Stigmergy / 涌现式协作**），无直接通信，无信息孤岛。
+研究工作流复用共享的 Driver 注册表，支持切换 Agent 后端：
 
-## 工作原理
+- 默认 **claude**（`--driver claudecode` / 环境变量 `CAIRN_RESEARCH_DRIVER=claudecode`）。
+- 可选 **codex / pi / mock**（`--driver codex` 等），复用各驱动已有的命令构造与结果解析。
+- claude 为默认且已充分验证；**codex/pi/mock 已接线复用，但真实研究输出质量尚未验证**。
 
-三种任务类型，均由同一个 Worker 执行：
+---
 
-| 任务 | 作用 | 输出 |
-|------|------|------|
-| **Bootstrap** | 项目开始时直接尝试求解问题 | 事实 + 可能的 Complete |
-| **Reason** | 读取完整图：目标是否达成？下一步该探索什么？ | Complete / 新意图 / no-op |
-| **Explore** | 认领一个意图，执行探索，报告发现 | 一条事实 |
+## CTF 平台接入
 
-系统架构：
+内置 CTF 比赛平台自动接入：拉取题目 → 建项目 → Agent 解题 → 自动提交 flag。
 
-```
-          ┌──────────────────────────────────┐
-          │           Cairn Server           │
-          │      Facts + Intents + Hints     │
-          └─────────────────┬────────────────┘
-                            │
-                     Read / Write API
-                            │
-          ┌─────────────────┴────────────────┐
-          │             Dispatcher           │
-          │   调度任务、管理容器、写协议     │
-          └──────────┬───────────────┬───────┘
-                     │               │
-     ┌───────────────┴──┐     ┌──────┴──────────────┐
-     │  Worker Container│     │  Worker Container   │
-     │   (Project A)    │     │   (Project B)       │
-     │  ┌────┐  ┌────┐  │     │  ┌────┐  ┌────┐     │
-     │  │ W. │  │ W. │  │     │  │ W. │  │ W. │     │
-     │  └────┘  └────┘  │     │  └────┘  └────┘     │
-     └──────────────────┘     └─────────────────────┘
-```
+- **Bridge 进程**：`cairn ctf-bridge --server http://127.0.0.1:8000`。
+- **适配器**：`cairn/src/cairn/ctfbridge/adapters/` — `dasctf`、`ctfd`，可经 `ChallengeSource` 扩展。
+- **预算护栏**：按题目难度档位限制单个项目消耗。
 
-- **Cairn Server**：仅维护图的一致性。
-- **Cairn Dispatcher**：读取图、调度任务、拉起/销毁 Worker 容器，是协议的唯一写入方。每个项目拥有独立的 Worker 容器，容器内多个 Agent Worker 并发运行；Agent Worker 只接收提示词并返回结构化输出。
-- Worker 也可以直接跑在调度器所在宿主机上（**本地模式**，无需 Docker），见 [部署](#部署)。
-
-支持的 Worker 后端：**Claude Code**、**Codex**、**Pi**。
-
-## 中文支持
-
-本分支在原版基础上加入了两层简体中文本地化，均可随时切换回英文：
-
-| 层面 | 英文（原版） | 中文（本分支） |
-|------|-------------|---------------|
-| **Agent 提示词** | `runtime.prompt_group: "default"` | `runtime.prompt_group: "zh-CN"`（改 `dispatch.yaml`，重启生效） |
-| **Web 界面** | 右上角 `EN` | 右上角 `中文` 按钮（无需改配置，浏览器记住选择） |
-
-**提示词层**：`cairn/src/cairn/dispatcher/prompts/zh-CN/` 内含 5 个中文提示词模板，在原版英文指令基础上新增 `## Language` 规则，强制 Agent 产出的 `fact.description`、`intent.description`、reason 文本一律使用简体中文；JSON 键名、枚举值、`fact/intent` 的 id、技术标识符（IP/URL/CVE/路径/命令）保持原样不变。
-
-**界面层**：`index.html` 整站文案中英双语，右上角 `EN / 中文` 一键切换，按浏览器语言自动默认，选择持久化在浏览器 localStorage。
-
-**预构建成品**（`dist/` 目录）：
-
-- `cairn-zh-CN-0.2.1.zip` — 中文独立增量包。下载原版 Cairn 后解压到项目根、运行 `./install.sh` 即可切换中文，无需改任何 Python 代码。
-- `Cairn-0.2.1-zh.zip` — 完整中文版整包，开箱即用。
+---
 
 ## 部署
 
-**环境要求**
+**环境要求**：macOS 或 Linux、Python ≥ 3.12、[`uv`](https://docs.astral.sh/uv/)、已登录的 `claude` CLI（研究工作流默认）；Docker 仅容器执行模式需要（本地模式不需要）。
 
-- macOS 或 Linux
-- Python ≥ 3.12
-- `uv`（Python 包管理器，参考 https://docs.astral.sh/uv/ ）
-- Docker（仅容器执行模式需要，本地模式不需要）
-- 已登录的 `claude` / `codex` / `pi` CLI（本地模式需要）
-
-**拉取 Worker 容器镜像**（两种部署方式都需要，本地模式除外）：
+### 启动（本地模式）
 
 ```bash
-docker pull --platform=linux/amd64 ghcr.io/oritera/cairn-worker-container:latest
+# 1) 后端服务 :8000
+uv run --project cairn cairn serve --db-path ~/.local/share/cairn/cairn.db
+
+# 2) 研究工作台后台执行器（认领并运行 queued 研究；默认 claude）
+uv run --project cairn cairn research-worker --db-path ~/.local/share/cairn/cairn.db
+
+# 3) 通用 Dispatcher（CTF / 通用任务调度；可另行配置）
+uv run --project cairn cairn dispatch --config dispatch.yaml
+
+# 4) CTF 平台桥接（可选）
+uv run --project cairn cairn ctf-bridge --server http://127.0.0.1:8000
 ```
 
-创建你的调度器配置并填入 LLM 端点与 API key：
+研究工作台页面：`http://<host>:8000/research`。
+
+常用参数：
 
 ```bash
-cp dispatch.example.yaml dispatch.yaml        # 容器模式
-# 或
-cp dispatch.local.example.yaml dispatch.yaml  # 本地模式
+# 指定工作区根目录、扫描间隔
+cairn research-worker --workspace-root ~/.local/share/cairn/research-workspaces --interval 5
+
+# 只跑一轮认领/执行后退出（适合脚本与验收）
+cairn research-worker --once
+
+# 切换 Agent 驱动
+cairn research-worker --driver codex
 ```
 
-### 方式一：本地模式（无需 Docker，推荐）
+> 注意：`dispatch.yaml` 与 SQLite 数据文件（`*.db`）可能含平台凭证，已在 `.gitignore` 中排除，**切勿提交**。
 
-Worker 直接跑在调度器宿主机上，复用本机已配置好的 `claude` / `codex` / `pi` CLI——无需 Docker，也无需在配置里写 API key。
-
-```bash
-# 仓库根目录一键起停
-./cairn-local.sh start      # 启动 server(:8000，内置漏洞采集器) + dispatcher
-./cairn-local.sh status     # 查看进程与 API 状态
-./cairn-local.sh stop       # 停止
-./cairn-local.sh restart    # 重启
-
-# 或手动
-uv run --project cairn cairn serve                          # 后端 :8000 + 漏洞采集器
-uv run --project cairn cairn dispatch --config dispatch.yaml # 调度器
-```
-
-`cairn serve` 默认托管漏洞持续采集器，因此 Web 控制台提交的真实采集任务会立即进入受控执行队列，不需要再为每个 Campaign 手工启动 `vuln-collect`。需要将采集器拆成独立进程时，可用 `cairn serve --no-vuln-collector`，并另行运行 `cairn vuln-collect --interval 60`。
-
-本地模式通过 `runtime.execution: local` 开启（参见 `dispatch.local.example.yaml`）。调度器启动时检查每个配置的 Worker CLI 是否可执行，并提示它们必须已登录。每个项目在 `local.workspace_root`（默认：调度器当前目录）下获得独立工作目录。**请直接在宿主机上运行调度器，不要放进 Docker**——Agent 将以你的用户权限运行且无沙箱。
-
-漏洞分析 profile 采用更严格边界：本地运行必须关闭任意宿主环境继承，且不允许使用仍可读取宿主文件的本地 Codex driver；生产配置优先使用 `enforce_isolation: true` 的容器模式。Worker 的 stdout/stderr 都有字节硬上限，超限会终止整个进程组并按失败处理。
-
-### 方式二：Docker Compose（容器模式）
+### 方式二：Docker Compose（容器模式，用于通用 Dispatcher）
 
 ```bash
 docker pull ghcr.io/astral-sh/uv:python3.13-trixie
-docker compose up --build
+docker compose up --build   # cairn-server:8000 + cairn-dispatcher
 ```
 
-这会启动 `cairn-server:8000`，待其通过健康检查后启动 `cairn-dispatcher`。dispatcher 挂载项目根目录的 `dispatch.yaml`，通过宿主机 docker.sock 连接 Docker。数据持久化到 `./datas/cairn/`。
+研究工作台执行器通常在宿主机本地运行（需要访问已登录的 `claude` CLI 与真实文件挂载）。`dispatch.yaml` 的 `runtime.execution` 可选 `local` / `container`。
 
-漏洞分析容器使用只读根文件系统、删除全部 Linux capabilities、`no-new-privileges`、PID/内存/CPU 上限及有界 `/tmp`。已有项目容器不满足同一隔离版本时会拒绝复用，需由运维移除后按当前配置重建。
+### 中文提示词
 
-漏洞 Campaign 的异常通知默认关闭。启用前由服务端配置三个环境变量：`CAIRN_NOTIFICATION_ALLOWED_HOSTS` 是逗号分隔的 HTTPS 目标主机精确白名单，`CAIRN_NOTIFICATION_PROXY_URL` 是通知专用 HTTP/HTTPS 出口代理，`CAIRN_NOTIFICATION_SECRETS` 是 `secret_ref` 到 HMAC 密钥的 JSON 对象（每项 32～4096 字节）。密钥只存在于服务端环境，不写入数据库、API 响应或通知正文。通道配置和失败重试 API 均要求漏洞审批人身份；投递不跟随重定向，并对请求、响应、超时、租约和重试次数设硬限制。
-
-### 方式三：手动
-
-```bash
-# 启动 server（默认同时启动漏洞持续采集器）
-uv run --project cairn cairn serve
-
-# 运行 dispatcher
-uv run --project cairn cairn dispatch --config dispatch.yaml
-
-# 仅做启动健康检查
-uv run --project cairn cairn dispatch --config dispatch.yaml --startup-healthcheck-only
-```
-
-### 启用中文提示词
-
-```yaml
-# dispatch.yaml 中
-runtime:
-  prompt_group: "zh-CN"     # 英文则用 "default"
-```
-
-重启 server 与 dispatcher 后生效。
+Dispatcher（CTF / 通用任务）提示词支持中英文切换：`dispatch.yaml` 中 `runtime.prompt_group: "zh-CN"`（英文用 `"default"`），Web 界面右上角一键切换。研究工作台提示词位于 `default/` 与 `mock/`。
 
 ### 测试
 
-无需 Docker 或真实模型端点即可运行快速回归测试：
+无需 Docker 或真实模型端点即可运行回归测试：
 
 ```bash
 uv run --project cairn --group dev pytest
 ```
 
-## CTF 平台接入
+---
 
-Cairn 内置了 CTF 比赛平台自动接入：拉取题目 → 建项目 → Agent 解题 → 自动提交 flag。
+## 工作原理（通用引擎）
 
-- **Bridge 进程**：`uv run cairn ctf-bridge --server http://127.0.0.1:8000`（与 server/dispatcher 并列运行）。
-- **适配器**：`cairn/src/cairn/ctfbridge/adapters/` — 目前含 `dasctf`（西湖论剑/DasCTF）与 `ctfd`（CTFd 通用）两个实现，可通过 `ChallengeSource` 基类扩展新平台。
-- **配置**：接入凭证通过设置页或 `PUT /ctf/config` 写入（`base_url` + `token` + `adapter`），模型配置复用 `dispatch.yaml` 的 worker 环境。
-- **Flag 提交**：自动剥离 `DASCTF{...}` / `flag{...}` 外壳，只提交花括号内内容；`auto_submit` 控制是否自动提交。
-- **预算护栏**：设置页 `budget_easy/medium/hard` 按题目难度档位限制单个项目的 intent 消耗，防止失控解题烧 token。
-- **网关代理**：`scripts/llm_proxy.py` 提供一个路径剥离的反向代理，用于必须走平台 LLM 网关（要求精确 URL）的场景。
+引擎基于**黑板架构**：显式的“事实-意图”图，三种原语：
 
-> 注意：`dispatch.yaml` 与 SQLite 数据文件（`*.db`）含平台凭证，已在 `.gitignore` 中排除，**切勿提交**。
+| 概念 | 含义 |
+|------|------|
+| **事实（Fact）** | 已确认的客观发现 |
+| **意图（Intent）** | 已声明但尚未执行的探索方向 |
+| **提示（Hint）** | 人类注入的判断，下轮被 Agent 吸收 |
+
+三种任务类型由同一个 Worker 执行：**Bootstrap**（开始直接求解）、**Reason**（读全图决定下一步）、**Explore**（认领意图并报告发现）。Worker 通过共享黑板协作（Stigmergy），无直接通信。
+
+```
+   Cairn Server (facts/intents/hints)  ──┬──  |     Cairn Api   |
+             ▲                          │     └─────┬──────────┘
+             └───── Read / Write ───────┘           │
+                                Dispatcher (调度/写协议/管理容器)
+                                   └── Worker containers (per project, OODA loop)
+```
+
+支持的通用后端：**Claude Code / Codex / Pi**。
+
+---
 
 ## 成绩
 
-**腾讯云黑客松 · AI 渗透测试挑战赛 · 第二届**
+**腾讯云黑客松 · AI 渗透测试挑战赛 · 第二届**：610 支队伍 / 1,345 名参赛者，**54/54 唯一 AK 全解队伍**，最终排名第 3。该流水线比赛当天凌晨才首次上线，无训练、无调参、无预定义 Agent 角色。
 
-610 支队伍 · 1,345 名参赛者 · 来自全国顶尖高校与安全厂商
-
-| 指标 | 数值 |
-|------|------|
-| 解题数 | **54 / 54 —— 唯一 AK 全解队伍** |
-| 最终排名 | 第 3 名 |
-
-> 该系统在赛前从未经过测试。完整流水线在比赛当天凌晨 4 点才首次上线。无训练、无调参、无领域定制工具。零 MCP 工具、零 RAG、零预定义 Agent 角色。
+---
 
 ## 延伸阅读
 
-- [最强 AI 渗透测试智能体：腾讯云黑客松智能渗透测试挑战赛（第二届）唯一 AK 队伍复盘](https://mp.weixin.qq.com/s/DlpEH7bVr0xi0VawPJs3XA)
+- [最强 AI 渗透测试智能体：腾讯云黑客松唯一 AK 队伍复盘](https://mp.weixin.qq.com/s/DlpEH7bVr0xi0VawPJs3XA)
 - [无路之路：从渗透测试到通用问题求解的 Cairn AI](https://mp.weixin.qq.com/s/2rEqFLvkxvYWM3gW170C2w)
+- [开发总纲](docs/development-charter.md) · [实施状态](docs/implementation-status.md)
+
+---
 
 ## 免责声明
 
-Cairn 是一个通用问题求解引擎。尽管它支持渗透测试、CTF 解题、安全评估与漏洞研究工作流，但仅应在**你拥有明确授权**的环境中运行。
-
-你需自行对使用方式负责。未经系统/网络/应用/数据所有者或运营者事先明确许可，请勿使用 Cairn 对其进行操作。未经授权的安全测试、利用或数据访问可能违法并造成损害。
-
-本项目开发者与贡献者不对任何滥用、误用、损害、损失或由此产生的法律后果负责。使用本项目即表示你同意确保你的活动符合所在司法辖区的所有适用法律、法规、合同义务及专业/组织政策。
+Cairn 是通用问题求解引擎，支持渗透测试、CTF 解题、安全评估与漏洞研究工作流。**仅应在你拥有明确授权（目标所有者事先许可）的环境中运行**。未经授权的安全测试、利用或数据访问可能违法并造成损害。本项目开发者与贡献者不对滥用、误用、损害、损失或由此产生的法律后果负责。
 
 ## ⚖️ 许可与致谢
 
-本项目基于 **GNU AGPLv3** 许可开源，供个人与学习用途使用。
-
-**商业使用**：如需在商业或专有环境中使用本项目而不承担 AGPL-3.0 开源义务，请联系原作者获取商业许可。
-
-**贡献**：提交 Pull Request 即表示你同意你的贡献可在 AGPL-3.0 与本项目商业许可下被使用。
+本项目基于 **GNU AGPLv3** 许可开源，供个人与学习用途使用。商业使用请向原作者申请商业许可；提交 PR 即同意你的贡献可在 AGPL-3.0 与本项目商业许可下使用。
 
 本分支由 **[XVSHIFU](https://github.com/XVSHIFU)** 维护，原始项目及所有功劳归于 **[leixiao / oritera/Cairn](https://github.com/oritera/Cairn)**。
