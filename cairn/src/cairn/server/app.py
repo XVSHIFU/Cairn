@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from cairn import __version__
@@ -40,7 +40,9 @@ app.include_router(research_source_compare.router)
 
 @app.get("/", include_in_schema=False)
 def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    """The legacy global index (vulnerability mining UI) was removed; land the
+    operator on the current research workbench."""
+    return RedirectResponse(url="/research", status_code=302)
 
 
 @app.get("/research", include_in_schema=False)
